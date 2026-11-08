@@ -208,6 +208,48 @@ describe('PrismID Web SDK (prismid-js) Unit & Cross-Language Suite', () => {
           expect(hookedServerOut.spoof_flags).toContain('worker_lie_detected')
           // And d_gpu_* is STILL identical to the unhooked run!
           expect(hookedServerOut.gpu_audio_slice_id).toBe(serverRes.gpu_audio_slice_id)
+
+          // 3. Test 5-Silo Self-Healing Storage Beacon + 16x16 Solid-Patch Canvas Noise Trap in real Chrome!
+          await page.evaluate(() => {
+            // Simulate attacker clearing localStorage, sessionStorage, and cookies in DevTools
+            localStorage.clear()
+            sessionStorage.clear()
+            document.cookie = '_prismid_bcn_v1=; expires=Thu, 01 Jan 1970 00:00:00 GMT; path=/'
+
+            // Simulate AdsPower / BitBrowser / CanvasBlocker injecting +1 pixel noise into getImageData
+            const origGetImageData = CanvasRenderingContext2D.prototype.getImageData
+            CanvasRenderingContext2D.prototype.getImageData = function (sx, sy, sw, sh) {
+              const img = origGetImageData.call(this, sx, sy, sw, sh)
+              if (img.data.length >= 4) {
+                img.data[2] = (img.data[2] + 1) & 0xff
+              }
+              return img
+            }
+
+            const el = document.getElementById('server-out')
+            if (el) el.textContent = 'pending...'
+          })
+          await page.click('#btn-identify')
+          await page.waitForFunction(
+            () => {
+              const el = document.getElementById('server-out')
+              return el && el.textContent && el.textContent.includes('"accepted": true')
+            },
+            undefined,
+            { timeout: 10000 }
+          )
+          const healedServerOut = JSON.parse((await page.textContent('#server-out')) || '{}')
+          const healedClientOut = JSON.parse((await page.textContent('#client-out')) || '{}')
+
+          // Beacon ID must be 100% resurrected from IndexedDB / CacheStorage!
+          expect(healedClientOut.decrypted_payload.beacon_id).toBe(
+            clientData.decrypted_payload.beacon_id
+          )
+          expect(healedClientOut.decrypted_payload.lies.storage_healed).toBe(true)
+          expect(healedClientOut.decrypted_payload.lies.canvas_noise_injected).toBe(true)
+          expect(healedServerOut.beacon_slice_id).toBe(serverRes.beacon_slice_id)
+          expect(healedServerOut.spoof_flags).toContain('storage_healed')
+          expect(healedServerOut.spoof_flags).toContain('canvas_noise_injected')
         } finally {
           await browser.close()
         }

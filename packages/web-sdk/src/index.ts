@@ -4,8 +4,9 @@
  * Provides 3-line integration for Browser Web apps and Tauri Desktop WebViews:
  *   1. Requests a 60s single-use challenge (`nonce` + `render_seed` [s0,s1,s2,s3])
  *   2. Executes WebGL shader spot-pixel sampling, inline Blob Worker + OffscreenCanvas
- *      cross-thread lie detection, OfflineAudioContext integral, sub-pixel TextMetrics
- *      font bounding boxes, FDLIBM Math constants, and optional Rust NativeHardwareAnchor
+ *      cross-thread lie detection, 5-silo self-healing storage beacon, Canvas 2D solid-patch
+ *      noise trap, OfflineAudioContext integral, sub-pixel TextMetrics font bounding boxes,
+ *      FDLIBM Math constants, and optional Rust NativeHardwareAnchor
  *   3. Seals the entire probe payload via AES-256-GCM (AEAD) and submits to `/api/v1/risk/identify`
  */
 
@@ -21,6 +22,7 @@ import {
 import { collectAudioProbe } from './probes/audio.js'
 import { collectFontsAndCanvasProbe } from './probes/fontsCanvas.js'
 import { collectLieDetectorProbe } from './probes/lieDetector.js'
+import { collectAndHealStorageBeacon, type StorageBeaconResult } from './probes/storageBeacon.js'
 import {
   collectWebGLProbe,
   computeExpectedSpotPixelMath,
@@ -31,6 +33,7 @@ import { collectWorkerLieProbe } from './probes/workerLie.js'
 export {
   AEAD_KEY_DOMAIN_PREFIX,
   aes256GcmEncryptPureTS,
+  collectAndHealStorageBeacon,
   collectAudioProbe,
   collectFontsAndCanvasProbe,
   collectLieDetectorProbe,
@@ -43,6 +46,7 @@ export {
   sha256Bytes,
   sha256Hex,
   toBase64RawURL,
+  type StorageBeaconResult,
 }
 
 export interface NativeHardwareAnchor {
@@ -75,6 +79,7 @@ export interface IdentifyResponse {
   accepted: boolean
   confidence?: number
   exact_slice_id?: string
+  beacon_slice_id?: string
   gpu_audio_slice_id?: string
   sys_net_slice_id?: string
   crowd_slice_id?: string
@@ -90,6 +95,7 @@ export interface ProbePayload {
   v: number
   nonce: string
   collected_at: number
+  beacon_id?: string
   webgl: {
     gpu_vendor: string
     gpu_renderer: string
@@ -106,6 +112,9 @@ export interface ProbePayload {
     timezone: string
     languages: string[]
     screen_spec: string
+    display_gamut_spec?: string
+    voices_hash?: string
+    intl_hash?: string
     canvas_2d_hash: string
     fonts_bitmap_hash: string
   }
@@ -117,6 +126,10 @@ export interface ProbePayload {
     worker_cpu_cores?: number
     worker_platform?: string
     worker_user_agent?: string
+    worker_timezone?: string
+    canvas_noise_injected?: boolean
+    webgl_noise_injected?: boolean
+    storage_healed?: boolean
     math_engine_signature: string
     math_constants_hash: string
     prototype_lies: string[]
@@ -153,6 +166,67 @@ export interface PrismClient {
   }>
   /** Clears the in-memory session cooldown cache. */
   resetSessionCache: () => void
+}
+
+function collectDisplayGamutSpec(): string {
+  try {
+    if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') {
+      return 'srgb|standard|fine'
+    }
+    const gamut = window.matchMedia('(color-gamut: rec2020)').matches
+      ? 'rec2020'
+      : window.matchMedia('(color-gamut: p3)').matches
+        ? 'p3'
+        : 'srgb'
+    const hdr = window.matchMedia('(dynamic-range: high)').matches ? 'hdr' : 'standard'
+    const ptr = window.matchMedia('(pointer: coarse)').matches ? 'coarse' : 'fine'
+    return `${gamut}|${hdr}|${ptr}`
+  } catch {
+    return 'srgb|standard|fine'
+  }
+}
+
+function collectIntlHash(): string {
+  try {
+    const dtf = Intl.DateTimeFormat().resolvedOptions()
+    const nf = Intl.NumberFormat().resolvedOptions()
+    const numSample = new Intl.NumberFormat(undefined, {
+      style: 'currency',
+      currency: 'USD',
+    }).format(123456.78)
+    return sha256Hex(
+      [
+        dtf.locale || '',
+        dtf.calendar || '',
+        dtf.numberingSystem || '',
+        dtf.timeZone || '',
+        nf.locale || '',
+        numSample,
+      ].join('|')
+    ).slice(0, 32)
+  } catch {
+    return ''
+  }
+}
+
+function collectVoicesHash(): string {
+  try {
+    if (
+      typeof speechSynthesis === 'undefined' ||
+      typeof speechSynthesis.getVoices !== 'function'
+    ) {
+      return ''
+    }
+    const voices = speechSynthesis.getVoices() || []
+    if (voices.length === 0) return ''
+    const canonical = voices
+      .map((v) => `${v.voiceURI}|${v.lang}|${v.localService ? 1 : 0}`)
+      .sort()
+      .join(';')
+    return sha256Hex(canonical).slice(0, 32)
+  } catch {
+    return ''
+  }
 }
 
 function collectSystemMetadata() {
@@ -193,6 +267,9 @@ function collectSystemMetadata() {
     timezone,
     languages,
     screenSpec,
+    displayGamutSpec: collectDisplayGamutSpec(),
+    intlHash: collectIntlHash(),
+    voicesHash: collectVoicesHash(),
   }
 }
 
@@ -232,7 +309,7 @@ export function createPrismClient(options: PrismClientOptions = {}): PrismClient
     const fontsCanvas = collectFontsAndCanvasProbe()
     const lieDetector = collectLieDetectorProbe()
 
-    const [audioHash, workerLie, nativeAnchor, turnstileToken] = await Promise.all([
+    const [audioHash, workerLie, storageBeacon, nativeAnchor, turnstileToken] = await Promise.all([
       collectAudioProbe(),
       collectWorkerLieProbe({
         gpuRenderer: webgl.gpu_renderer,
@@ -240,7 +317,9 @@ export function createPrismClient(options: PrismClientOptions = {}): PrismClient
         cpuCores: sysMeta.cpuCores,
         platform: sysMeta.platform,
         userAgent: sysMeta.userAgent,
+        timezone: sysMeta.timezone,
       }),
+      collectAndHealStorageBeacon(),
       options.nativeAnchorProvider
         ? options.nativeAnchorProvider().catch(() => null)
         : Promise.resolve(null),
@@ -253,6 +332,7 @@ export function createPrismClient(options: PrismClientOptions = {}): PrismClient
       v: 1,
       nonce: challenge.nonce,
       collected_at: Date.now(),
+      beacon_id: storageBeacon.beacon_id,
       webgl: {
         gpu_vendor: webgl.gpu_vendor,
         gpu_renderer: webgl.gpu_renderer,
@@ -269,6 +349,9 @@ export function createPrismClient(options: PrismClientOptions = {}): PrismClient
         timezone: sysMeta.timezone,
         languages: sysMeta.languages,
         screen_spec: sysMeta.screenSpec,
+        display_gamut_spec: sysMeta.displayGamutSpec,
+        ...(sysMeta.voicesHash ? { voices_hash: sysMeta.voicesHash } : {}),
+        ...(sysMeta.intlHash ? { intl_hash: sysMeta.intlHash } : {}),
         canvas_2d_hash: fontsCanvas.canvas_2d_hash,
         fonts_bitmap_hash: fontsCanvas.fonts_bitmap_hash,
       },
@@ -280,6 +363,10 @@ export function createPrismClient(options: PrismClientOptions = {}): PrismClient
         worker_cpu_cores: workerLie.worker_cpu_cores,
         worker_platform: workerLie.worker_platform,
         worker_user_agent: workerLie.worker_user_agent,
+        worker_timezone: workerLie.worker_timezone,
+        canvas_noise_injected: fontsCanvas.canvas_noise_injected,
+        webgl_noise_injected: webgl.webgl_noise_injected,
+        storage_healed: storageBeacon.storage_healed,
         math_engine_signature: lieDetector.math_engine_signature,
         math_constants_hash: lieDetector.math_constants_hash,
         prototype_lies: lieDetector.prototype_lies,
@@ -319,7 +406,6 @@ export function createPrismClient(options: PrismClientOptions = {}): PrismClient
       try {
         const headers = await buildAuthHeaders()
 
-        // Optional cooldown check via GET /api/v1/risk/should-collect
         if (!callOpts?.force) {
           try {
             const scRes = await fetchFn(`${baseUrl}/api/v1/risk/should-collect`, {

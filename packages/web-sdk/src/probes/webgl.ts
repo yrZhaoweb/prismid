@@ -15,6 +15,7 @@ export interface WebGLProbeResult {
   static_webgl_fp_hash: string
   spot_pixels: [number, number, number, number][]
   webgl_available: boolean
+  webgl_noise_injected: boolean
 }
 
 export const DEFAULT_SAMPLE_POINTS: [number, number][] = [
@@ -248,6 +249,7 @@ export function collectWebGLProbe(
       static_webgl_fp_hash: sha256Hex('headless-no-webgl-static-fallback'),
       spot_pixels: samplePoints.map(([x, y]) => computeExpectedSpotPixelMath(x, y, renderSeed)),
       webgl_available: false,
+      webgl_noise_injected: false,
     }
   }
 
@@ -269,16 +271,25 @@ export function collectWebGLProbe(
   const limitsVector = extractWebGLLimitsVector(gl)
 
   // Step 1: Render 64x64 static fingerprint scene and hash raw pixel buffer
+  // Also perform dual readPixels determinism check to detect WebGL noise-injection extensions.
   let staticFpHash = ''
+  let webglNoiseInjected = false
   try {
     gl.viewport(0, 0, 64, 64)
     const staticProg = compileProgram(gl, VERTEX_SHADER_SRC, STATIC_FINGERPRINT_FRAGMENT_SHADER_SRC)
     if (staticProg) {
       gl.useProgram(staticProg)
       const buf = drawFullScreenQuad(gl, staticProg)
-      const pixels = new Uint8Array(64 * 64 * 4)
-      gl.readPixels(0, 0, 64, 64, gl.RGBA, gl.UNSIGNED_BYTE, pixels)
-      staticFpHash = sha256Hex(pixels)
+      const pixels1 = new Uint8Array(64 * 64 * 4)
+      const pixels2 = new Uint8Array(64 * 64 * 4)
+      gl.readPixels(0, 0, 64, 64, gl.RGBA, gl.UNSIGNED_BYTE, pixels1)
+      gl.readPixels(0, 0, 64, 64, gl.RGBA, gl.UNSIGNED_BYTE, pixels2)
+      const hash1 = sha256Hex(pixels1)
+      const hash2 = sha256Hex(pixels2)
+      staticFpHash = hash1
+      if (hash1 !== hash2) {
+        webglNoiseInjected = true
+      }
       if (buf) gl.deleteBuffer(buf)
       gl.deleteProgram(staticProg)
     }
@@ -325,5 +336,6 @@ export function collectWebGLProbe(
     static_webgl_fp_hash: staticFpHash,
     spot_pixels: spotPixels,
     webgl_available: true,
+    webgl_noise_injected: webglNoiseInjected,
   }
 }

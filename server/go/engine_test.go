@@ -9,45 +9,6 @@ import (
 	"time"
 )
 
-func buildValidPayload(ch *Challenge) ProbePayload {
-	spots := ComputeAllExpectedSpotPixels(ch.SamplePoints, ch.RenderSeed)
-	return ProbePayload{
-		Version:     1,
-		Nonce:       ch.Nonce,
-		CollectedAt: time.Now().UnixMilli(),
-		WebGL: WebGLProbeData{
-			GPUVendor:         "Apple",
-			GPURenderer:       "Apple M1 Pro",
-			WebGLLimitsVector: "16384|16384|16384,16384|16384|4096|1024|31|1,1|1,511|16|23,23,23,23|a1b2c3d4",
-			StaticWebGLFpHash: "7c4a8d09ca3762af61e59520943dc26494f8941b00112233445566778899aabb",
-			SpotPixels:        spots,
-		},
-		AudioCompressorHash: "4a9e8b7c6d5f4e3a2b1c0d9e8f7a6b5c4d3e2f1a0b9c8d7e6f5a4b3c2d1e0f9a",
-		System: SystemProbeData{
-			UserAgent:       "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
-			Platform:        "MacIntel",
-			CPUCores:        10,
-			DeviceMemory:    8,
-			Timezone:        "Asia/Shanghai",
-			Languages:       []string{"zh-CN", "en-US"},
-			ScreenSpec:      "1728x1117x30@2",
-			Canvas2DHash:    "8f3d2a1b9c0e7f6a5b4c3d2e1f0a9b8c",
-			FontsBitmapHash: "1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f",
-		},
-		Lies: LieProbeData{
-			WorkerUnavailable:       false,
-			WorkerLieDetected:       false,
-			WorkerGPURenderer:       "Apple M1 Pro",
-			WorkerStaticWebGLFpHash: "7c4a8d09ca3762af61e59520943dc26494f8941b00112233445566778899aabb",
-			WorkerCPUCores:          10,
-			WorkerPlatform:          "MacIntel",
-			WorkerUserAgent:         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
-			MathEngineSignature:     "v8",
-			MathConstantsHash:       "b9f8e7d6c5b4a392",
-		},
-	}
-}
-
 func sealProbePayload(t *testing.T, nonce string, payload ProbePayload) string {
 	t.Helper()
 	raw, err := json.Marshal(payload)

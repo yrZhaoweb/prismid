@@ -4,6 +4,7 @@
  * Spawns an inline `Blob` Web Worker (`WorkerGlobalScope`) with a 300ms timeout guard.
  * Inside the Worker thread (which escapes main-thread DOM/window tampering extensions):
  *   - Reads `self.navigator.userAgent`, `platform`, `hardwareConcurrency`
+ *   - Reads `Intl.DateTimeFormat().resolvedOptions().timeZone` (catches timezone-spoofing proxy plugins!)
  *   - Creates `new OffscreenCanvas(64, 64).getContext('webgl')` to read `UNMASKED_RENDERER_WEBGL`
  *     and render the exact same static 3D hardware fingerprint scene.
  *
@@ -20,6 +21,7 @@ export interface WorkerComparisonInput {
   cpuCores: number
   platform: string
   userAgent: string
+  timezone?: string
 }
 
 export interface WorkerLieProbeResult {
@@ -30,27 +32,31 @@ export interface WorkerLieProbeResult {
   worker_cpu_cores: number
   worker_platform: string
   worker_user_agent: string
+  worker_timezone: string
 }
 
 export async function collectWorkerLieProbe(
   mainThread: WorkerComparisonInput,
   timeoutMs = 300
 ): Promise<WorkerLieProbeResult> {
+  const emptyUnavailable: WorkerLieProbeResult = {
+    worker_unavailable: true,
+    worker_lie_detected: false,
+    worker_gpu_renderer: '',
+    worker_static_webgl_fp_hash: '',
+    worker_cpu_cores: 0,
+    worker_platform: '',
+    worker_user_agent: '',
+    worker_timezone: '',
+  }
+
   if (
     typeof Worker === 'undefined' ||
     typeof Blob === 'undefined' ||
     typeof URL === 'undefined' ||
     typeof URL.createObjectURL !== 'function'
   ) {
-    return {
-      worker_unavailable: true,
-      worker_lie_detected: false,
-      worker_gpu_renderer: '',
-      worker_static_webgl_fp_hash: '',
-      worker_cpu_cores: 0,
-      worker_platform: '',
-      worker_user_agent: '',
-    }
+    return emptyUnavailable
   }
 
   const workerScript = `
@@ -60,6 +66,10 @@ export async function collectWorkerLieProbe(
         var ua = String(nav.userAgent || '');
         var plat = String(nav.platform || '');
         var cores = Number(nav.hardwareConcurrency || 0);
+        var tz = '';
+        try {
+          tz = String(Intl.DateTimeFormat().resolvedOptions().timeZone || '');
+        } catch (_) {}
         var renderer = '';
         var pixelsArray = null;
 
@@ -100,7 +110,7 @@ export async function collectWorkerLieProbe(
           }
         }
         self.postMessage(
-          { ok: true, ua: ua, plat: plat, cores: cores, renderer: renderer, pixelsBuffer: pixelsArray },
+          { ok: true, ua: ua, plat: plat, cores: cores, tz: tz, renderer: renderer, pixelsBuffer: pixelsArray },
           pixelsArray ? [pixelsArray] : []
         );
       } catch (e) {
@@ -131,15 +141,7 @@ export async function collectWorkerLieProbe(
     }
 
     const timer = setTimeout(() => {
-      finish({
-        worker_unavailable: true,
-        worker_lie_detected: false,
-        worker_gpu_renderer: '',
-        worker_static_webgl_fp_hash: '',
-        worker_cpu_cores: 0,
-        worker_platform: '',
-        worker_user_agent: '',
-      })
+      finish(emptyUnavailable)
     }, timeoutMs)
 
     try {
@@ -149,30 +151,14 @@ export async function collectWorkerLieProbe(
 
       worker.onerror = () => {
         clearTimeout(timer)
-        finish({
-          worker_unavailable: true,
-          worker_lie_detected: false,
-          worker_gpu_renderer: '',
-          worker_static_webgl_fp_hash: '',
-          worker_cpu_cores: 0,
-          worker_platform: '',
-          worker_user_agent: '',
-        })
+        finish(emptyUnavailable)
       }
 
       worker.onmessage = (ev: MessageEvent) => {
         clearTimeout(timer)
         const data = ev.data
         if (!data || !data.ok) {
-          finish({
-            worker_unavailable: true,
-            worker_lie_detected: false,
-            worker_gpu_renderer: '',
-            worker_static_webgl_fp_hash: '',
-            worker_cpu_cores: 0,
-            worker_platform: '',
-            worker_user_agent: '',
-          })
+          finish(emptyUnavailable)
           return
         }
 
@@ -180,6 +166,7 @@ export async function collectWorkerLieProbe(
         const workerCores = Number(data.cores || 0)
         const workerPlat = String(data.plat || '')
         const workerUA = String(data.ua || '')
+        const workerTZ = String(data.tz || '')
         const workerFpHash =
           data.pixelsBuffer instanceof ArrayBuffer
             ? sha256Hex(new Uint8Array(data.pixelsBuffer))
@@ -213,6 +200,9 @@ export async function collectWorkerLieProbe(
         if (workerUA && mainThread.userAgent && workerUA !== mainThread.userAgent) {
           lieDetected = true
         }
+        if (workerTZ && mainThread.timezone && workerTZ !== mainThread.timezone) {
+          lieDetected = true
+        }
 
         finish({
           worker_unavailable: false,
@@ -222,21 +212,14 @@ export async function collectWorkerLieProbe(
           worker_cpu_cores: workerCores,
           worker_platform: workerPlat,
           worker_user_agent: workerUA,
+          worker_timezone: workerTZ,
         })
       }
 
       worker.postMessage('probe')
     } catch {
       clearTimeout(timer)
-      finish({
-        worker_unavailable: true,
-        worker_lie_detected: false,
-        worker_gpu_renderer: '',
-        worker_static_webgl_fp_hash: '',
-        worker_cpu_cores: 0,
-        worker_platform: '',
-        worker_user_agent: '',
-      })
+      finish(emptyUnavailable)
     }
   })
 }

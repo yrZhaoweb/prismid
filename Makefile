@@ -1,4 +1,4 @@
-.PHONY: all test test-go test-web test-rust build run-server
+.PHONY: all test test-go test-web test-rust bench build run-server
 
 all: test build
 
@@ -6,6 +6,9 @@ test: test-go test-rust test-web
 
 test-go:
 	cd server/go && go test -v ./...
+
+bench:
+	cd server/go && go run ./cmd/prismid-bench
 
 test-rust:
 	cd crates/prismid-native && cargo test
