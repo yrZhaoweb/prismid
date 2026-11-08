@@ -1,7 +1,9 @@
 import { spawn, type ChildProcess } from 'node:child_process'
 import crypto from 'node:crypto'
+import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { chromium } from 'playwright-core'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import {
   collectAudioProbe,
@@ -18,6 +20,7 @@ import {
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const GO_SERVER_DIR = path.resolve(__dirname, '../../../server/go')
+const CHROME_MAC_PATH = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
 
 describe('PrismID Web SDK (prismid-js) Unit & Cross-Language Suite', () => {
   it('1. sha256Hex matches Node native crypto SHA-256 across empty, ASCII, and UTF-8 inputs', () => {
@@ -38,7 +41,7 @@ describe('PrismID Web SDK (prismid-js) Unit & Cross-Language Suite', () => {
     expect(pureTsSealed).toBe(webCryptoSealed)
   })
 
-  it('3. GLSL shader mathspot-pixel calculation is deterministic and bounded in [0, 255]', () => {
+  it('3. GLSL shader spot-pixel math calculation is deterministic and bounded in [0, 255]', () => {
     const seed: [number, number, number, number] = [3.141593, 2.718282, 1.618034, 4.669201]
     for (const [x, y] of DEFAULT_SAMPLE_POINTS) {
       const px = computeExpectedSpotPixelMath(x, y, seed)
@@ -90,7 +93,6 @@ describe('PrismID Web SDK (prismid-js) Unit & Cross-Language Suite', () => {
         stdio: 'pipe',
       })
 
-      // Poll /healthz until server is listening
       const deadline = Date.now() + 15000
       while (Date.now() < deadline) {
         try {
@@ -111,7 +113,6 @@ describe('PrismID Web SDK (prismid-js) Unit & Cross-Language Suite', () => {
     })
 
     it('completes full Challenge -> WebGL Math Spot-Pixels -> AEAD Seal -> Go VerifyAndDerive cycle (Web & Desktop Native modes)', async () => {
-      // Test 1: Pure Browser Web mode
       const webClient = createPrismClient({
         baseUrl,
         getAccessToken: () => 'test-jwt-token-web',
@@ -123,7 +124,6 @@ describe('PrismID Web SDK (prismid-js) Unit & Cross-Language Suite', () => {
       expect(webRes?.gpu_audio_slice_id).toMatch(/^d_gpu_[0-9a-f]{32}$/)
       expect(webRes?.sys_net_slice_id).toMatch(/^d_sys_[0-9a-f]{32}$/)
 
-      // Test 2: Desktop Tauri Native mode with NativeHardwareAnchor
       const desktopClient = createPrismClient({
         baseUrl,
         getAccessToken: () => 'test-jwt-token-desktop',
@@ -145,5 +145,74 @@ describe('PrismID Web SDK (prismid-js) Unit & Cross-Language Suite', () => {
       expect(desktopRes?.exact_slice_id).toMatch(/^d_nat_[0-9a-f]{32}$/)
       expect(desktopRes?.gpu_audio_slice_id).toBe(webRes?.gpu_audio_slice_id)
     })
+
+    it.skipIf(!fs.existsSync(CHROME_MAC_PATH))(
+      'executes real Chrome GPU WebGL fragment shader, inline Blob Worker + OffscreenCanvas, OfflineAudioContext & TextMetrics against Go server',
+      async () => {
+        const browser = await chromium.launch({
+          executablePath: CHROME_MAC_PATH,
+          headless: true,
+          args: ['--enable-webgl', '--ignore-gpu-blocklist', '--use-gl=angle'],
+        })
+        try {
+          const page = await browser.newPage()
+          await page.goto(baseUrl, { waitUntil: 'networkidle' })
+
+          // 1. Trigger live browser identify button
+          await page.click('#btn-identify')
+          await page.waitForFunction(
+            () => {
+              const el = document.getElementById('server-out')
+              return el && el.textContent && el.textContent.includes('"accepted": true')
+            },
+            undefined,
+            { timeout: 10000 }
+          )
+
+          const serverOutText = await page.textContent('#server-out')
+          const clientOutText = await page.textContent('#client-out')
+          const serverRes = JSON.parse(serverOutText || '{}')
+          const clientData = JSON.parse(clientOutText || '{}')
+
+          expect(serverRes.accepted).toBe(true)
+          expect(serverRes.exact_slice_id).toMatch(/^d_web_[0-9a-f]{32}$/)
+          expect(serverRes.gpu_audio_slice_id).toMatch(/^d_gpu_[0-9a-f]{32}$/)
+          expect(serverRes.sys_net_slice_id).toMatch(/^d_sys_[0-9a-f]{32}$/)
+          expect(clientData.decrypted_payload.lies.worker_unavailable).toBe(false)
+          expect(clientData.decrypted_payload.lies.worker_lie_detected).toBe(false)
+
+          // 2. Test main-thread navigator tampering caught by inline Blob Worker + OffscreenCanvas in real Chrome!
+          await page.evaluate(() => {
+            Object.defineProperty(navigator, 'hardwareConcurrency', {
+              get: () => 64,
+              configurable: true,
+            })
+            const el = document.getElementById('server-out')
+            if (el) el.textContent = 'pending...'
+          })
+          await page.click('#btn-identify')
+          await page.waitForFunction(
+            () => {
+              const el = document.getElementById('server-out')
+              return el && el.textContent && el.textContent.includes('"accepted": true')
+            },
+            undefined,
+            { timeout: 10000 }
+          )
+          const hookedServerOut = JSON.parse((await page.textContent('#server-out')) || '{}')
+          const hookedClientOut = JSON.parse((await page.textContent('#client-out')) || '{}')
+
+          expect(hookedClientOut.decrypted_payload.lies.worker_lie_detected).toBe(true)
+          expect(hookedServerOut.accepted).toBe(true)
+          expect(hookedServerOut.spoof_trap_triggered).toBe(true)
+          expect(hookedServerOut.spoof_flags).toContain('worker_lie_detected')
+          // And d_gpu_* is STILL identical to the unhooked run!
+          expect(hookedServerOut.gpu_audio_slice_id).toBe(serverRes.gpu_audio_slice_id)
+        } finally {
+          await browser.close()
+        }
+      },
+      25000
+    )
   })
 })
