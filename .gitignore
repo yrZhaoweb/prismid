@@ -1,0 +1,9 @@
+node_modules/
+dist/
+target/
+Cargo.lock
+*.tsbuildinfo
+.DS_Store
+coverage/
+.env
+.env.*

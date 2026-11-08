@@ -1,0 +1,26 @@
+# PrismID Anti-Spoofing & Adversarial Matrix (`ANTI_SPOOFING_MATRIX.md`)
+
+This document catalogs the 8 primary adversarial attack vectors encountered in real-world anti-fraud operations and specifies the exact detection & mitigation logic enforced by PrismID.
+
+---
+
+## 1. Red-Blue Adversarial Defense Matrix
+
+| # | Attack Vector | Attacker Technique | PrismID Defense Mechanism | Verification Outcome |
+|---|---|---|---|---|
+| **1** | **Genuine First-Time Device** | Standard browser or desktop client running on physical hardware. | Passes single-use `nonce`, AEAD decryption, GLSL spot-pixel math (`absDiff <= 2`), GPU register laws, and cross-thread Worker consistency. | `Accepted = true`, `Confidence = 0.95` (Web) or `0.99` (Native), 3 orthogonal slices derived. |
+| **2** | **Challenge Nonce Replay Attack** | Captures a valid `{ c: nonce, p: sealed_blob }` packet via proxy/F12 and replays it for a second account. | `ChallengeStore.Consume(nonce)` atomically deletes the nonce on first read (`GETDEL` semantics). | `Accepted = false`, `ErrorCode = CHALLENGE_NONCE_INVALID_OR_REPLAYED`. |
+| **3** | **Headless Python/Go Random Payload Script** | Generates random JSON/hashes without a real WebGL GPU and encrypts using the public key derivation formula. | Server computes exact GLSL fragment shader values at the 8 challenge coordinates `(x+0.5)/256.0` for `render_seed` `[s0,s1,s2,s3]`. Random or static pixel values fail the `±2` tolerance check. | `Accepted = false`, `ErrorCode = SHADER_SPOT_PIXEL_MATH_MISMATCH`. |
+| **4** | **Anti-Detect Browser + Rotating Residential Proxy Pool** | Uses an anti-detect browser that randomizes Canvas 2D, fonts, and screen resolution while rotating `/24` residential proxy IPs per account. | **`GpuAudioSliceID` (`d_gpu_*`) is 100% decoupled from IP, Canvas 2D, fonts, screen size, and renderer text.** Derived strictly from `StaticWebGLFpHash + WebGLLimitsVector + AudioCompressorHash`. | `d_web_*` and `d_sys_*` change, but **`d_gpu_*` remains 100% identical** across all accounts on that machine, linking them into the same risk component. |
+| **5** | **Main-Thread Hook Extension (`window.navigator` / `WebGL` Spoofing)** | Injects JS on the main thread to override `navigator.userAgent`, `navigator.hardwareConcurrency`, or `WebGLRenderingContext.prototype.getParameter`. | `workerLie.ts` spawns an inline `Blob` Web Worker (`WorkerGlobalScope`) and renders on an independent `OffscreenCanvas`. Main-thread vs. Worker mismatch triggers `worker_lie_detected`. | Flags `worker_lie_detected`, and **substitutes the Worker's unhooked `OffscreenCanvas` GPU hash** to compute the true `d_gpu_*`. |
+| **6** | **Forged GPU Renderer / Impossible Hardware Register Combination** | Script patches `gpu_renderer` to `"Apple M3 Max"` while running on Windows Direct3D (`ALIASED_LINE_WIDTH_RANGE = [1, 1]`, `platform = "Win32"`, or mismatched `Math` FDLIBM engine constants). | `gpu_laws.go` checks hardware register invariants: Apple Silicon GPUs require Apple platform, line width `[1,1]`, `MAX_TEXTURE_SIZE >= 16384`; V8 vs. JSC vs. SpiderMonkey `Math` constants must align with UA. | Flags `gpu_register_law_violation` (and/or `math_engine_ua_mismatch`), rejecting or marking the device as spoofed (`SpoofTrapTriggered = true`). |
+| **7** | **Kernel/API Hook Spoofing Native Motherboard UUID** | Uses a native hook tool on desktop to return a random `IOPlatformUUID` or `MachineGuid` on every launch. | **Hardware Split Honeypot (`native_uuid_split_trap`)**: While `d_nat_*` changes when `hw_uuid` is randomized, the physical GPU slice `d_gpu_*` remains constant. When a single `d_gpu_*` associates with $\ge 2$ distinct `d_nat_*` anchors, the honeypot triggers. | Links all accounts via `d_gpu_*` AND sets `SpoofTrapTriggered = true` (`native_uuid_split_trap`). |
+| **8** | **Cloud Headless Browser (`SwiftShader` / `llvmpipe`) & VMware Clones** | Runs Puppeteer/Playwright inside Docker containers with CPU software rendering (`Google SwiftShader`, `llvmpipe`) or clones VMware/VirtualBox/Parallels VMs. | `gpu_laws.go` + `prismid-native` hypervisor detector checks virtual GPU blacklist and CPU hypervisor flags (`kern.hv_vmm_present`, `VMware`, `VirtualBox`, `QEMU`, `VirtIO`). | Sets `IsVirtualGPU = true` and demotes **`Confidence = 0.30`** (below the `0.60` authoritative threshold), blocking all automated promotional grants. |
+
+---
+
+## 2. Subnet Hardware Mutation Capacity Breaker (7-Day Rolling Window)
+
+Even if an attacker purchases a library of pre-recorded genuine device telemetry and replays them slowly from a single network gateway:
+1. Dynamic `render_seed` challenge-response already blocks static recordings because the 8 sampled pixel values depend on the live 60-second `render_seed`.
+2. In addition, if an attacker farms multiple physical devices or emulators behind a single `/24` IPv4 subnet (or `/48` IPv6 prefix), once the number of distinct `d_gpu_*` slices on that subnet within 7 days reaches the threshold (`MaxDistinctGPUsPerSubnet = 3`, i.e., $\ge 4$ distinct GPUs), the engine emits a shared crowd slice `d_ip24_crowd_<hmac>` (confidence `0.85`), automatically linking all accounts on that subnet into a single connected component.
