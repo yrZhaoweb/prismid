@@ -445,3 +445,86 @@ func TestSubnetHardwareCrowdBreaker(t *testing.T) {
 		}
 	}
 }
+
+// TestConnectedComponentRiskGraph verifies singleton green, multi-account earliest yellow + later red,
+// two-hop transitive closure across orthogonal slices, and virtual GPU (<0.60) staying unknown/pending.
+func TestConnectedComponentRiskGraph(t *testing.T) {
+	ctx := context.Background()
+	v := NewVerifier(Config{HMACSecret: []byte("test-secret-key-32-bytes-long-000")}, nil)
+	graph := NewRiskGraph(AuthoritativeConfidenceThreshold)
+	t0 := time.Date(2026, 11, 8, 0, 0, 0, 0, time.UTC)
+
+	// 1. Account "user_1001" registers on MacBook Chrome at IP 198.51.100.10 -> Green
+	ch1, _ := v.IssueChallenge(ctx, "198.51.100.10")
+	p1 := buildValidPayload(ch1)
+	res1, err := v.VerifyAndDerive(ctx, IdentifyRequest{
+		ChallengeNonce: ch1.Nonce,
+		SealedPayload:  sealProbePayload(t, ch1.Nonce, p1),
+	}, "198.51.100.10")
+	if err != nil {
+		t.Fatalf("user_1001 verify: %v", err)
+	}
+	snap1 := graph.RecordVerification("user_1001", t0, res1)
+	if snap1.RiskStatus != RiskStatusGreen || snap1.RiskPending {
+		t.Fatalf("expected user_1001 to be green, got %+v", snap1)
+	}
+
+	// 2. Account "user_1002" uses rotating residential proxy IP 203.0.113.99 and mutates Canvas/Fonts,
+	//    but runs on the same physical GPU -> shares d_gpu_* with user_1001!
+	//    user_1001 becomes Yellow (earliest), user_1002 becomes Red!
+	ch2, _ := v.IssueChallenge(ctx, "203.0.113.99")
+	p2 := buildValidPayload(ch2)
+	p2.System.Canvas2DHash = "different_canvas_2d"
+	p2.System.FontsBitmapHash = "different_fonts"
+	res2, err := v.VerifyAndDerive(ctx, IdentifyRequest{
+		ChallengeNonce: ch2.Nonce,
+		SealedPayload:  sealProbePayload(t, ch2.Nonce, p2),
+	}, "203.0.113.99")
+	if err != nil {
+		t.Fatalf("user_1002 verify: %v", err)
+	}
+	snap2 := graph.RecordVerification("user_1002", t0.Add(5*time.Minute), res2)
+	if snap2.RiskStatus != RiskStatusRed {
+		t.Fatalf("expected user_1002 to be red, got %+v", snap2)
+	}
+	snap1After := graph.EvaluateSubject("user_1001")
+	if snap1After.RiskStatus != RiskStatusYellow {
+		t.Fatalf("expected earliest user_1001 to become yellow, got %+v", snap1After)
+	}
+
+	// 3. Account "user_1003" on same /24 IP (203.0.113.200) and same OS/CPU/TZ as user_1002,
+	//    even with a mocked different GPU hash -> shares d_sys_* with user_1002 (2-hop transitive link to user_1001)!
+	ch3, _ := v.IssueChallenge(ctx, "203.0.113.200")
+	p3 := buildValidPayload(ch3)
+	p3.WebGL.StaticWebGLFpHash = "spoofed_gpu_hash_for_2hop_test"
+	p3.Lies.WorkerStaticWebGLFpHash = p3.WebGL.StaticWebGLFpHash
+	res3, err := v.VerifyAndDerive(ctx, IdentifyRequest{
+		ChallengeNonce: ch3.Nonce,
+		SealedPayload:  sealProbePayload(t, ch3.Nonce, p3),
+	}, "203.0.113.200")
+	if err != nil {
+		t.Fatalf("user_1003 verify: %v", err)
+	}
+	snap3 := graph.RecordVerification("user_1003", t0.Add(10*time.Minute), res3)
+	if snap3.RiskStatus != RiskStatusRed || len(snap3.ComponentSubjects) != 3 {
+		t.Fatalf("expected 2-hop transitive component of 3 users with user_1003=red, got %+v", snap3)
+	}
+
+	// 4. Account "user_vm" on SwiftShader virtual GPU (Confidence = 0.30 < 0.60) -> stays Unknown (RiskPending = true)
+	chVM, _ := v.IssueChallenge(ctx, "192.0.2.55")
+	pVM := buildValidPayload(chVM)
+	pVM.WebGL.GPURenderer = "Google SwiftShader"
+	pVM.Lies.WorkerGPURenderer = "Google SwiftShader"
+	resVM, err := v.VerifyAndDerive(ctx, IdentifyRequest{
+		ChallengeNonce: chVM.Nonce,
+		SealedPayload:  sealProbePayload(t, chVM.Nonce, pVM),
+	}, "192.0.2.55")
+	if err != nil {
+		t.Fatalf("user_vm verify: %v", err)
+	}
+	snapVM := graph.RecordVerification("user_vm", t0.Add(15*time.Minute), resVM)
+	if snapVM.RiskStatus != RiskStatusUnknown || !snapVM.RiskPending {
+		t.Fatalf("expected SwiftShader user_vm to remain unknown/pending, got %+v", snapVM)
+	}
+}
+

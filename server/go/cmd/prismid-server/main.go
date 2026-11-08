@@ -34,6 +34,7 @@ func main() {
 		HMACSecret:   []byte(secret),
 		ChallengeTTL: 60 * time.Second,
 	}, prismid.NewMemoryChallengeStore())
+	riskGraph := prismid.NewRiskGraph(prismid.AuthoritativeConfidenceThreshold)
 
 	mux := http.NewServeMux()
 
@@ -108,6 +109,28 @@ func main() {
 			writeJSON(w, status, map[string]any{"accepted": false, "message": err.Error()})
 			return
 		}
+
+		subjectID := extractSubjectID(r)
+		if subjectID != "" {
+			snap := riskGraph.RecordVerification(subjectID, time.Now().UTC(), res)
+			writeJSON(w, http.StatusOK, map[string]any{
+				"accepted":            res.Accepted,
+				"confidence":          res.Confidence,
+				"exact_slice_id":      res.ExactSliceID,
+				"gpu_audio_slice_id":  res.GpuAudioSliceID,
+				"sys_net_slice_id":    res.SysNetSliceID,
+				"crowd_slice_id":      res.CrowdSliceID,
+				"ip_subnet":           res.IPSubnet,
+				"is_native":           res.IsNative,
+				"is_virtual_gpu":      res.IsVirtualGPU,
+				"spoof_trap_triggered": res.SpoofTrapTriggered,
+				"spoof_flags":         res.SpoofFlags,
+				"risk_status":         snap.RiskStatus,
+				"risk_pending":        snap.RiskPending,
+				"component_snapshot":  snap,
+			})
+			return
+		}
 		writeJSON(w, http.StatusOK, res)
 	})
 
@@ -135,6 +158,17 @@ func extractClientIP(r *http.Request) string {
 		return host
 	}
 	return r.RemoteAddr
+}
+
+func extractSubjectID(r *http.Request) string {
+	if q := strings.TrimSpace(r.URL.Query().Get("subject_id")); q != "" {
+		return q
+	}
+	auth := strings.TrimSpace(r.Header.Get("Authorization"))
+	if strings.HasPrefix(strings.ToLower(auth), "bearer ") {
+		return strings.TrimSpace(auth[7:])
+	}
+	return ""
 }
 
 func enableCORS(w http.ResponseWriter, r *http.Request) {
