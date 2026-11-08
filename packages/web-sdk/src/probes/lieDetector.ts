@@ -53,20 +53,50 @@ export function collectLieDetectorProbe(): LieDetectorResult {
     mathEngineSignature = 'unknown'
   }
 
-  // 2. Prototype chain & native function integrity inspection
+  // 2. Prototype chain & native function integrity inspection (CreepJS `getPrototypeLies` grade)
   const prototypeLies: string[] = []
   const fnToString = Function.prototype.toString
 
-  const checkNativeFunction = (fn: unknown, label: string) => {
+  const checkNativeFunction = (fn: unknown, label: string, expectedName?: string) => {
     if (typeof fn !== 'function') return
     try {
       const str = fnToString.call(fn)
       if (!/\{\s*\[native code\]\s*\}/.test(str)) {
         prototypeLies.push(`${label}:non_native_toString`)
       }
-      // Check if function itself has an own `toString` override
+      // Check if function itself has an own `toString` or `name` override
       if (Object.prototype.hasOwnProperty.call(fn, 'toString')) {
         prototypeLies.push(`${label}:own_toString_override`)
+      }
+      // Native WebIDL methods & getters never have a `.prototype` property (`'prototype' in fn === false`)
+      if ('prototype' in fn) {
+        prototypeLies.push(`${label}:has_prototype_property`)
+      }
+      // Check expected function `.name` (e.g. `'get userAgent'` for native getters)
+      if (expectedName && fn.name !== expectedName) {
+        prototypeLies.push(`${label}:unexpected_name_${fn.name || 'empty'}`)
+      }
+      // ECMAScript §10.1.2.1 OrdinarySetPrototypeOf cyclic __proto__ invariant:
+      // Calling `Object.setPrototypeOf(fn, Object.create(fn))` on any genuine function MUST
+      // throw `TypeError: Cyclic __proto__ value` because `SameValue(p, O)` matches `fn`.
+      // On an ES6 `new Proxy(target, handler)`, `[[SetPrototypeOf]]` forwards to `target` while
+      // `Object.create(proxy)` links to `proxy` (`SameValue(proxy, target) === false`), so it
+      // succeeds without throwing (or triggers a custom `setPrototypeOf` trap)!
+      const origProto = Object.getPrototypeOf(fn)
+      try {
+        Object.setPrototypeOf(fn, Object.create(fn))
+        prototypeLies.push(`${label}:es6_proxy_detected`)
+      } catch (err) {
+        const stack = (err as Error)?.stack || ''
+        if (stack.includes('Proxy.')) {
+          prototypeLies.push(`${label}:proxy_setPrototypeOf_trap`)
+        }
+      } finally {
+        try {
+          Object.setPrototypeOf(fn, origProto)
+        } catch {
+          // ignore
+        }
       }
     } catch {
       prototypeLies.push(`${label}:proxy_toString_trap`)
@@ -74,46 +104,97 @@ export function collectLieDetectorProbe(): LieDetectorResult {
   }
 
   try {
-    checkNativeFunction(Function.prototype.toString, 'Function.toString')
+    checkNativeFunction(Function.prototype.toString, 'Function.toString', 'toString')
     if (typeof HTMLCanvasElement !== 'undefined') {
-      checkNativeFunction(HTMLCanvasElement.prototype.toDataURL, 'HTMLCanvasElement.toDataURL')
-      checkNativeFunction(HTMLCanvasElement.prototype.getContext, 'HTMLCanvasElement.getContext')
+      checkNativeFunction(HTMLCanvasElement.prototype.toDataURL, 'HTMLCanvasElement.toDataURL', 'toDataURL')
+      checkNativeFunction(HTMLCanvasElement.prototype.getContext, 'HTMLCanvasElement.getContext', 'getContext')
     }
     if (typeof CanvasRenderingContext2D !== 'undefined') {
       checkNativeFunction(
         CanvasRenderingContext2D.prototype.measureText,
-        'CanvasRenderingContext2D.measureText'
+        'CanvasRenderingContext2D.measureText',
+        'measureText'
       )
       checkNativeFunction(
         CanvasRenderingContext2D.prototype.getImageData,
-        'CanvasRenderingContext2D.getImageData'
+        'CanvasRenderingContext2D.getImageData',
+        'getImageData'
       )
     }
     if (typeof WebGLRenderingContext !== 'undefined') {
       checkNativeFunction(
         WebGLRenderingContext.prototype.getParameter,
-        'WebGLRenderingContext.getParameter'
+        'WebGLRenderingContext.getParameter',
+        'getParameter'
       )
       checkNativeFunction(
         WebGLRenderingContext.prototype.readPixels,
-        'WebGLRenderingContext.readPixels'
+        'WebGLRenderingContext.readPixels',
+        'readPixels'
       )
     }
     if (typeof OfflineAudioContext !== 'undefined') {
       checkNativeFunction(
         OfflineAudioContext.prototype.startRendering,
-        'OfflineAudioContext.startRendering'
+        'OfflineAudioContext.startRendering',
+        'startRendering'
       )
     }
+    if (typeof AudioBuffer !== 'undefined') {
+      checkNativeFunction(
+        AudioBuffer.prototype.getChannelData,
+        'AudioBuffer.getChannelData',
+        'getChannelData'
+      )
+      if (typeof AudioBuffer.prototype.copyFromChannel === 'function') {
+        checkNativeFunction(
+          AudioBuffer.prototype.copyFromChannel,
+          'AudioBuffer.copyFromChannel',
+          'copyFromChannel'
+        )
+      }
+    }
     if (typeof Navigator !== 'undefined') {
-      for (const prop of ['userAgent', 'platform', 'hardwareConcurrency', 'webdriver'] as const) {
+      const navProps = [
+        'userAgent',
+        'appVersion',
+        'platform',
+        'hardwareConcurrency',
+        'deviceMemory',
+        'language',
+        'languages',
+        'webdriver',
+        'vendor',
+        'plugins',
+        'mimeTypes',
+        'maxTouchPoints',
+      ] as const
+      for (const prop of navProps) {
         const desc = Object.getOwnPropertyDescriptor(Navigator.prototype, prop)
         if (desc && desc.get) {
-          checkNativeFunction(desc.get, `Navigator.${prop}.get`)
+          checkNativeFunction(desc.get, `Navigator.${prop}.get`, `get ${prop}`)
         }
         if (typeof navigator !== 'undefined' && Object.prototype.hasOwnProperty.call(navigator, prop)) {
           prototypeLies.push(`navigator.${prop}:instance_property_override`)
         }
+      }
+    }
+    if (typeof Screen !== 'undefined' && typeof screen !== 'undefined') {
+      const scrProps = ['width', 'height', 'availWidth', 'availHeight', 'colorDepth', 'pixelDepth'] as const
+      for (const prop of scrProps) {
+        const desc = Object.getOwnPropertyDescriptor(Screen.prototype, prop)
+        if (desc && desc.get) {
+          checkNativeFunction(desc.get, `Screen.${prop}.get`, `get ${prop}`)
+        }
+        if (Object.prototype.hasOwnProperty.call(screen, prop)) {
+          prototypeLies.push(`screen.${prop}:instance_property_override`)
+        }
+      }
+      if (
+        (screen.width > 0 && screen.availWidth > screen.width) ||
+        (screen.height > 0 && screen.availHeight > screen.height)
+      ) {
+        prototypeLies.push('screen:avail_exceeds_total_dimensions')
       }
     }
   } catch {

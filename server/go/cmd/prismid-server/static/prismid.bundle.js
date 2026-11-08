@@ -1142,24 +1142,30 @@ export async function collectWorkerLieProbe(mainThread, timeoutMs = 300) {
  * Completely immune to IP changes, screen size changes, and Canvas 2D noise extensions.
  */
 
-export async function collectAudioProbe(timeoutMs = 400) {
+export async function collectAudioProbeWithTrap(timeoutMs = 400) {
     const OfflineCtx = typeof globalThis !== 'undefined'
         ? globalThis.OfflineAudioContext ||
             globalThis.webkitOfflineAudioContext
         : undefined;
     if (!OfflineCtx) {
-        return sha256Hex('prismid-audio-context-unavailable');
+        return {
+            audio_compressor_hash: sha256Hex('prismid-audio-context-unavailable'),
+            audio_noise_injected: false,
+        };
     }
     return new Promise((resolve) => {
         let done = false;
-        const finish = (hash) => {
+        const finish = (res) => {
             if (done)
                 return;
             done = true;
-            resolve(hash);
+            resolve(res);
         };
         const timer = setTimeout(() => {
-            finish(sha256Hex('prismid-audio-context-timeout'));
+            finish({
+                audio_compressor_hash: sha256Hex('prismid-audio-context-timeout'),
+                audio_noise_injected: false,
+            });
         }, timeoutMs);
         try {
             const ctx = new OfflineCtx(1, 5000, 44100);
@@ -1172,45 +1178,117 @@ export async function collectAudioProbe(timeoutMs = 400) {
             comp.ratio.setValueAtTime(12, ctx.currentTime);
             comp.attack.setValueAtTime(0, ctx.currentTime);
             comp.release.setValueAtTime(0.25, ctx.currentTime);
+            // Start oscillator at sample ~44 (t = 0.001s) so frames [0..16) are a mathematically
+            // guaranteed silent prefix (0.0), while [4500..5000) is fully steady-state compressed!
+            // Wait: to keep 100% hash compatibility for [4500..5000), we keep osc.start(0) on ctx
+            // and check:
+            //  1) Repeat-read determinism: buffer.getChannelData(0) read twice
+            //  2) Cross-surface readback: buffer.getChannelData(0) vs buffer.copyFromChannel()
+            //  3) Unconnected tail / silent channel check via a 2-channel context where channel 1 is silent!
             osc.connect(comp);
             comp.connect(ctx.destination);
             osc.start(0);
+            const inspectBuffer = (buffer) => {
+                const ch0A = buffer.getChannelData(0);
+                const sliceA = new Float32Array(500);
+                for (let i = 0; i < 500; i++) {
+                    sliceA[i] = ch0A[4500 + i];
+                }
+                let noiseInjected = false;
+                // Trap 1: Cross-Surface `copyFromChannel` vs `getChannelData` consistency
+                // Extensions like AudioContext Fingerprint Defender hook `getChannelData` but miss `copyFromChannel`,
+                // or inject per-call random noise so a second read differs from the first!
+                if (typeof buffer.copyFromChannel === 'function') {
+                    try {
+                        const copySlice = new Float32Array(500);
+                        buffer.copyFromChannel(copySlice, 0, 4500);
+                        for (let i = 0; i < 500; i++) {
+                            if (copySlice[i] !== sliceA[i]) {
+                                noiseInjected = true;
+                                break;
+                            }
+                        }
+                    }
+                    catch {
+                        // ignore
+                    }
+                }
+                // Trap 2: Second `getChannelData(0)` call determinism check
+                const ch0B = buffer.getChannelData(0);
+                for (let i = 0; i < 500; i++) {
+                    if (ch0B[4500 + i] !== sliceA[i]) {
+                        noiseInjected = true;
+                        break;
+                    }
+                }
+                // Trap 3: Pristine Silent AudioBuffer Invariant (catches deterministic PRNG seed hooks on AudioBuffer.prototype.getChannelData)
+                try {
+                    const silentBuf = ctx.createBuffer(1, 16, 44100);
+                    const silentData = silentBuf.getChannelData(0);
+                    for (let i = 0; i < silentData.length; i++) {
+                        if (silentData[i] !== 0) {
+                            noiseInjected = true;
+                            break;
+                        }
+                    }
+                }
+                catch {
+                    // ignore
+                }
+                // Trap 4: Realistic magnitude & NaN/Infinity check (CreepJS audio magnitude invariant)
+                let nonZeroCount = 0;
+                let acc = '';
+                for (let i = 0; i < 500; i++) {
+                    const v = sliceA[i];
+                    if (!Number.isFinite(v) || Math.abs(v) > 2.0) {
+                        noiseInjected = true;
+                    }
+                    if (v !== 0)
+                        nonZeroCount++;
+                    acc += v.toFixed(7) + ',';
+                }
+                if (nonZeroCount === 0) {
+                    noiseInjected = true;
+                }
+                return {
+                    audio_compressor_hash: sha256Hex(acc),
+                    audio_noise_injected: noiseInjected,
+                };
+            };
             const renderPromise = ctx.startRendering();
             if (renderPromise && typeof renderPromise.then === 'function') {
                 renderPromise
                     .then((buffer) => {
                     clearTimeout(timer);
-                    const channelData = buffer.getChannelData(0);
-                    const slice = channelData.subarray(4500, 5000);
-                    let acc = '';
-                    for (let i = 0; i < slice.length; i++) {
-                        acc += slice[i].toFixed(7) + ',';
-                    }
-                    finish(sha256Hex(acc));
+                    finish(inspectBuffer(buffer));
                 })
                     .catch(() => {
                     clearTimeout(timer);
-                    finish(sha256Hex('prismid-audio-render-rejected'));
+                    finish({
+                        audio_compressor_hash: sha256Hex('prismid-audio-render-rejected'),
+                        audio_noise_injected: false,
+                    });
                 });
             }
             else {
                 ctx.oncomplete = (ev) => {
                     clearTimeout(timer);
-                    const channelData = ev.renderedBuffer.getChannelData(0);
-                    const slice = channelData.subarray(4500, 5000);
-                    let acc = '';
-                    for (let i = 0; i < slice.length; i++) {
-                        acc += slice[i].toFixed(7) + ',';
-                    }
-                    finish(sha256Hex(acc));
+                    finish(inspectBuffer(ev.renderedBuffer));
                 };
             }
         }
         catch {
             clearTimeout(timer);
-            finish(sha256Hex('prismid-audio-exception'));
+            finish({
+                audio_compressor_hash: sha256Hex('prismid-audio-exception'),
+                audio_noise_injected: false,
+            });
         }
     });
+}
+export async function collectAudioProbe(timeoutMs = 400) {
+    const res = await collectAudioProbeWithTrap(timeoutMs);
+    return res.audio_compressor_hash;
 }
 
 // --- probes/fontsCanvas.js ---
@@ -1326,13 +1404,47 @@ function detectCanvasNoiseInjection() {
                 return true;
             }
         }
-        // Trap 2: Dual-Canvas Determinism Trap (catches per-canvas random seed noise)
+        // Trap 2: In-Scene Complex Text+Arc Deterministic Seed Trap (CreepJS / LiarJS Blank & Solid Invariant)
+        // Smart anti-detect browsers only activate their deterministic PRNG noise filter after `fillText`
+        // and `arc` are called on a context. We draw a full complex scene on `c1`, then carve out:
+        //   - Zone A (x: 224..240, y: 0..16): pristine transparent `clearRect` -> must be strictly rgba(0,0,0,0)
+        //   - Zone B (x: 224..240, y: 16..32): pure solid `rgb(17, 136, 221)` -> must be strictly [17,136,221,255]
         const c1 = document.createElement('canvas');
         const c2 = document.createElement('canvas');
         const url1 = renderCompositeScene(c1);
         const url2 = renderCompositeScene(c2);
         if (url1 !== url2) {
             return true;
+        }
+        const ctx1 = c1.getContext('2d');
+        if (ctx1) {
+            ctx1.globalCompositeOperation = 'source-over';
+            ctx1.clearRect(224, 0, 16, 32);
+            ctx1.fillStyle = 'rgb(17, 136, 221)';
+            ctx1.fillRect(224, 16, 16, 16);
+            const blankData = ctx1.getImageData(224, 0, 16, 16).data;
+            for (let i = 0; i < blankData.length; i++) {
+                if (blankData[i] !== 0) {
+                    return true;
+                }
+            }
+            const solidInScene = ctx1.getImageData(224, 16, 16, 16).data;
+            for (let i = 0; i < solidInScene.length; i += 4) {
+                if (solidInScene[i] !== 17 ||
+                    solidInScene[i + 1] !== 136 ||
+                    solidInScene[i + 2] !== 221 ||
+                    solidInScene[i + 3] !== 255) {
+                    return true;
+                }
+            }
+            // Trap 3: Stateful PRNG Seed Advance Trap (reading getImageData twice on the same complex canvas)
+            const readA = ctx1.getImageData(0, 0, 220, 60).data;
+            const readB = ctx1.getImageData(0, 0, 220, 60).data;
+            for (let i = 0; i < readA.length; i += 16) {
+                if (readA[i] !== readB[i] || readA[i + 1] !== readB[i + 1] || readA[i + 2] !== readB[i + 2]) {
+                    return true;
+                }
+            }
         }
     }
     catch {
@@ -1440,10 +1552,10 @@ export function collectLieDetectorProbe() {
     catch {
         mathEngineSignature = 'unknown';
     }
-    // 2. Prototype chain & native function integrity inspection
+    // 2. Prototype chain & native function integrity inspection (CreepJS `getPrototypeLies` grade)
     const prototypeLies = [];
     const fnToString = Function.prototype.toString;
-    const checkNativeFunction = (fn, label) => {
+    const checkNativeFunction = (fn, label, expectedName) => {
         if (typeof fn !== 'function')
             return;
         try {
@@ -1451,9 +1563,42 @@ export function collectLieDetectorProbe() {
             if (!/\{\s*\[native code\]\s*\}/.test(str)) {
                 prototypeLies.push(`${label}:non_native_toString`);
             }
-            // Check if function itself has an own `toString` override
+            // Check if function itself has an own `toString` or `name` override
             if (Object.prototype.hasOwnProperty.call(fn, 'toString')) {
                 prototypeLies.push(`${label}:own_toString_override`);
+            }
+            // Native WebIDL methods & getters never have a `.prototype` property (`'prototype' in fn === false`)
+            if ('prototype' in fn) {
+                prototypeLies.push(`${label}:has_prototype_property`);
+            }
+            // Check expected function `.name` (e.g. `'get userAgent'` for native getters)
+            if (expectedName && fn.name !== expectedName) {
+                prototypeLies.push(`${label}:unexpected_name_${fn.name || 'empty'}`);
+            }
+            // ECMAScript §10.1.2.1 OrdinarySetPrototypeOf cyclic __proto__ invariant:
+            // Calling `Object.setPrototypeOf(fn, Object.create(fn))` on any genuine function MUST
+            // throw `TypeError: Cyclic __proto__ value` because `SameValue(p, O)` matches `fn`.
+            // On an ES6 `new Proxy(target, handler)`, `[[SetPrototypeOf]]` forwards to `target` while
+            // `Object.create(proxy)` links to `proxy` (`SameValue(proxy, target) === false`), so it
+            // succeeds without throwing (or triggers a custom `setPrototypeOf` trap)!
+            const origProto = Object.getPrototypeOf(fn);
+            try {
+                Object.setPrototypeOf(fn, Object.create(fn));
+                prototypeLies.push(`${label}:es6_proxy_detected`);
+            }
+            catch (err) {
+                const stack = err?.stack || '';
+                if (stack.includes('Proxy.')) {
+                    prototypeLies.push(`${label}:proxy_setPrototypeOf_trap`);
+                }
+            }
+            finally {
+                try {
+                    Object.setPrototypeOf(fn, origProto);
+                }
+                catch {
+                    // ignore
+                }
             }
         }
         catch {
@@ -1461,31 +1606,67 @@ export function collectLieDetectorProbe() {
         }
     };
     try {
-        checkNativeFunction(Function.prototype.toString, 'Function.toString');
+        checkNativeFunction(Function.prototype.toString, 'Function.toString', 'toString');
         if (typeof HTMLCanvasElement !== 'undefined') {
-            checkNativeFunction(HTMLCanvasElement.prototype.toDataURL, 'HTMLCanvasElement.toDataURL');
-            checkNativeFunction(HTMLCanvasElement.prototype.getContext, 'HTMLCanvasElement.getContext');
+            checkNativeFunction(HTMLCanvasElement.prototype.toDataURL, 'HTMLCanvasElement.toDataURL', 'toDataURL');
+            checkNativeFunction(HTMLCanvasElement.prototype.getContext, 'HTMLCanvasElement.getContext', 'getContext');
         }
         if (typeof CanvasRenderingContext2D !== 'undefined') {
-            checkNativeFunction(CanvasRenderingContext2D.prototype.measureText, 'CanvasRenderingContext2D.measureText');
-            checkNativeFunction(CanvasRenderingContext2D.prototype.getImageData, 'CanvasRenderingContext2D.getImageData');
+            checkNativeFunction(CanvasRenderingContext2D.prototype.measureText, 'CanvasRenderingContext2D.measureText', 'measureText');
+            checkNativeFunction(CanvasRenderingContext2D.prototype.getImageData, 'CanvasRenderingContext2D.getImageData', 'getImageData');
         }
         if (typeof WebGLRenderingContext !== 'undefined') {
-            checkNativeFunction(WebGLRenderingContext.prototype.getParameter, 'WebGLRenderingContext.getParameter');
-            checkNativeFunction(WebGLRenderingContext.prototype.readPixels, 'WebGLRenderingContext.readPixels');
+            checkNativeFunction(WebGLRenderingContext.prototype.getParameter, 'WebGLRenderingContext.getParameter', 'getParameter');
+            checkNativeFunction(WebGLRenderingContext.prototype.readPixels, 'WebGLRenderingContext.readPixels', 'readPixels');
         }
         if (typeof OfflineAudioContext !== 'undefined') {
-            checkNativeFunction(OfflineAudioContext.prototype.startRendering, 'OfflineAudioContext.startRendering');
+            checkNativeFunction(OfflineAudioContext.prototype.startRendering, 'OfflineAudioContext.startRendering', 'startRendering');
+        }
+        if (typeof AudioBuffer !== 'undefined') {
+            checkNativeFunction(AudioBuffer.prototype.getChannelData, 'AudioBuffer.getChannelData', 'getChannelData');
+            if (typeof AudioBuffer.prototype.copyFromChannel === 'function') {
+                checkNativeFunction(AudioBuffer.prototype.copyFromChannel, 'AudioBuffer.copyFromChannel', 'copyFromChannel');
+            }
         }
         if (typeof Navigator !== 'undefined') {
-            for (const prop of ['userAgent', 'platform', 'hardwareConcurrency', 'webdriver']) {
+            const navProps = [
+                'userAgent',
+                'appVersion',
+                'platform',
+                'hardwareConcurrency',
+                'deviceMemory',
+                'language',
+                'languages',
+                'webdriver',
+                'vendor',
+                'plugins',
+                'mimeTypes',
+                'maxTouchPoints',
+            ];
+            for (const prop of navProps) {
                 const desc = Object.getOwnPropertyDescriptor(Navigator.prototype, prop);
                 if (desc && desc.get) {
-                    checkNativeFunction(desc.get, `Navigator.${prop}.get`);
+                    checkNativeFunction(desc.get, `Navigator.${prop}.get`, `get ${prop}`);
                 }
                 if (typeof navigator !== 'undefined' && Object.prototype.hasOwnProperty.call(navigator, prop)) {
                     prototypeLies.push(`navigator.${prop}:instance_property_override`);
                 }
+            }
+        }
+        if (typeof Screen !== 'undefined' && typeof screen !== 'undefined') {
+            const scrProps = ['width', 'height', 'availWidth', 'availHeight', 'colorDepth', 'pixelDepth'];
+            for (const prop of scrProps) {
+                const desc = Object.getOwnPropertyDescriptor(Screen.prototype, prop);
+                if (desc && desc.get) {
+                    checkNativeFunction(desc.get, `Screen.${prop}.get`, `get ${prop}`);
+                }
+                if (Object.prototype.hasOwnProperty.call(screen, prop)) {
+                    prototypeLies.push(`screen.${prop}:instance_property_override`);
+                }
+            }
+            if ((screen.width > 0 && screen.availWidth > screen.width) ||
+                (screen.height > 0 && screen.availHeight > screen.height)) {
+                prototypeLies.push('screen:avail_exceeds_total_dimensions');
             }
         }
     }
@@ -1677,8 +1858,8 @@ export function createPrismClient(options = {}) {
         const webgl = collectWebGLProbe(challenge.render_seed, samplePoints);
         const fontsCanvas = collectFontsAndCanvasProbe();
         const lieDetector = collectLieDetectorProbe();
-        const [audioHash, workerLie, storageBeacon, nativeAnchor, turnstileToken] = await Promise.all([
-            collectAudioProbe(),
+        const [audioRes, workerLie, storageBeacon, nativeAnchor, turnstileToken] = await Promise.all([
+            collectAudioProbeWithTrap(),
             collectWorkerLieProbe({
                 gpuRenderer: webgl.gpu_renderer,
                 staticWebGLFpHash: webgl.static_webgl_fp_hash,
@@ -1707,7 +1888,7 @@ export function createPrismClient(options = {}) {
                 static_webgl_fp_hash: webgl.static_webgl_fp_hash,
                 spot_pixels: webgl.spot_pixels,
             },
-            audio_compressor_hash: audioHash,
+            audio_compressor_hash: audioRes.audio_compressor_hash,
             system: {
                 user_agent: sysMeta.userAgent,
                 platform: sysMeta.platform,
@@ -1733,6 +1914,7 @@ export function createPrismClient(options = {}) {
                 worker_timezone: workerLie.worker_timezone,
                 canvas_noise_injected: fontsCanvas.canvas_noise_injected,
                 webgl_noise_injected: webgl.webgl_noise_injected,
+                audio_noise_injected: audioRes.audio_noise_injected,
                 storage_healed: storageBeacon.storage_healed,
                 math_engine_signature: lieDetector.math_engine_signature,
                 math_constants_hash: lieDetector.math_constants_hash,

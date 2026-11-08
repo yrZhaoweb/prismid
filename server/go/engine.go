@@ -124,6 +124,7 @@ type LieProbeData struct {
 	WorkerTimezone          string   `json:"worker_timezone,omitempty"`
 	CanvasNoiseInjected     bool     `json:"canvas_noise_injected,omitempty"`
 	WebGLNoiseInjected      bool     `json:"webgl_noise_injected,omitempty"`
+	AudioNoiseInjected      bool     `json:"audio_noise_injected,omitempty"`
 	StorageHealed           bool     `json:"storage_healed,omitempty"`
 	MathEngineSignature     string   `json:"math_engine_signature"`
 	MathConstantsHash       string   `json:"math_constants_hash"`
@@ -368,6 +369,10 @@ func (v *Verifier) VerifyAndDerive(ctx context.Context, req IdentifyRequest, cli
 	}
 	if payload.Lies.WebGLNoiseInjected {
 		spoofFlags = appendUniqueFlag(spoofFlags, "webgl_noise_injected")
+		spoofTrapTriggered = true
+	}
+	if payload.Lies.AudioNoiseInjected {
+		spoofFlags = appendUniqueFlag(spoofFlags, "audio_noise_injected")
 		spoofTrapTriggered = true
 	}
 	if payload.Lies.StorageHealed {

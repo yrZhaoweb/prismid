@@ -19,7 +19,7 @@ import {
   sha256Hex,
   toBase64RawURL,
 } from './crypto/aead.js'
-import { collectAudioProbe } from './probes/audio.js'
+import { collectAudioProbe, collectAudioProbeWithTrap } from './probes/audio.js'
 import { collectFontsAndCanvasProbe } from './probes/fontsCanvas.js'
 import { collectLieDetectorProbe } from './probes/lieDetector.js'
 import { collectAndHealStorageBeacon, type StorageBeaconResult } from './probes/storageBeacon.js'
@@ -129,6 +129,7 @@ export interface ProbePayload {
     worker_timezone?: string
     canvas_noise_injected?: boolean
     webgl_noise_injected?: boolean
+    audio_noise_injected?: boolean
     storage_healed?: boolean
     math_engine_signature: string
     math_constants_hash: string
@@ -309,8 +310,8 @@ export function createPrismClient(options: PrismClientOptions = {}): PrismClient
     const fontsCanvas = collectFontsAndCanvasProbe()
     const lieDetector = collectLieDetectorProbe()
 
-    const [audioHash, workerLie, storageBeacon, nativeAnchor, turnstileToken] = await Promise.all([
-      collectAudioProbe(),
+    const [audioRes, workerLie, storageBeacon, nativeAnchor, turnstileToken] = await Promise.all([
+      collectAudioProbeWithTrap(),
       collectWorkerLieProbe({
         gpuRenderer: webgl.gpu_renderer,
         staticWebGLFpHash: webgl.static_webgl_fp_hash,
@@ -340,7 +341,7 @@ export function createPrismClient(options: PrismClientOptions = {}): PrismClient
         static_webgl_fp_hash: webgl.static_webgl_fp_hash,
         spot_pixels: webgl.spot_pixels,
       },
-      audio_compressor_hash: audioHash,
+      audio_compressor_hash: audioRes.audio_compressor_hash,
       system: {
         user_agent: sysMeta.userAgent,
         platform: sysMeta.platform,
@@ -366,6 +367,7 @@ export function createPrismClient(options: PrismClientOptions = {}): PrismClient
         worker_timezone: workerLie.worker_timezone,
         canvas_noise_injected: fontsCanvas.canvas_noise_injected,
         webgl_noise_injected: webgl.webgl_noise_injected,
+        audio_noise_injected: audioRes.audio_noise_injected,
         storage_healed: storageBeacon.storage_healed,
         math_engine_signature: lieDetector.math_engine_signature,
         math_constants_hash: lieDetector.math_constants_hash,

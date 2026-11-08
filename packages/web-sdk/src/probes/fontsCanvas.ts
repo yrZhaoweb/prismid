@@ -128,13 +128,53 @@ function detectCanvasNoiseInjection(): boolean {
       }
     }
 
-    // Trap 2: Dual-Canvas Determinism Trap (catches per-canvas random seed noise)
+    // Trap 2: In-Scene Complex Text+Arc Deterministic Seed Trap (CreepJS / LiarJS Blank & Solid Invariant)
+    // Smart anti-detect browsers only activate their deterministic PRNG noise filter after `fillText`
+    // and `arc` are called on a context. We draw a full complex scene on `c1`, then carve out:
+    //   - Zone A (x: 224..240, y: 0..16): pristine transparent `clearRect` -> must be strictly rgba(0,0,0,0)
+    //   - Zone B (x: 224..240, y: 16..32): pure solid `rgb(17, 136, 221)` -> must be strictly [17,136,221,255]
     const c1 = document.createElement('canvas')
     const c2 = document.createElement('canvas')
     const url1 = renderCompositeScene(c1)
     const url2 = renderCompositeScene(c2)
     if (url1 !== url2) {
       return true
+    }
+
+    const ctx1 = c1.getContext('2d')
+    if (ctx1) {
+      ctx1.globalCompositeOperation = 'source-over'
+      ctx1.clearRect(224, 0, 16, 32)
+      ctx1.fillStyle = 'rgb(17, 136, 221)'
+      ctx1.fillRect(224, 16, 16, 16)
+
+      const blankData = ctx1.getImageData(224, 0, 16, 16).data
+      for (let i = 0; i < blankData.length; i++) {
+        if (blankData[i] !== 0) {
+          return true
+        }
+      }
+
+      const solidInScene = ctx1.getImageData(224, 16, 16, 16).data
+      for (let i = 0; i < solidInScene.length; i += 4) {
+        if (
+          solidInScene[i] !== 17 ||
+          solidInScene[i + 1] !== 136 ||
+          solidInScene[i + 2] !== 221 ||
+          solidInScene[i + 3] !== 255
+        ) {
+          return true
+        }
+      }
+
+      // Trap 3: Stateful PRNG Seed Advance Trap (reading getImageData twice on the same complex canvas)
+      const readA = ctx1.getImageData(0, 0, 220, 60).data
+      const readB = ctx1.getImageData(0, 0, 220, 60).data
+      for (let i = 0; i < readA.length; i += 16) {
+        if (readA[i] !== readB[i] || readA[i + 1] !== readB[i + 1] || readA[i + 2] !== readB[i + 2]) {
+          return true
+        }
+      }
     }
   } catch {
     return false
