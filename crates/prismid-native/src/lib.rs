@@ -245,4 +245,33 @@ mod tests {
         let json_str = first.to_json_string();
         assert!(json_str.contains(&first.hw_uuid));
     }
+
+    #[test]
+    fn test_windows_parser_and_bios_serial_preservation() {
+        let reg_out = r#"
+HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Cryptography
+    MachineGuid    REG_SZ    d1b2c3d4-e5f6-4789-abcd-112233445566
+"#;
+        let cim_out = "4C4C4544-0059-3410-8053-B8C04F4A3132\nSN-BIOS-998877\nAMD Ryzen 9 7950X\n34359738368\nFalse\nASUS\n";
+        let parsed = windows::parse_windows_cim_output(reg_out, cim_out, 16);
+        assert_eq!(parsed.platform, "windows");
+        assert_eq!(parsed.hw_uuid, "d1b2c3d4-e5f6-4789-abcd-112233445566");
+        assert_eq!(
+            parsed.serial_number,
+            "SN-BIOS-998877:4C4C4544-0059-3410-8053-B8C04F4A3132"
+        );
+        assert_eq!(parsed.cpu_brand, "AMD Ryzen 9 7950X");
+        assert_eq!(parsed.memory_bytes, 34359738368);
+        assert!(!parsed.is_vm);
+
+        // OEM placeholder BIOS serial falls back cleanly to SMBIOS UUID
+        let cim_oem = "4C4C4544-0059-3410-8053-B8C04F4A3132\nTo be filled by O.E.M.\nIntel Core i9\n17179869184\nTrue\nVMware, Inc.\n";
+        let parsed_vm = windows::parse_windows_cim_output(reg_out, cim_oem, 8);
+        assert_eq!(
+            parsed_vm.serial_number,
+            "4C4C4544-0059-3410-8053-B8C04F4A3132"
+        );
+        assert!(parsed_vm.is_vm);
+        assert_eq!(parsed_vm.vm_vendor, "vmware");
+    }
 }

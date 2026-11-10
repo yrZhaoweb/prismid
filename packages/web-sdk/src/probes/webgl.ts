@@ -12,6 +12,7 @@ export interface WebGLProbeResult {
   gpu_vendor: string
   gpu_renderer: string
   webgl_limits_vector: string
+  webgl_extensions_hash: string
   static_webgl_fp_hash: string
   spot_pixels: [number, number, number, number][]
   webgl_available: boolean
@@ -211,14 +212,6 @@ function extractWebGLLimitsVector(gl: WebGLRenderingContext): string {
     precisions.push(23, 23, 23, 23)
   }
 
-  let extHash = '00000000'
-  try {
-    const exts = (gl.getSupportedExtensions() || []).slice().sort().join(',')
-    extHash = sha256Hex(exts).slice(0, 8)
-  } catch {
-    extHash = '00000000'
-  }
-
   return [
     p(gl.MAX_TEXTURE_SIZE),
     p(gl.MAX_CUBE_MAP_TEXTURE_SIZE),
@@ -231,8 +224,16 @@ function extractWebGLLimitsVector(gl: WebGLRenderingContext): string {
     p(gl.ALIASED_POINT_SIZE_RANGE),
     maxAnisotropy,
     precisions.join(','),
-    extHash,
   ].join('|')
+}
+
+function extractWebGLExtensionsHash(gl: WebGLRenderingContext): string {
+  try {
+    const exts = (gl.getSupportedExtensions() || []).slice().sort().join(',')
+    return sha256Hex(exts).slice(0, 16)
+  } catch {
+    return '0000000000000000'
+  }
 }
 
 export function collectWebGLProbe(
@@ -241,11 +242,13 @@ export function collectWebGLProbe(
 ): WebGLProbeResult {
   const gl = createWebGLContext(256, 256)
   if (!gl) {
-    // Fallback for non-WebGL headless unit test environments
+    // Headless / non-WebGL environment fallback (strictly marked webgl_available: false and SwiftShader,
+    // which server/go demotes to VirtualGPUConfidence = 0.30 / RiskPending = true)
     return {
       gpu_vendor: 'SwiftShader',
       gpu_renderer: 'Google SwiftShader (Headless Fallback)',
-      webgl_limits_vector: '8192|8192|8192,8192|8192|1024|1024|30|1,1|1,1024|0|23,23,23,23|00000000',
+      webgl_limits_vector: '8192|8192|8192,8192|8192|1024|1024|30|1,1|1,1024|0|23,23,23,23',
+      webgl_extensions_hash: '0000000000000000',
       static_webgl_fp_hash: sha256Hex('headless-no-webgl-static-fallback'),
       spot_pixels: samplePoints.map(([x, y]) => computeExpectedSpotPixelMath(x, y, renderSeed)),
       webgl_available: false,
@@ -269,6 +272,7 @@ export function collectWebGLProbe(
   }
 
   const limitsVector = extractWebGLLimitsVector(gl)
+  const extensionsHash = extractWebGLExtensionsHash(gl)
 
   // Step 1: Render 64x64 static fingerprint scene and hash raw pixel buffer
   // Also perform dual readPixels determinism check to detect WebGL noise-injection extensions.
@@ -322,17 +326,17 @@ export function collectWebGLProbe(
     // Fallback if shader compilation was blocked
   }
 
-  if (spotPixels.length !== samplePoints.length) {
-    spotPixels.length = 0
-    for (const [x, y] of samplePoints) {
-      spotPixels.push(computeExpectedSpotPixelMath(x, y, renderSeed))
-    }
+  // Do NOT fall back to CPU math when a WebGL context exists but failed/blocked shader rendering:
+  // fill with [0,0,0,0] so broken/stubbed WebGL mocks fail spot-pixel verification honestly.
+  while (spotPixels.length < samplePoints.length) {
+    spotPixels.push([0, 0, 0, 0])
   }
 
   return {
     gpu_vendor: gpuVendor,
     gpu_renderer: gpuRenderer,
     webgl_limits_vector: limitsVector,
+    webgl_extensions_hash: extensionsHash,
     static_webgl_fp_hash: staticFpHash,
     spot_pixels: spotPixels,
     webgl_available: true,

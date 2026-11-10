@@ -1,6 +1,6 @@
 # PrismID Wire & Cryptographic Protocol Specification (`PROTOCOL_SPEC.md`)
 
-This document defines the exact byte-level cryptographic, mathematical, and JSON schema contracts between `prismid-js` (TypeScript), `prismid-native` (Rust), and `prismid-go` (Go). All implementations must strictly conform to this specification.
+This document defines the byte-level cryptographic, mathematical, and JSON schema contracts between `prismid-js` (TypeScript `v0.4.0`), `prismid-native` (Rust `v0.4.0`), and `prismid-go` (Go `v0.4.0`).
 
 ---
 
@@ -13,10 +13,10 @@ sequenceDiagram
 
     C->>S: POST /api/v1/risk/challenge
     S-->>C: 200 OK { nonce, render_seed: [s0,s1,s2,s3], sample_points: [[x,y]x8], expires_at }
-    Note over C: 1. Run WebGL shader with render_seed on 256x256 canvas<br/>2. Sample 8 RGBA pixels via gl.readPixels(x, y, 1, 1)<br/>3. Run Worker OffscreenCanvas + Audio + Fonts + Lie probes<br/>4. Seal JSON payload with AES-256-GCM using nonce-derived key
+    Note over C: 1. Render WebGL shader with render_seed on 256x256 canvas<br/>2. Sample 8 RGBA pixels via gl.readPixels(x, y, 1, 1)<br/>3. Run 5-Silo Beacon (<=350ms) + Worker + Audio + Canvas + Lie probes<br/>4. Seal JSON payload with AES-256-GCM using nonce-derived key
     C->>S: POST /api/v1/risk/identify { c: nonce, p: sealed_blob, ts?: turnstile_token }
-    Note over S: 1. Atomically consume nonce (reject replay)<br/>2. Derive AES-256 key & open GCM sealed_blob<br/>3. Verify 8 spot pixels against GLSL math (absDiff <= 2)<br/>4. Run 5-layer anti-forgery & derive 3 orthogonal slices
-    S-->>C: 200 OK { accepted, confidence, exact_slice_id, gpu_audio_slice_id, sys_net_slice_id, ... }
+    Note over S: 1. Atomically consume nonce (reject replay)<br/>2. Derive AES-256 key & open GCM sealed_blob<br/>3. Verify 8 spot pixels against GLSL math (absDiff <= 2)<br/>4. Run 5-layer checks & derive hard/soft orthogonal slices
+    S-->>C: 200 OK { accepted, confidence, exact_slice_id, beacon_slice_id, gpu_audio_slice_id, sys_net_slice_id, ... }
 ```
 
 ---
@@ -44,10 +44,10 @@ sequenceDiagram
 }
 ```
 
-- `nonce`: 32 cryptographically random bytes encoded as 64 lowercase hexadecimal characters. Single-use only; TTL is 60 seconds.
-- `render_seed`: Array of 4 floating-point numbers `[s0, s1, s2, s3]` in the range `[1.0, 7.0)`.
+- `nonce`: 32 cryptographically random bytes encoded as 64 lowercase hexadecimal characters. Single-use only (`GETDEL` semantics); default TTL is 60 seconds.
+- `render_seed`: Array of 4 floating-point numbers `[s0, s1, s2, s3]` in the inclusive range `[1.25, 6.75]` (`1.25 + float64(n)/10000.0 * 5.5` where $n \in [0, 9999]$).
 - `sample_points`: Array of 8 coordinate pairs `[x, y]` where $0 \le x < 256$ and $0 \le y < 256$.
-- `issued_at` / `expires_at`: Unix epoch timestamps in milliseconds.
+- `issued_at` / `expires_at`: Unix epoch timestamps in milliseconds (or seconds, auto-normalized by `prismid-go`).
 
 ---
 
@@ -59,7 +59,7 @@ sequenceDiagram
 - In OpenGL ES / WebGL fragment shaders, `gl_FragCoord.xy` evaluates at the **half-pixel center** `(x + 0.5, y + 0.5)` for integer pixel `(x, y)`, with `(0, 0)` at the bottom-left corner.
 - `gl.readPixels(x, y, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, buf)` also uses `(0, 0)` at the bottom-left corner.
 
-### 3.2 Exact Mathematical Formula (GLSL & Go Must Match Character-for-Character)
+### 3.2 Mathematical Formula (GLSL & Go Reference)
 
 For any integer pixel coordinate $(x, y) \in [0, 255]^2$ and seed $[s_0, s_1, s_2, s_3]$:
 
@@ -73,65 +73,46 @@ b &= 0.5 + 0.5 \cdot \sin((u + v) \cdot s_3 + s_0)
 
 Each channel $c \in \{r, g, b\}$ is clamped to $[0.0, 1.0]$ and quantized to an 8-bit unsigned integer $[0, 255]$ via `round(c * 255.0)`, with alpha $a = 255$.
 
-### 3.3 Fragment Shader Source (`webgl.ts`)
+### 3.3 Quantization Tolerance & Trust Boundary (`shader_math.go`)
 
-```glsl
-precision highp float;
-uniform vec4 u_seed;
-void main() {
-  vec2 uv = gl_FragCoord.xy / 256.0;
-  float r = 0.5 + 0.5 * sin(uv.x * u_seed.x + uv.y * u_seed.y + u_seed.z);
-  float g = 0.5 + 0.5 * cos(uv.x * u_seed.y - uv.y * u_seed.z + u_seed.w);
-  float b = 0.5 + 0.5 * sin((uv.x + uv.y) * u_seed.w + u_seed.x);
-  gl_FragColor = vec4(r, g, b, 1.0);
-}
-```
-
-### 3.4 Quantization Tolerance (`shader_math.go`)
-
-Different GPU architectures (Apple Silicon Metal backend, NVIDIA Direct3D11 ANGLE, AMD Vulkan, Mesa) have slight floating-point ULP differences in hardware trigonometric SFU instructions (`sin`/`cos`).
 - The Go verifier computes the expected $[R, G, B, 255]$ for each of the 8 `sample_points` and accepts a sample if and only if for every channel:
   $$|\text{Actual}_c - \text{Expected}_c| \le 2, \quad \text{and} \quad \text{Actual}_A == 255$$
-- A genuine WebGL GPU passes this check with 100% reliability (0% false positive rate), whereas a script guessing random bytes has a $(5/256)^{24} \approx 2.2 \times 10^{-41}$ probability of passing.
+- When a WebGL context exists (`gl != null`), `webgl.ts` strictly reads pixels from the GPU framebuffer without falling back to CPU math; if the WebGL shader fails to compile or link, `spot_pixels` are filled with `[0, 0, 0, 0]` so the server rejects the broken/stubbed WebGL context.
+- **Security Note**: Because the formula above is deterministic and public, an external script outside the browser can compute expected pixels on a CPU. The spot-pixel check guarantees freshness and blocks random/replay payloads, while in-browser hooks are caught by Layers 2–4.
 
 ---
 
 ## 4. Step 3: AEAD (AES-256-GCM) Cryptographic Envelope
 
-### 4.1 Key Derivation & Parameters
-
 1. **Key Derivation**:
    $$\text{Key} = \text{SHA-256}\big(\text{UTF8}(\texttt{"prismid-v1-aead:"} \parallel \text{challenge.nonce})\big)$$
-   Produces a 32-byte (256-bit) AES key.
-2. **Initialization Vector (IV / Nonce)**:
+2. **Initialization Vector (IV)**:
    - 12 cryptographically random bytes generated per encryption call (`crypto.getRandomValues(new Uint8Array(12))`).
 3. **Additional Authenticated Data (AAD)**:
    $$\text{AAD} = \text{UTF8}(\text{challenge.nonce})$$
-   Binds the ciphertext cryptographically to the challenge nonce.
 4. **Ciphertext Wire Format**:
    $$\text{RawEnvelope} = \text{IV}_{[0..12)} \parallel \text{Ciphertext}_{[12..N-16)} \parallel \text{GCM\_Tag}_{[N-16..N)}$$
    $$\text{SealedBlob} = \text{Base64RawURL}(\text{RawEnvelope})$$
-   *(RFC 4648 §5 URL-safe Base64 encoding without `=` padding, matching Go `base64.RawURLEncoding`).*
 
 > [!NOTE]
-> Browser WebCrypto `crypto.subtle.encrypt({ name: "AES-GCM", iv, additionalData: aad, tagLength: 128 }, key, plaintext)` outputs `Ciphertext || GCM_Tag (16B)` directly, which is 100% byte-identical to what Go's `cipher.NewGCM(block).Open(nil, iv, ciphertextWithTag, aad)` expects.
-> For non-HTTPS local LAN debugging environments where `window.crypto.subtle` may be undefined, `aead.ts` includes a compliant pure-TypeScript AES-256-GCM implementation producing the exact same byte layout.
+> Because `challenge.nonce` is transmitted in the challenge response, the AEAD envelope serves as **transport payload obfuscation and nonce-binding** (preventing trivial F12 plaintext editing and binding ciphertext to the single-use `nonce`), not as client-identity authentication. Always run `/api/v1/risk/*` over HTTPS/TLS in production.
 
 ---
 
 ## 5. Decrypted Payload JSON Schema (`ProbePayload`)
-
-Inside the encrypted `SealedBlob`, the UTF-8 JSON plaintext matches the following structure:
 
 ```json
 {
   "v": 1,
   "nonce": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
   "collected_at": 1794096001120,
+  "beacon_id": "a1b2c3d4e5f60718293a4b5c6d7e8f90",
   "webgl": {
+    "webgl_available": true,
     "gpu_vendor": "Apple",
     "gpu_renderer": "Apple M1 Pro",
-    "webgl_limits_vector": "16384|16384|16384,16384|16384|4096|1024|31|1,1|1,511|16|23,23,23,23|e3b0c442",
+    "webgl_limits_vector": "16384|16384|16384,16384|16384|4096|1024|31|1,1|1,511|16|23,23,23,23",
+    "webgl_extensions_hash": "e3b0c442",
     "static_webgl_fp_hash": "7c4a8d09ca3762af61e59520943dc26494f8941b00112233445566778899aabb",
     "spot_pixels": [
       [182, 114, 209, 255],
@@ -164,6 +145,10 @@ Inside the encrypted `SealedBlob`, the UTF-8 JSON plaintext matches the followin
     "worker_cpu_cores": 10,
     "worker_platform": "MacIntel",
     "worker_user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)...",
+    "worker_timezone": "Asia/Shanghai",
+    "canvas_noise_injected": false,
+    "audio_noise_injected": false,
+    "storage_healed": false,
     "math_engine_signature": "v8",
     "math_constants_hash": "b9f8e7d6...",
     "prototype_lies": [],

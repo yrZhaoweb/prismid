@@ -15,10 +15,13 @@ const (
 	RiskStatusRed     = "red"
 )
 
-// Default velocity windows for conditional soft-slice promotion.
+// Default velocity windows and burst thresholds for conditional soft-slice promotion.
 const (
-	DefaultGPUBurstWindow   = 25 * time.Minute
-	DefaultWebProfileWindow = 2 * time.Hour
+	DefaultGPUBurstWindow        = 25 * time.Minute
+	DefaultWebProfileWindow      = 2 * time.Hour
+	DefaultSameNetFarmingWindow  = 6 * time.Hour
+	DefaultCleanBeaconBurstCount = 3
+	DefaultMaxGraphSubjects      = 50000
 )
 
 // GraphSubject represents an account/user node in the orthogonal slice risk graph.
@@ -35,6 +38,8 @@ type GraphEdge struct {
 	Confidence       float64   `json:"confidence"`
 	SpoofTraphit     bool      `json:"spoof_trap_hit,omitempty"`
 	HasBeacon        bool      `json:"has_beacon,omitempty"`
+	BeaconSliceID    string    `json:"beacon_slice_id,omitempty"`
+	NativeSliceID    string    `json:"native_slice_id,omitempty"`
 }
 
 // ComponentSnapshot describes the connected component and risk decision for a subject.
@@ -48,97 +53,225 @@ type ComponentSnapshot struct {
 	SharedSliceIDs    []string `json:"shared_slice_ids"`
 }
 
-// RiskGraph evaluates connected components over (SubjectID, SliceID) bipartite edges
-// using a tiered Hard-Anchor + Conditional Soft-Slice anti-collision model:
+// RiskGraph evaluates connected components over deduplicated (SubjectID, SliceID) bipartite
+// observations using a strict Identity-Anchor vs. Shared-Model separation model:
 //
-//  1. Hard Slices (Always link unconditionally when Confidence >= 0.60):
-//     - d_nat_*         (Desktop Motherboard UUID + Serial + OS Keychain)
-//     - d_bcn_*         (5-Silo Self-Healing Cryptographic Storage Beacon + GPU binding)
-//     - d_ip24_crowd_*  (7-Day /24 Subnet Hardware Mutation Breaker)
-//     - d_gpusys_*      (Compound co-occurrence of d_gpu_* AND d_sys_* on the same /24 network)
+//  1. Per-Device Identity Slices (Always link unconditionally when Confidence >= 0.60):
+//     - d_nat_* (Desktop Motherboard UUID + Serial + Keychain)
+//     - d_kch_* (Desktop OS Keychain / Registry persistent anchor)
+//     - d_bcn_* (Web 128-bit 5-Silo Self-Healing Cryptographic Storage Beacon)
 //
-//  2. Conditional Soft Slices (d_gpu_*, d_web_*, d_sys_*):
-//     - Prevents False Positives (FPR = 0%) where two innocent users in different cities own
-//       the same stock MacBook Pro M3 model (identical d_gpu_*) or two colleagues share office
-//       Wi-Fi (identical d_sys_*).
-//     - Automatically promotes d_gpu_* / d_web_* / d_sys_* to active links when:
-//     a) Active spoofing/noise/lie/storage-heal was detected (SpoofTrapTriggered == true), OR
-//     b) Rapid multi-account burst velocity occurs within DefaultGPUBurstWindow (25 min), OR
-//     c) Stateless/no-beacon mode is used within the velocity window.
+//  2. Shared Model / Environment Soft Slices (d_gpu_*, d_web_*, d_sys_*, d_gpusys_*):
+//     - Two accounts that possess distinct, un-spoofed native anchors (d_nat_A != d_nat_B)
+//     are NEVER merged by model-level d_gpu_* or network-level d_sys_*.
+//     - Two accounts that possess distinct, un-spoofed Web beacons (d_bcn_A != d_bcn_B)
+//     are NEVER merged pairwise by model-level d_gpu_* or d_gpusys_* (preventing false
+//     positives between colleagues with company-issued MacBooks or strangers registering
+//     simultaneously across cities).
+//     - Soft slices promote to active links ONLY when:
+//     a) Active tampering / lie trap was triggered (SpoofTraphit == true), OR
+//     b) Beacons are absent/stripped in stateless mode within the burst window, OR
+//     c) A multi-account Incognito farming batch (>= 3 distinct-beacon accounts sharing the
+//     exact same hardware/environment profile) arrives within the burst window.
 type RiskGraph struct {
-	mu      sync.RWMutex
-	minConf float64
-	edges   []GraphEdge
+	mu           sync.RWMutex
+	minConf      float64
+	maxSubjects  int
+	subjectOrder []string
+	subjectEdges map[string]map[string]GraphEdge
+	sliceEdges   map[string]map[string]GraphEdge
 }
 
-// NewRiskGraph creates a standalone thread-safe orthogonal slice risk graph engine.
+// NewRiskGraph creates a standalone thread-safe, deduplicated, capacity-bounded risk graph.
 func NewRiskGraph(minConfidence float64) *RiskGraph {
 	if minConfidence <= 0 {
 		minConfidence = AuthoritativeConfidenceThreshold
 	}
 	return &RiskGraph{
-		minConf: minConfidence,
-		edges:   make([]GraphEdge, 0),
+		minConf:      minConfidence,
+		maxSubjects:  DefaultMaxGraphSubjects,
+		subjectOrder: make([]string, 0, 256),
+		subjectEdges: make(map[string]map[string]GraphEdge),
+		sliceEdges:   make(map[string]map[string]GraphEdge),
 	}
 }
 
-// RecordVerification links a subject to all orthogonal and compound slices from a VerifyResult
-// and immediately returns the updated ComponentSnapshot for that subject.
+// RecordVerification records or updates a subject's orthogonal slices from a VerifyResult
+// and returns the updated ComponentSnapshot for that subject.
 func (g *RiskGraph) RecordVerification(subjectID string, subjectCreatedAt time.Time, res *VerifyResult) ComponentSnapshot {
 	subjectID = strings.TrimSpace(subjectID)
 	if subjectCreatedAt.IsZero() {
 		subjectCreatedAt = time.Now().UTC()
 	}
+
 	g.mu.Lock()
 	if res != nil && res.Accepted && subjectID != "" {
+		if _, exists := g.subjectEdges[subjectID]; !exists {
+			if g.maxSubjects > 0 && len(g.subjectEdges) >= g.maxSubjects && len(g.subjectOrder) > 0 {
+				oldest := g.subjectOrder[0]
+				g.subjectOrder = g.subjectOrder[1:]
+				g.removeSubjectLocked(oldest)
+			}
+			g.subjectOrder = append(g.subjectOrder, subjectID)
+			g.subjectEdges[subjectID] = make(map[string]GraphEdge)
+		}
+
 		hasBeacon := strings.TrimSpace(res.BeaconSliceID) != ""
+		var nativeSliceID string
+		if res.IsNative && strings.HasPrefix(res.ExactSliceID, "d_nat_") {
+			nativeSliceID = res.ExactSliceID
+		}
+
 		slices := make([]string, 0, 6)
 		slices = append(slices, res.SliceNodes()...)
-		// Add compound GPU+SysNet slice (catches Incognito farming on same /24 network with 0% cross-city or office collision)
 		if res.GpuAudioSliceID != "" && res.SysNetSliceID != "" {
 			slices = append(slices, "d_gpusys_"+res.GpuAudioSliceID[6:]+"_"+res.SysNetSliceID[6:])
 		}
+
 		for _, sliceID := range slices {
-			g.edges = append(g.edges, GraphEdge{
+			sliceID = strings.TrimSpace(sliceID)
+			if sliceID == "" {
+				continue
+			}
+			edge := GraphEdge{
 				SubjectID:        subjectID,
 				SubjectCreatedAt: subjectCreatedAt,
 				SliceID:          sliceID,
 				Confidence:       res.Confidence,
 				SpoofTraphit:     res.SpoofTrapTriggered,
 				HasBeacon:        hasBeacon,
-			})
+				BeaconSliceID:    res.BeaconSliceID,
+				NativeSliceID:    nativeSliceID,
+			}
+			if prev, ok := g.subjectEdges[subjectID][sliceID]; ok {
+				if !prev.SubjectCreatedAt.IsZero() && prev.SubjectCreatedAt.Before(edge.SubjectCreatedAt) {
+					edge.SubjectCreatedAt = prev.SubjectCreatedAt
+				}
+				if prev.SpoofTraphit {
+					edge.SpoofTraphit = true
+				}
+				if prev.Confidence > edge.Confidence {
+					edge.Confidence = prev.Confidence
+				}
+			}
+			g.subjectEdges[subjectID][sliceID] = edge
+			if g.sliceEdges[sliceID] == nil {
+				g.sliceEdges[sliceID] = make(map[string]GraphEdge)
+			}
+			g.sliceEdges[sliceID][subjectID] = edge
 		}
 	}
-	edgesCopy := make([]GraphEdge, len(g.edges))
-	copy(edgesCopy, g.edges)
+	subEdges := g.collectLocalSubgraphEdgesLocked(subjectID)
 	g.mu.Unlock()
 
-	return EvaluateSubjectComponent(edgesCopy, subjectID, g.minConf)
+	return EvaluateSubjectComponent(subEdges, subjectID, g.minConf)
 }
 
-// EvaluateSubject returns the current ComponentSnapshot for a subject.
+// EvaluateSubject returns the current ComponentSnapshot for a subject using bounded local subgraph traversal.
 func (g *RiskGraph) EvaluateSubject(subjectID string) ComponentSnapshot {
+	subjectID = strings.TrimSpace(subjectID)
 	g.mu.RLock()
-	edgesCopy := make([]GraphEdge, len(g.edges))
-	copy(edgesCopy, g.edges)
+	subEdges := g.collectLocalSubgraphEdgesLocked(subjectID)
 	g.mu.RUnlock()
-	return EvaluateSubjectComponent(edgesCopy, strings.TrimSpace(subjectID), g.minConf)
+	return EvaluateSubjectComponent(subEdges, subjectID, g.minConf)
 }
 
-// shouldLinkOnSlice determines whether two observations sharing `slice` should be merged
-// into the same connected component, preventing stock-hardware cross-city collisions and
-// office NAT collisions while preserving 100% recall against fraudsters.
-func shouldLinkOnSlice(slice string, a, b GraphEdge) bool {
-	// Hard slices always link unconditionally:
-	if strings.HasPrefix(slice, "d_nat_") ||
-		strings.HasPrefix(slice, "d_bcn_") ||
-		strings.HasPrefix(slice, "d_ip24_crowd_") ||
-		strings.HasPrefix(slice, "d_gpusys_") {
+func (g *RiskGraph) removeSubjectLocked(subjectID string) {
+	slices, ok := g.subjectEdges[subjectID]
+	if !ok {
+		return
+	}
+	for sliceID := range slices {
+		if smap, ok := g.sliceEdges[sliceID]; ok {
+			delete(smap, subjectID)
+			if len(smap) == 0 {
+				delete(g.sliceEdges, sliceID)
+			}
+		}
+	}
+	delete(g.subjectEdges, subjectID)
+}
+
+// collectLocalSubgraphEdgesLocked extracts only the connected neighborhood of targetSubjectID
+// (up to 3 hops) so evaluation does not copy or scan unrelated subjects across the entire graph.
+func (g *RiskGraph) collectLocalSubgraphEdgesLocked(targetSubjectID string) []GraphEdge {
+	if targetSubjectID == "" {
+		return nil
+	}
+	if _, ok := g.subjectEdges[targetSubjectID]; !ok {
+		return nil
+	}
+
+	visitedSubjects := map[string]bool{targetSubjectID: true}
+	visitedSlices := make(map[string]bool)
+	frontier := []string{targetSubjectID}
+
+	for hop := 0; hop < 3 && len(frontier) > 0; hop++ {
+		var nextFrontier []string
+		for _, sid := range frontier {
+			for sliceID := range g.subjectEdges[sid] {
+				if visitedSlices[sliceID] {
+					continue
+				}
+				visitedSlices[sliceID] = true
+				for neighborSID := range g.sliceEdges[sliceID] {
+					if !visitedSubjects[neighborSID] {
+						visitedSubjects[neighborSID] = true
+						nextFrontier = append(nextFrontier, neighborSID)
+					}
+				}
+			}
+		}
+		frontier = nextFrontier
+	}
+
+	out := make([]GraphEdge, 0, len(visitedSubjects)*4)
+	for sid := range visitedSubjects {
+		for _, edge := range g.subjectEdges[sid] {
+			out = append(out, edge)
+		}
+	}
+	return out
+}
+
+func isPerDeviceHardSlice(slice string) bool {
+	return strings.HasPrefix(slice, "d_nat_") ||
+		strings.HasPrefix(slice, "d_kch_") ||
+		strings.HasPrefix(slice, "d_bcn_")
+}
+
+func hasDifferentCleanNativeAnchors(a, b GraphEdge) bool {
+	if a.SpoofTraphit || b.SpoofTraphit {
+		return false
+	}
+	return a.NativeSliceID != "" && b.NativeSliceID != "" && a.NativeSliceID != b.NativeSliceID
+}
+
+func hasDifferentCleanBeacons(a, b GraphEdge) bool {
+	if a.SpoofTraphit || b.SpoofTraphit {
+		return false
+	}
+	if a.BeaconSliceID != "" && b.BeaconSliceID != "" {
+		return a.BeaconSliceID != b.BeaconSliceID
+	}
+	return a.HasBeacon && b.HasBeacon
+}
+
+// shouldLinkOnSliceWithContext determines whether two observations `a` and `b` sharing `slice`
+// should be merged into the same connected component, taking into account the burst density
+// (`burstClusterCount`) on that slice when distinct clean beacons are present.
+func shouldLinkOnSliceWithContext(slice string, a, b GraphEdge, burstClusterCount int) bool {
+	// 1. Per-device unique anchors (Motherboard UUID, OS Keychain, 128-bit 5-silo Beacon) always link:
+	if isPerDeviceHardSlice(slice) {
 		return true
 	}
 
-	// If either observation triggered any spoofing / noise / Worker lie / storage-heal trap,
-	// immediately promote shared soft slices (d_gpu_*, d_web_*, d_sys_*) to a hard link!
+	// 2. Two distinct un-spoofed Desktop Native machines (d_nat_A != d_nat_B) never merge on soft slices:
+	if hasDifferentCleanNativeAnchors(a, b) {
+		return false
+	}
+
+	// 3. If either observation triggered an active spoofing/lie/noise trap, promote shared hardware slices:
 	if a.SpoofTraphit || b.SpoofTraphit {
 		return true
 	}
@@ -148,35 +281,56 @@ func shouldLinkOnSlice(slice string, a, b GraphEdge) bool {
 		dt = -dt
 	}
 
-	// Conditional Soft Slice 1: d_gpu_* (Cross-IP Physical GPU + Audio)
+	// 4. When both observations carry distinct, intact Web beacons (d_bcn_A != d_bcn_B) and no spoof traps:
+	//    - Never merge a pair of users (burstClusterCount < 3) on shared model/network slices!
+	//      This guarantees 0% false positives when 2 office colleagues use identical company MacBooks
+	//      or 2 strangers in different cities register within 5 minutes of each other.
+	//    - Only link when a multi-account Incognito farming batch (>= 3 distinct-beacon accounts)
+	//      accumulates within the farming window on the same hardware/network slice.
+	if hasDifferentCleanBeacons(a, b) {
+		if burstClusterCount < DefaultCleanBeaconBurstCount {
+			return false
+		}
+		if strings.HasPrefix(slice, "d_gpusys_") {
+			return dt <= DefaultSameNetFarmingWindow
+		}
+		if strings.HasPrefix(slice, "d_web_") {
+			return dt <= DefaultGPUBurstWindow
+		}
+		return false
+	}
+
+	// 5. Stateless / no-beacon observations (BeaconSliceID == ""):
+	if strings.HasPrefix(slice, "d_gpusys_") {
+		return dt <= DefaultSameNetFarmingWindow
+	}
 	if strings.HasPrefix(slice, "d_gpu_") {
-		// Link if accounts arrive in a multi-account farming burst (<= 25 min)
-		if dt <= DefaultGPUBurstWindow {
-			return true
-		}
-		return false
+		return dt <= DefaultGPUBurstWindow
 	}
-
-	// Conditional Soft Slice 2: d_web_* (Full Web Profile)
 	if strings.HasPrefix(slice, "d_web_") {
-		if dt <= DefaultWebProfileWindow {
-			return true
-		}
-		return false
+		return dt <= DefaultWebProfileWindow
 	}
-
-	// Conditional Soft Slice 3: d_sys_* (OS + CPU + TZ + /24 IP)
 	if strings.HasPrefix(slice, "d_sys_") {
-		// In office Wi-Fi where normal users have valid beacons (HasBeacon == true) and no spoof flags,
-		// d_sys_* alone never links colleagues with different hardware!
-		// Only link on raw d_sys_* when beacons are absent/stripped and accounts arrive in a burst.
-		if (!a.HasBeacon || !b.HasBeacon) && dt <= DefaultGPUBurstWindow {
-			return true
-		}
-		return false
+		return (!a.HasBeacon || !b.HasBeacon) && dt <= DefaultGPUBurstWindow
 	}
 
-	return true
+	return false
+}
+
+// countSliceBurstSubjects counts how many distinct subjects observed on `slice` fall within `window`
+// of `refTime`. Used to distinguish a 2-person coincidence from a >=3-account Incognito farming batch.
+func countSliceBurstSubjects(obs []GraphEdge, refTime time.Time, window time.Duration) int {
+	seen := make(map[string]struct{}, len(obs))
+	for _, o := range obs {
+		dt := o.SubjectCreatedAt.Sub(refTime)
+		if dt < 0 {
+			dt = -dt
+		}
+		if dt <= window {
+			seen[o.SubjectID] = struct{}{}
+		}
+	}
+	return len(seen)
 }
 
 // EvaluateSubjectComponent is a pure, stateless function that computes the connected component
@@ -219,6 +373,7 @@ func EvaluateSubjectComponent(edges []GraphEdge, targetSubjectID string, minConf
 		return root
 	}
 
+	// First pass: group valid observations by slice and initialize subject nodes
 	for _, e := range edges {
 		if e.Confidence < minConf {
 			continue
@@ -237,19 +392,6 @@ func EvaluateSubjectComponent(edges []GraphEdge, targetSubjectID string, minConf
 		if e.SpoofTraphit {
 			spoofed[sid] = true
 		}
-
-		for _, prevObs := range sliceObs[slice] {
-			if prevObs.SubjectID == sid {
-				continue
-			}
-			if shouldLinkOnSlice(slice, e, prevObs) {
-				ra, rb := find(sid), find(prevObs.SubjectID)
-				if ra != rb {
-					parent[ra] = rb
-				}
-				activeSharedSlices[slice] = true
-			}
-		}
 		sliceObs[slice] = append(sliceObs[slice], e)
 
 		if subjectSlices[sid] == nil {
@@ -262,6 +404,37 @@ func EvaluateSubjectComponent(edges []GraphEdge, targetSubjectID string, minConf
 
 	if _, ok := parent[targetSubjectID]; !ok {
 		return empty
+	}
+
+	// Second pass: evaluate links per slice with full burst-count context
+	for slice, obsList := range sliceObs {
+		if len(obsList) < 2 {
+			continue
+		}
+		window := DefaultGPUBurstWindow
+		if strings.HasPrefix(slice, "d_gpusys_") {
+			window = DefaultSameNetFarmingWindow
+		} else if strings.HasPrefix(slice, "d_web_") {
+			window = DefaultWebProfileWindow
+		}
+
+		for i := 0; i < len(obsList); i++ {
+			e := obsList[i]
+			burstCount := countSliceBurstSubjects(obsList, e.SubjectCreatedAt, window)
+			for j := 0; j < i; j++ {
+				prevObs := obsList[j]
+				if prevObs.SubjectID == e.SubjectID {
+					continue
+				}
+				if shouldLinkOnSliceWithContext(slice, e, prevObs, burstCount) {
+					ra, rb := find(e.SubjectID), find(prevObs.SubjectID)
+					if ra != rb {
+						parent[ra] = rb
+					}
+					activeSharedSlices[slice] = true
+				}
+			}
+		}
 	}
 
 	targetRoot := find(targetSubjectID)
@@ -305,14 +478,17 @@ func EvaluateSubjectComponent(edges []GraphEdge, targetSubjectID string, minConf
 
 	earliest := members[0]
 	status := RiskStatusGreen
-	if componentSpoofed {
-		status = RiskStatusRed
-	} else if len(members) > 1 {
-		if targetSubjectID == earliest {
+	if len(members) > 1 {
+		if componentSpoofed {
+			status = RiskStatusRed
+		} else if targetSubjectID == earliest {
 			status = RiskStatusYellow
 		} else {
 			status = RiskStatusRed
 		}
+	} else if componentSpoofed {
+		// Single account with active spoofing/tampering trap triggered
+		status = RiskStatusRed
 	}
 
 	return ComponentSnapshot{

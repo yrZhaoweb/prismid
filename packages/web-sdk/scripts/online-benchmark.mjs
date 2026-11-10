@@ -30,8 +30,10 @@ async function startLocalPrismServer(port) {
   throw new Error('Failed to start local prismid-server')
 }
 
-async function runPrismScenario(browser, baseUrl, initScript) {
-  const context = await browser.newContext()
+async function runPrismScenario(browser, baseUrl, initScript, subjectId) {
+  const context = await browser.newContext({
+    extraHTTPHeaders: subjectId ? { Authorization: `Bearer ${subjectId}` } : undefined,
+  })
   if (initScript) {
     await context.addInitScript(initScript)
   }
@@ -295,11 +297,13 @@ async function main() {
       console.log(
         JSON.stringify({
           scenario: name,
+          confidence: res.confidence,
+          risk_status: res.risk_status,
           spoof_trap_triggered: res.spoof_trap_triggered,
           spoof_flags: res.spoof_flags,
-          action: res.risk_evaluation?.action,
-          risk_score: res.risk_evaluation?.risk_score,
-          cluster_id: res.risk_evaluation?.cluster_id,
+          privacy_signals: res.privacy_signals,
+          beacon_slice_id: res.beacon_slice_id,
+          gpu_audio_slice_id: res.gpu_audio_slice_id,
         })
       )
     }

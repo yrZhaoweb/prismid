@@ -1,19 +1,15 @@
 /**
  * PrismID 5-Silo Self-Healing Cryptographic Beacon (`storageBeacon.ts`)
  *
- * Persists a 128-bit (32 hex chars) device beacon across 5 independent browser storage silos:
+ * Persists a 128-bit (32 hex chars) device installation beacon across 5 browser storage silos:
  *   1. `localStorage`
  *   2. `sessionStorage`
- *   3. `IndexedDB` (`prismid_vault` -> `beacons`)
- *   4. `CacheStorage` (`prismid-cache-v1` -> `https://prismid.local/__beacon`)
- *   5. `document.cookie` (`_prismid_bcn`)
+ *   3. `IndexedDB` (`prismid_vault_v1` -> `beacons`)
+ *   4. `CacheStorage` (`prismid-beacon-cache-v1` -> `https://prismid.invalid/__beacon_v1`)
+ *   5. `document.cookie` (`_prismid_bcn_v1`)
  *
- * Accuracy benefits:
- *   - Eliminates False Negatives (FNR) from browser version upgrades (e.g. Chrome 130 -> 131)
- *     and partial storage clearing (when a fraudster clears Cookies or localStorage in F12,
- *     IndexedDB or CacheStorage resurrects the original ID and flags `storage_healed = true`).
- *   - Eliminates False Positives (FPR) across identical hardware models (two innocent users
- *     with the same MacBook Pro M3 model have distinct cryptographic `beacon_id`s).
+ * All asynchronous reads and writes enforce strict per-operation and overall deadlines
+ * so blocked/corrupted browser storage engines can never hang `identify()`.
  */
 
 import { randomBytes } from '../crypto/aead.js'
@@ -126,10 +122,18 @@ function readIndexedDB(timeoutMs = 150): Promise<{ available: boolean; value: st
 
     try {
       const req = indexedDB.open(IDB_NAME, 1)
+      req.onblocked = () => {
+        clearTimeout(timer)
+        finish({ available: false, value: null })
+      }
       req.onupgradeneeded = () => {
-        const db = req.result
-        if (!db.objectStoreNames.contains(IDB_STORE)) {
-          db.createObjectStore(IDB_STORE)
+        try {
+          const db = req.result
+          if (!db.objectStoreNames.contains(IDB_STORE)) {
+            db.createObjectStore(IDB_STORE)
+          }
+        } catch {
+          // ignore
         }
       }
       req.onerror = () => {
@@ -145,12 +149,16 @@ function readIndexedDB(timeoutMs = 150): Promise<{ available: boolean; value: st
           getReq.onsuccess = () => {
             clearTimeout(timer)
             const val = getReq.result
-            db.close()
+            try {
+              db.close()
+            } catch {}
             finish({ available: true, value: isValidBeaconId(val) ? val.trim() : null })
           }
           getReq.onerror = () => {
             clearTimeout(timer)
-            db.close()
+            try {
+              db.close()
+            } catch {}
             finish({ available: true, value: null })
           }
         } catch {
@@ -165,37 +173,71 @@ function readIndexedDB(timeoutMs = 150): Promise<{ available: boolean; value: st
   })
 }
 
-function writeIndexedDB(id: string): Promise<void> {
+function writeIndexedDB(id: string, timeoutMs = 150): Promise<void> {
   if (typeof indexedDB === 'undefined') return Promise.resolve()
   return new Promise((resolve) => {
+    let settled = false
+    const finish = () => {
+      if (settled) return
+      settled = true
+      resolve()
+    }
+    const timer = setTimeout(finish, timeoutMs)
+
     try {
       const req = indexedDB.open(IDB_NAME, 1)
+      req.onblocked = () => {
+        clearTimeout(timer)
+        finish()
+      }
       req.onupgradeneeded = () => {
-        const db = req.result
-        if (!db.objectStoreNames.contains(IDB_STORE)) {
-          db.createObjectStore(IDB_STORE)
+        try {
+          const db = req.result
+          if (!db.objectStoreNames.contains(IDB_STORE)) {
+            db.createObjectStore(IDB_STORE)
+          }
+        } catch {
+          // ignore
         }
       }
-      req.onerror = () => resolve()
+      req.onerror = () => {
+        clearTimeout(timer)
+        finish()
+      }
       req.onsuccess = () => {
         try {
           const db = req.result
           const tx = db.transaction(IDB_STORE, 'readwrite')
           tx.objectStore(IDB_STORE).put(id, STORAGE_KEY)
           tx.oncomplete = () => {
-            db.close()
-            resolve()
+            clearTimeout(timer)
+            try {
+              db.close()
+            } catch {}
+            finish()
           }
           tx.onerror = () => {
-            db.close()
-            resolve()
+            clearTimeout(timer)
+            try {
+              db.close()
+            } catch {}
+            finish()
+          }
+          tx.onabort = () => {
+            clearTimeout(timer)
+            try {
+              db.close()
+            } catch {}
+            finish()
           }
         } catch {
-          resolve()
+          clearTimeout(timer)
+          finish()
         }
       }
     } catch {
-      resolve()
+      clearTimeout(timer)
+      finish()
     }
   })
 }
@@ -205,98 +247,147 @@ async function readCacheStorage(timeoutMs = 150): Promise<{ available: boolean; 
     return { available: false, value: null }
   }
   return new Promise((resolve) => {
-    const timer = setTimeout(() => resolve({ available: false, value: null }), timeoutMs)
+    let settled = false
+    const finish = (res: { available: boolean; value: string | null }) => {
+      if (settled) return
+      settled = true
+      resolve(res)
+    }
+    const timer = setTimeout(() => finish({ available: false, value: null }), timeoutMs)
     caches
       .open(CACHE_NAME)
       .then((cache) => cache.match(CACHE_URL))
       .then((resp) => (resp ? resp.text() : null))
       .then((text) => {
         clearTimeout(timer)
-        resolve({ available: true, value: isValidBeaconId(text) ? text.trim() : null })
+        finish({ available: true, value: isValidBeaconId(text) ? text.trim() : null })
       })
       .catch(() => {
         clearTimeout(timer)
-        resolve({ available: false, value: null })
+        finish({ available: false, value: null })
       })
   })
 }
 
-async function writeCacheStorage(id: string): Promise<void> {
-  if (typeof caches === 'undefined' || typeof Response === 'undefined') return
-  try {
-    const cache = await caches.open(CACHE_NAME)
-    await cache.put(
-      CACHE_URL,
-      new Response(id, {
-        headers: {
-          'Content-Type': 'text/plain',
-          'ETag': `"${id}"`,
-          'Cache-Control': 'max-age=31536000',
-        },
+function writeCacheStorage(id: string, timeoutMs = 150): Promise<void> {
+  if (typeof caches === 'undefined' || typeof Response === 'undefined') return Promise.resolve()
+  return new Promise((resolve) => {
+    let settled = false
+    const finish = () => {
+      if (settled) return
+      settled = true
+      resolve()
+    }
+    const timer = setTimeout(finish, timeoutMs)
+    caches
+      .open(CACHE_NAME)
+      .then((cache) =>
+        cache.put(
+          CACHE_URL,
+          new Response(id, {
+            headers: {
+              'Content-Type': 'text/plain',
+              ETag: `"${id}"`,
+              'Cache-Control': 'max-age=31536000',
+            },
+          })
+        )
+      )
+      .then(() => {
+        clearTimeout(timer)
+        finish()
       })
-    )
-  } catch {
-    // ignore
-  }
+      .catch(() => {
+        clearTimeout(timer)
+        finish()
+      })
+  })
 }
 
-export async function collectAndHealStorageBeacon(): Promise<StorageBeaconResult> {
-  const ls = readLocalStorage()
-  const ss = readSessionStorage()
-  const ck = readCookie()
-  const [idb, cs] = await Promise.all([readIndexedDB(), readCacheStorage()])
+export async function collectAndHealStorageBeacon(timeoutMs = 350): Promise<StorageBeaconResult> {
+  const fallbackId = generateBeaconId()
+  let timer: ReturnType<typeof setTimeout> | undefined
 
-  const silos: { name: string; available: boolean; value: string | null }[] = [
-    { name: 'localStorage', ...ls },
-    { name: 'sessionStorage', ...ss },
-    { name: 'cookie', ...ck },
-    { name: 'indexedDB', ...idb },
-    { name: 'cacheStorage', ...cs },
-  ]
+  const work = (async (): Promise<StorageBeaconResult> => {
+    const ls = readLocalStorage()
+    const ss = readSessionStorage()
+    const ck = readCookie()
+    const perSiloMs = Math.max(40, Math.floor(timeoutMs * 0.4))
+    const [idb, cs] = await Promise.all([readIndexedDB(perSiloMs), readCacheStorage(perSiloMs)])
 
-  const survivingSilos: string[] = []
-  const freq = new Map<string, number>()
-  let missingPrimarySilo = false
+    const silos: { name: string; available: boolean; value: string | null }[] = [
+      { name: 'localStorage', ...ls },
+      { name: 'sessionStorage', ...ss },
+      { name: 'cookie', ...ck },
+      { name: 'indexedDB', ...idb },
+      { name: 'cacheStorage', ...cs },
+    ]
 
-  for (const s of silos) {
-    if (s.value) {
-      survivingSilos.push(s.name)
-      freq.set(s.value, (freq.get(s.value) || 0) + 1)
-    } else if (s.available && (s.name === 'localStorage' || s.name === 'cookie' || s.name === 'indexedDB')) {
-      missingPrimarySilo = true
-    }
-  }
+    const survivingSilos: string[] = []
+    const freq = new Map<string, number>()
+    let missingPrimarySilo = false
 
-  let canonicalId = ''
-  let storageHealed = false
-
-  if (freq.size > 0) {
-    // Pick the majority / first surviving beacon ID
-    let bestCount = -1
-    for (const [id, count] of freq.entries()) {
-      if (count > bestCount) {
-        bestCount = count
-        canonicalId = id
+    for (const s of silos) {
+      if (s.value) {
+        survivingSilos.push(s.name)
+        freq.set(s.value, (freq.get(s.value) || 0) + 1)
+      } else if (
+        s.available &&
+        (s.name === 'localStorage' || s.name === 'cookie' || s.name === 'indexedDB')
+      ) {
+        missingPrimarySilo = true
       }
     }
-    // If at least one silo survived while a primary silo (like localStorage or cookie) was wiped,
-    // or if multiple conflicting beacons existed, mark storage_healed = true!
-    if (missingPrimarySilo || freq.size > 1) {
-      storageHealed = true
+
+    let canonicalId = ''
+    let storageHealed = false
+
+    if (freq.size > 0) {
+      let bestCount = -1
+      for (const [id, count] of freq.entries()) {
+        if (count > bestCount) {
+          bestCount = count
+          canonicalId = id
+        }
+      }
+      if (missingPrimarySilo || freq.size > 1) {
+        storageHealed = true
+      }
+    } else {
+      canonicalId = fallbackId
     }
-  } else {
-    canonicalId = generateBeaconId()
-  }
 
-  // Heal / synchronize all 5 silos with the canonical beacon ID
-  writeLocalStorage(canonicalId)
-  writeSessionStorage(canonicalId)
-  writeCookie(canonicalId)
-  await Promise.all([writeIndexedDB(canonicalId), writeCacheStorage(canonicalId)])
+    writeLocalStorage(canonicalId)
+    writeSessionStorage(canonicalId)
+    writeCookie(canonicalId)
+    await Promise.all([
+      writeIndexedDB(canonicalId, perSiloMs),
+      writeCacheStorage(canonicalId, perSiloMs),
+    ])
 
-  return {
-    beacon_id: canonicalId,
-    storage_healed: storageHealed,
-    surviving_silos: survivingSilos,
+    return {
+      beacon_id: canonicalId,
+      storage_healed: storageHealed,
+      surviving_silos: survivingSilos,
+    }
+  })()
+
+  const deadline = new Promise<StorageBeaconResult>((resolve) => {
+    timer = setTimeout(() => {
+      writeLocalStorage(fallbackId)
+      writeSessionStorage(fallbackId)
+      writeCookie(fallbackId)
+      resolve({
+        beacon_id: fallbackId,
+        storage_healed: false,
+        surviving_silos: [],
+      })
+    }, timeoutMs)
+  })
+
+  try {
+    return await Promise.race([work, deadline])
+  } finally {
+    if (timer !== undefined) clearTimeout(timer)
   }
 }

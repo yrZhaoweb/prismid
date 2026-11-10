@@ -9,6 +9,45 @@ import (
 	"time"
 )
 
+func buildValidPayload(ch *Challenge) ProbePayload {
+	spots := ComputeAllExpectedSpotPixels(ch.SamplePoints, ch.RenderSeed)
+	return ProbePayload{
+		Version:     1,
+		Nonce:       ch.Nonce,
+		CollectedAt: time.Now().UnixMilli(),
+		WebGL: WebGLProbeData{
+			GPUVendor:         "Apple",
+			GPURenderer:       "Apple M1 Pro",
+			WebGLLimitsVector: "16384|16384|16384,16384|16384|4096|1024|31|1,1|1,511|16|23,23,23,23|a1b2c3d4",
+			StaticWebGLFpHash: "7c4a8d09ca3762af61e59520943dc26494f8941b00112233445566778899aabb",
+			SpotPixels:        spots,
+		},
+		AudioCompressorHash: "4a9e8b7c6d5f4e3a2b1c0d9e8f7a6b5c4d3e2f1a0b9c8d7e6f5a4b3c2d1e0f9a",
+		System: SystemProbeData{
+			UserAgent:       "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+			Platform:        "MacIntel",
+			CPUCores:        10,
+			DeviceMemory:    8,
+			Timezone:        "Asia/Shanghai",
+			Languages:       []string{"zh-CN", "en-US"},
+			ScreenSpec:      "1728x1117x30@2",
+			Canvas2DHash:    "8f3d2a1b9c0e7f6a5b4c3d2e1f0a9b8c",
+			FontsBitmapHash: "1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f",
+		},
+		Lies: LieProbeData{
+			WorkerUnavailable:       false,
+			WorkerLieDetected:       false,
+			WorkerGPURenderer:       "Apple M1 Pro",
+			WorkerStaticWebGLFpHash: "7c4a8d09ca3762af61e59520943dc26494f8941b00112233445566778899aabb",
+			WorkerCPUCores:          10,
+			WorkerPlatform:          "MacIntel",
+			WorkerUserAgent:         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+			MathEngineSignature:     "v8",
+			MathConstantsHash:       "b9f8e7d6c5b4a392",
+		},
+	}
+}
+
 func sealProbePayload(t *testing.T, nonce string, payload ProbePayload) string {
 	t.Helper()
 	raw, err := json.Marshal(payload)
@@ -314,14 +353,14 @@ func TestVector7_NativeUUIDSplitHoneypotTriggered(t *testing.T) {
 		t.Fatalf("did not expect SpoofTrapTriggered on first native UUID")
 	}
 
-	// Launch 2 on the same physical GPU, but attacker hooked ioreg to return a fake random UUID!
+	// Launch 2 on the same physical MacBook (same KeychainAnchor kc001), but attacker hooked ioreg to return a fake random UUID!
 	ch2, _ := v.IssueChallenge(ctx, "203.0.113.80")
 	p2 := buildValidPayload(ch2)
 	p2.NativeAnchor = &NativeHardwareAnchor{
 		Platform:       "macos",
 		HWUUID:         "FAKE-UUID-9999-8888-7777-666655554444",
 		SerialNumber:   "FAKESER999",
-		KeychainAnchor: "fake_kc_999",
+		KeychainAnchor: "kc001",
 		CPUCores:       10,
 	}
 	res2, err := v.VerifyAndDerive(ctx, IdentifyRequest{
@@ -489,3 +528,279 @@ func TestConnectedComponentRiskGraph(t *testing.T) {
 	}
 }
 
+// TestAuditRegression_F2_SameModelColleagues48hAndCrossCity5mStayGreen verifies GPT Finding F2:
+// 1. Two users sharing the exact same GPU/Audio and same /24 subnet with different beacons 48h apart stay Green.
+// 2. Two users sharing the exact same GPU/Audio across different /24 subnets with different beacons 5m apart stay Green.
+func TestAuditRegression_F2_SameModelColleagues48hAndCrossCity5mStayGreen(t *testing.T) {
+	ctx := context.Background()
+	v := NewVerifier(Config{HMACSecret: []byte("test-secret-key-32-bytes-long-000")}, nil)
+	graph := NewRiskGraph(AuthoritativeConfidenceThreshold)
+	t0 := time.Date(2026, 11, 10, 12, 0, 0, 0, time.UTC)
+
+	// Case 1: Same GPU/Audio, same /24 subnet (198.51.100.x), distinct beacons, 48 hours apart
+	ch1, _ := v.IssueChallenge(ctx, "198.51.100.10")
+	p1 := buildValidPayload(ch1)
+	p1.BeaconID = "a0010000000000000000000000000001"
+	res1, err := v.VerifyAndDerive(ctx, IdentifyRequest{ChallengeNonce: ch1.Nonce, SealedPayload: sealProbePayload(t, ch1.Nonce, p1)}, "198.51.100.10")
+	if err != nil {
+		t.Fatalf("alice verify: %v", err)
+	}
+	snap1 := graph.RecordVerification("colleague_alice", t0, res1)
+	if snap1.RiskStatus != RiskStatusGreen {
+		t.Fatalf("expected colleague_alice green, got %+v", snap1)
+	}
+
+	ch2, _ := v.IssueChallenge(ctx, "198.51.100.20")
+	p2 := buildValidPayload(ch2)
+	p2.BeaconID = "a0020000000000000000000000000002"
+	res2, err := v.VerifyAndDerive(ctx, IdentifyRequest{ChallengeNonce: ch2.Nonce, SealedPayload: sealProbePayload(t, ch2.Nonce, p2)}, "198.51.100.20")
+	if err != nil {
+		t.Fatalf("bob verify: %v", err)
+	}
+	snap2 := graph.RecordVerification("colleague_bob", t0.Add(48*time.Hour), res2)
+	if snap2.RiskStatus != RiskStatusGreen || len(snap2.ComponentSubjects) != 1 {
+		t.Fatalf("expected colleague_bob (48h later, distinct beacon, same /24 & GPU) to stay green, got %+v", snap2)
+	}
+
+	// Case 2: Different /24 subnet, same GPU/Audio, distinct beacons, 5 minutes apart
+	ch3, _ := v.IssueChallenge(ctx, "203.0.113.55")
+	p3 := buildValidPayload(ch3)
+	p3.BeaconID = "a0030000000000000000000000000003"
+	res3, err := v.VerifyAndDerive(ctx, IdentifyRequest{ChallengeNonce: ch3.Nonce, SealedPayload: sealProbePayload(t, ch3.Nonce, p3)}, "203.0.113.55")
+	if err != nil {
+		t.Fatalf("charlie verify: %v", err)
+	}
+	snap3 := graph.RecordVerification("stranger_charlie", t0.Add(5*time.Minute), res3)
+	if snap3.RiskStatus != RiskStatusGreen || len(snap3.ComponentSubjects) != 1 {
+		t.Fatalf("expected stranger_charlie (5m later, different /24, distinct beacon, same GPU) to stay green, got %+v", snap3)
+	}
+}
+
+// TestAuditRegression_F2_TwoDistinctPhysicalMacBooksDoNotTriggerUUIDSplitTrap verifies GPT Finding F2:
+// Two separate physical MacBooks of the same model (distinct HWUUID, SerialNumber, KeychainAnchor, and BeaconID)
+// do NOT trigger native_uuid_split_trap and stay Green, whereas hooking HWUUID on the SAME machine (same KeychainAnchor)
+// DOES trigger native_uuid_split_trap and turns Red.
+func TestAuditRegression_F2_TwoDistinctPhysicalMacBooksDoNotTriggerUUIDSplitTrap(t *testing.T) {
+	ctx := context.Background()
+	v := NewVerifier(Config{HMACSecret: []byte("test-secret-key-32-bytes-long-000")}, nil)
+	graph := NewRiskGraph(AuthoritativeConfidenceThreshold)
+	t0 := time.Date(2026, 11, 10, 14, 0, 0, 0, time.UTC)
+
+	// Physical MacBook #1
+	ch1, _ := v.IssueChallenge(ctx, "198.51.100.10")
+	p1 := buildValidPayload(ch1)
+	p1.BeaconID = "b0010000000000000000000000000001"
+	p1.NativeAnchor = &NativeHardwareAnchor{
+		Platform:       "macos",
+		HWUUID:         "11111111-2222-3333-4444-555555550001",
+		SerialNumber:   "C02MACBOOK01",
+		KeychainAnchor: "kc_macbook_01",
+		CPUCores:       10,
+	}
+	res1, err := v.VerifyAndDerive(ctx, IdentifyRequest{ChallengeNonce: ch1.Nonce, SealedPayload: sealProbePayload(t, ch1.Nonce, p1)}, "198.51.100.10")
+	if err != nil {
+		t.Fatalf("macbook 1 verify: %v", err)
+	}
+	snap1 := graph.RecordVerification("mac_owner_1", t0, res1)
+	if res1.SpoofTrapTriggered || snap1.RiskStatus != RiskStatusGreen {
+		t.Fatalf("expected mac_owner_1 green without spoof trap, got res=%+v snap=%+v", res1, snap1)
+	}
+
+	// Physical MacBook #2 (exact same M1 Pro GPU/Audio & same office /24 IP, but distinct physical machine!)
+	ch2, _ := v.IssueChallenge(ctx, "198.51.100.11")
+	p2 := buildValidPayload(ch2)
+	p2.BeaconID = "b0020000000000000000000000000002"
+	p2.NativeAnchor = &NativeHardwareAnchor{
+		Platform:       "macos",
+		HWUUID:         "99999999-8888-7777-6666-555555550002",
+		SerialNumber:   "C02MACBOOK02",
+		KeychainAnchor: "kc_macbook_02",
+		CPUCores:       10,
+	}
+	res2, err := v.VerifyAndDerive(ctx, IdentifyRequest{ChallengeNonce: ch2.Nonce, SealedPayload: sealProbePayload(t, ch2.Nonce, p2)}, "198.51.100.11")
+	if err != nil {
+		t.Fatalf("macbook 2 verify: %v", err)
+	}
+	snap2 := graph.RecordVerification("mac_owner_2", t0.Add(2*time.Minute), res2)
+	if res2.SpoofTrapTriggered || snap2.RiskStatus != RiskStatusGreen {
+		t.Fatalf("expected distinct physical MacBook #2 to NOT trigger native_uuid_split_trap and stay green, got res=%+v snap=%+v", res2, snap2)
+	}
+
+	// Now simulate an attacker on Physical MacBook #1 hooking ioreg HWUUID while KeychainAnchor `kc_macbook_01` persists:
+	ch3, _ := v.IssueChallenge(ctx, "203.0.113.99")
+	p3 := buildValidPayload(ch3)
+	p3.BeaconID = "b0030000000000000000000000000003"
+	p3.NativeAnchor = &NativeHardwareAnchor{
+		Platform:       "macos",
+		HWUUID:         "HOOKED-UUID-0000-0000-999999999999",
+		SerialNumber:   "HOOKEDSER99",
+		KeychainAnchor: "kc_macbook_01", // Same OS Keychain anchor on MacBook #1
+		CPUCores:       10,
+	}
+	res3, err := v.VerifyAndDerive(ctx, IdentifyRequest{ChallengeNonce: ch3.Nonce, SealedPayload: sealProbePayload(t, ch3.Nonce, p3)}, "203.0.113.99")
+	if err != nil {
+		t.Fatalf("hooked macbook 1 verify: %v", err)
+	}
+	snap3 := graph.RecordVerification("mac_owner_1_alt", t0.Add(10*time.Minute), res3)
+	if !res3.SpoofTrapTriggered || snap3.RiskStatus != RiskStatusRed {
+		t.Fatalf("expected hooked HWUUID on same KeychainAnchor to trigger native_uuid_split_trap and turn red, got res=%+v snap=%+v", res3, snap3)
+	}
+}
+
+// TestAuditRegression_F3_SingleUserStorageHealedStaysGreen verifies GPT Finding F3 & DeepSeek #5B:
+// A single user who cleared Cookies / experienced Safari ITP (StorageHealed=true) is NOT marked red;
+// PrivacySignals records "storage_healed" and only a 2nd account sharing the healed d_bcn_* turns red.
+func TestAuditRegression_F3_SingleUserStorageHealedStaysGreen(t *testing.T) {
+	ctx := context.Background()
+	v := NewVerifier(Config{HMACSecret: []byte("test-secret-key-32-bytes-long-000")}, nil)
+	graph := NewRiskGraph(AuthoritativeConfidenceThreshold)
+	t0 := time.Date(2026, 11, 10, 15, 0, 0, 0, time.UTC)
+
+	ch1, _ := v.IssueChallenge(ctx, "198.51.100.30")
+	p1 := buildValidPayload(ch1)
+	p1.BeaconID = "c0010000000000000000000000000001"
+	p1.Lies.StorageHealed = true
+	res1, err := v.VerifyAndDerive(ctx, IdentifyRequest{ChallengeNonce: ch1.Nonce, SealedPayload: sealProbePayload(t, ch1.Nonce, p1)}, "198.51.100.30")
+	if err != nil {
+		t.Fatalf("single user verify: %v", err)
+	}
+	if res1.SpoofTrapTriggered {
+		t.Fatalf("expected SpoofTrapTriggered=false for StorageHealed alone")
+	}
+	if len(res1.PrivacySignals) != 1 || res1.PrivacySignals[0] != "storage_healed" {
+		t.Fatalf("expected PrivacySignals=[storage_healed], got %v", res1.PrivacySignals)
+	}
+	snap1 := graph.RecordVerification("single_safari_user", t0, res1)
+	if snap1.RiskStatus != RiskStatusGreen {
+		t.Fatalf("expected single user with StorageHealed=true to be green, got %+v", snap1)
+	}
+
+	// Second account on the same healed beacon turns red:
+	ch2, _ := v.IssueChallenge(ctx, "203.0.113.40")
+	p2 := buildValidPayload(ch2)
+	p2.BeaconID = "c0010000000000000000000000000001"
+	p2.Lies.StorageHealed = true
+	res2, _ := v.VerifyAndDerive(ctx, IdentifyRequest{ChallengeNonce: ch2.Nonce, SealedPayload: sealProbePayload(t, ch2.Nonce, p2)}, "203.0.113.40")
+	snap2 := graph.RecordVerification("second_account_same_beacon", t0.Add(time.Hour), res2)
+	if snap2.RiskStatus != RiskStatusRed {
+		t.Fatalf("expected second account sharing healed d_bcn_* to be red, got %+v", snap2)
+	}
+}
+
+// TestAuditRegression_F7_BeaconSliceIndependentOfGPUAndExtensionDrift verifies GPT Finding F7:
+// 1. d_bcn_* remains 100% identical even when StaticWebGLFpHash, WebGLLimitsVector, and AudioCompressorHash change.
+// 2. d_gpu_* remains 100% identical when only the 12th volatile extension hash segment of WebGLLimitsVector changes.
+func TestAuditRegression_F7_BeaconSliceIndependentOfGPUAndExtensionDrift(t *testing.T) {
+	ctx := context.Background()
+	v := NewVerifier(Config{HMACSecret: []byte("test-secret-key-32-bytes-long-000")}, nil)
+
+	ch1, _ := v.IssueChallenge(ctx, "198.51.100.10")
+	p1 := buildValidPayload(ch1)
+	p1.BeaconID = "d0010000000000000000000000000001"
+	res1, err := v.VerifyAndDerive(ctx, IdentifyRequest{ChallengeNonce: ch1.Nonce, SealedPayload: sealProbePayload(t, ch1.Nonce, p1)}, "198.51.100.10")
+	if err != nil {
+		t.Fatalf("verify 1: %v", err)
+	}
+
+	// Only extension hash (12th segment of WebGLLimitsVector) changes -> d_gpu_* must NOT change!
+	ch2, _ := v.IssueChallenge(ctx, "198.51.100.10")
+	p2 := buildValidPayload(ch2)
+	p2.BeaconID = "d0010000000000000000000000000001"
+	p2.WebGL.WebGLLimitsVector = "16384|16384|16384,16384|16384|4096|1024|31|1,1|1,511|16|23,23,23,23|new_ext_hash_ff00"
+	res2, err := v.VerifyAndDerive(ctx, IdentifyRequest{ChallengeNonce: ch2.Nonce, SealedPayload: sealProbePayload(t, ch2.Nonce, p2)}, "198.51.100.10")
+	if err != nil {
+		t.Fatalf("verify 2: %v", err)
+	}
+	if res1.GpuAudioSliceID != res2.GpuAudioSliceID {
+		t.Fatalf("expected d_gpu_* to ignore volatile 12th extension hash segment, got %s vs %s", res1.GpuAudioSliceID, res2.GpuAudioSliceID)
+	}
+
+	// Full GPU driver + ANGLE + Audio upgrade -> d_gpu_* changes, but d_bcn_* MUST remain identical!
+	ch3, _ := v.IssueChallenge(ctx, "203.0.113.88")
+	p3 := buildValidPayload(ch3)
+	p3.BeaconID = "d0010000000000000000000000000001"
+	p3.WebGL.StaticWebGLFpHash = "new_angle_shader_hash_after_browser_update_99999999"
+	p3.Lies.WorkerStaticWebGLFpHash = p3.WebGL.StaticWebGLFpHash
+	p3.AudioCompressorHash = "new_audio_compressor_hash_after_update_88888888"
+	res3, err := v.VerifyAndDerive(ctx, IdentifyRequest{ChallengeNonce: ch3.Nonce, SealedPayload: sealProbePayload(t, ch3.Nonce, p3)}, "203.0.113.88")
+	if err != nil {
+		t.Fatalf("verify 3: %v", err)
+	}
+	if res1.BeaconSliceID != res3.BeaconSliceID {
+		t.Fatalf("expected d_bcn_* to remain identical across GPU/Audio upgrade, got %s vs %s", res1.BeaconSliceID, res3.BeaconSliceID)
+	}
+}
+
+// TestAuditRegression_DeepSeek5A_MobileCGNAT40UsersInSameSubnetStayGreen verifies DeepSeek Finding #5A:
+// 40 unrelated normal users with distinct beacons and distinct GPUs sharing a single /24 mobile CGNAT
+// subnet all remain Green (0 false positives), while SubnetCrowdTriggered telemetry is reported.
+func TestAuditRegression_DeepSeek5A_MobileCGNAT40UsersInSameSubnetStayGreen(t *testing.T) {
+	ctx := context.Background()
+	v := NewVerifier(Config{
+		HMACSecret:               []byte("test-secret-key-32-bytes-long-000"),
+		MaxDistinctGPUsPerSubnet: 3,
+	}, nil)
+	graph := NewRiskGraph(AuthoritativeConfidenceThreshold)
+	t0 := time.Date(2026, 11, 10, 16, 0, 0, 0, time.UTC)
+
+	for i := 0; i < 40; i++ {
+		ip := fmt.Sprintf("100.64.88.%d", 10+i)
+		ch, _ := v.IssueChallenge(ctx, ip)
+		p := buildValidPayload(ch)
+		p.BeaconID = fmt.Sprintf("e001000000000000000000000000%04x", i)
+		p.WebGL.StaticWebGLFpHash = fmt.Sprintf("cgnat_distinct_gpu_hash_%04d", i)
+		p.Lies.WorkerStaticWebGLFpHash = p.WebGL.StaticWebGLFpHash
+		res, err := v.VerifyAndDerive(ctx, IdentifyRequest{ChallengeNonce: ch.Nonce, SealedPayload: sealProbePayload(t, ch.Nonce, p)}, ip)
+		if err != nil {
+			t.Fatalf("cgnat user %d verify: %v", i, err)
+		}
+		if i >= 3 && (!res.SubnetCrowdTriggered || res.CrowdSliceID == "") {
+			t.Fatalf("expected SubnetCrowdTriggered=true and CrowdSliceID populated for user %d", i)
+		}
+		snap := graph.RecordVerification(fmt.Sprintf("cgnat_user_%d", i), t0.Add(time.Duration(i)*10*time.Second), res)
+		if snap.RiskStatus != RiskStatusGreen {
+			t.Fatalf("cgnat user %d falsely marked %s (expected green): %+v", i, snap.RiskStatus, snap)
+		}
+	}
+}
+
+// TestAuditRegression_F8_GraphDeduplicationAndClockInjection verifies GPT Finding F8 & DeepSeek other findings:
+// 1. MemoryChallengeStore uses its injected NowFunc clock for deterministic TTL expiry.
+// 2. RiskGraph deduplicates repeated verifications of the same subject without growing unbounded edges.
+func TestAuditRegression_F8_GraphDeduplicationAndClockInjection(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 11, 10, 18, 0, 0, 0, time.UTC)
+	store := NewMemoryChallengeStoreWithClock(func() time.Time { return now })
+	v := NewVerifier(Config{
+		HMACSecret:   []byte("test-secret-key-32-bytes-long-000"),
+		ChallengeTTL: 30 * time.Second,
+	}, store)
+
+	ch, err := v.IssueChallenge(ctx, "198.51.100.10")
+	if err != nil {
+		t.Fatalf("IssueChallenge: %v", err)
+	}
+	sealed := sealProbePayload(t, ch.Nonce, buildValidPayload(ch))
+
+	// Advance fake clock past 30s TTL:
+	now = now.Add(31 * time.Second)
+	if _, err := v.VerifyAndDerive(ctx, IdentifyRequest{ChallengeNonce: ch.Nonce, SealedPayload: sealed}, "198.51.100.10"); err == nil {
+		t.Fatalf("expected expired challenge to be rejected when injected clock advances past TTL")
+	}
+
+	// Verify graph deduplication on repeated identifications of the same subject:
+	graph := NewRiskGraph(AuthoritativeConfidenceThreshold)
+	ch2, _ := v.IssueChallenge(ctx, "198.51.100.10")
+	p2 := buildValidPayload(ch2)
+	p2.BeaconID = "f0010000000000000000000000000001"
+	res2, err := v.VerifyAndDerive(ctx, IdentifyRequest{ChallengeNonce: ch2.Nonce, SealedPayload: sealProbePayload(t, ch2.Nonce, p2)}, "198.51.100.10")
+	if err != nil {
+		t.Fatalf("VerifyAndDerive: %v", err)
+	}
+	for repeat := 0; repeat < 25; repeat++ {
+		snap := graph.RecordVerification("repeat_subject_1", now.Add(time.Duration(repeat)*time.Minute), res2)
+		if snap.RiskStatus != RiskStatusGreen || len(snap.SliceIDs) != 4 {
+			t.Fatalf("repeat %d: expected green with 4 deduplicated slices, got %+v", repeat, snap)
+		}
+	}
+}

@@ -77,16 +77,21 @@ export interface IdentifyWireRequest {
 
 export interface IdentifyResponse {
   accepted: boolean
+  code?: string
+  message?: string
   confidence?: number
   exact_slice_id?: string
+  keychain_slice_id?: string
   beacon_slice_id?: string
   gpu_audio_slice_id?: string
   sys_net_slice_id?: string
   crowd_slice_id?: string
+  subnet_crowd_triggered?: boolean
   is_native?: boolean
   is_virtual_gpu?: boolean
   spoof_trap_triggered?: boolean
   spoof_flags?: string[]
+  privacy_signals?: string[]
   risk_status?: string
   risk_pending?: boolean
 }
@@ -100,6 +105,8 @@ export interface ProbePayload {
     gpu_vendor: string
     gpu_renderer: string
     webgl_limits_vector: string
+    webgl_extensions_hash?: string
+    webgl_available?: boolean
     static_webgl_fp_hash: string
     spot_pixels: [number, number, number, number][]
   }
@@ -155,6 +162,8 @@ export interface PrismClientOptions {
   fetchImpl?: typeof fetch
   /** Session cooldown in milliseconds to avoid redundant collections (default: 5 minutes). */
   cooldownMs?: number
+  /** Per-request network & provider timeout in milliseconds (default: 5000ms). */
+  requestTimeoutMs?: number
 }
 
 export interface PrismClient {
@@ -278,17 +287,43 @@ export function createPrismClient(options: PrismClientOptions = {}): PrismClient
   const baseUrl = (options.baseUrl || '').replace(/\/+$/, '')
   const fetchFn = options.fetchImpl || (typeof fetch !== 'undefined' ? fetch.bind(globalThis) : undefined)
   const cooldownMs = options.cooldownMs ?? 5 * 60 * 1000
+  const requestTimeoutMs = options.requestTimeoutMs ?? 5000
 
   let lastIdentifiedToken: string | null = null
   let lastIdentifiedAt = 0
   let inFlightPromise: Promise<IdentifyResponse | null> | null = null
+
+  function withDeadline<T>(promise: Promise<T>, timeoutMs: number, fallback: T): Promise<T> {
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const deadline = new Promise<T>((resolve) => {
+      timer = setTimeout(() => resolve(fallback), timeoutMs)
+    })
+    return Promise.race([promise, deadline]).finally(() => {
+      if (timer !== undefined) clearTimeout(timer)
+    })
+  }
+
+  async function fetchWithDeadline(url: string, init: RequestInit): Promise<Response> {
+    if (!fetchFn) throw new Error('fetch unavailable')
+    const controller = typeof AbortController !== 'undefined' ? new AbortController() : undefined
+    const timer = controller ? setTimeout(() => controller.abort(), requestTimeoutMs) : undefined
+    try {
+      return await fetchFn(url, controller ? { ...init, signal: controller.signal } : init)
+    } finally {
+      if (timer !== undefined) clearTimeout(timer)
+    }
+  }
 
   async function buildAuthHeaders(): Promise<Record<string, string>> {
     const headers: Record<string, string> = {
       'Content-Type': 'application/json',
     }
     if (options.getAccessToken) {
-      const token = await options.getAccessToken()
+      const token = await withDeadline(
+        Promise.resolve(options.getAccessToken()).catch(() => null),
+        Math.min(requestTimeoutMs, 1500),
+        null
+      )
       if (token) {
         headers['Authorization'] = token.startsWith('Bearer ') ? token : `Bearer ${token}`
       }
@@ -309,6 +344,7 @@ export function createPrismClient(options: PrismClientOptions = {}): PrismClient
     const webgl = collectWebGLProbe(challenge.render_seed, samplePoints)
     const fontsCanvas = collectFontsAndCanvasProbe()
     const lieDetector = collectLieDetectorProbe()
+    const providerTimeoutMs = Math.min(requestTimeoutMs, 1000)
 
     const [audioRes, workerLie, storageBeacon, nativeAnchor, turnstileToken] = await Promise.all([
       collectAudioProbeWithTrap(),
@@ -322,10 +358,18 @@ export function createPrismClient(options: PrismClientOptions = {}): PrismClient
       }),
       collectAndHealStorageBeacon(),
       options.nativeAnchorProvider
-        ? options.nativeAnchorProvider().catch(() => null)
+        ? withDeadline(
+            Promise.resolve(options.nativeAnchorProvider()).catch(() => null),
+            providerTimeoutMs,
+            null
+          )
         : Promise.resolve(null),
       options.getTurnstileToken
-        ? options.getTurnstileToken().catch(() => undefined)
+        ? withDeadline(
+            Promise.resolve(options.getTurnstileToken()).catch(() => undefined),
+            providerTimeoutMs,
+            undefined
+          )
         : Promise.resolve(undefined),
     ])
 
@@ -338,6 +382,8 @@ export function createPrismClient(options: PrismClientOptions = {}): PrismClient
         gpu_vendor: webgl.gpu_vendor,
         gpu_renderer: webgl.gpu_renderer,
         webgl_limits_vector: webgl.webgl_limits_vector,
+        webgl_extensions_hash: webgl.webgl_extensions_hash,
+        webgl_available: webgl.webgl_available,
         static_webgl_fp_hash: webgl.static_webgl_fp_hash,
         spot_pixels: webgl.spot_pixels,
       },
@@ -389,7 +435,13 @@ export function createPrismClient(options: PrismClientOptions = {}): PrismClient
 
   async function identify(callOpts?: { force?: boolean }): Promise<IdentifyResponse | null> {
     if (!fetchFn) return null
-    const token = options.getAccessToken ? (await options.getAccessToken()) || null : null
+    const token = options.getAccessToken
+      ? (await withDeadline(
+          Promise.resolve(options.getAccessToken()).catch(() => null),
+          Math.min(requestTimeoutMs, 1500),
+          null
+        )) || null
+      : null
     const now = Date.now()
     if (
       !callOpts?.force &&
@@ -410,7 +462,7 @@ export function createPrismClient(options: PrismClientOptions = {}): PrismClient
 
         if (!callOpts?.force) {
           try {
-            const scRes = await fetchFn(`${baseUrl}/api/v1/risk/should-collect`, {
+            const scRes = await fetchWithDeadline(`${baseUrl}/api/v1/risk/should-collect`, {
               method: 'GET',
               headers,
             })
@@ -432,7 +484,7 @@ export function createPrismClient(options: PrismClientOptions = {}): PrismClient
           }
         }
 
-        const chRes = await fetchFn(`${baseUrl}/api/v1/risk/challenge`, {
+        const chRes = await fetchWithDeadline(`${baseUrl}/api/v1/risk/challenge`, {
           method: 'POST',
           headers,
           body: '{}',
@@ -448,21 +500,36 @@ export function createPrismClient(options: PrismClientOptions = {}): PrismClient
 
         const { request } = await collectAndSeal(challenge)
 
-        const idRes = await fetchFn(`${baseUrl}/api/v1/risk/identify`, {
+        const idRes = await fetchWithDeadline(`${baseUrl}/api/v1/risk/identify`, {
           method: 'POST',
           headers,
           body: JSON.stringify(request),
         })
-        if (!idRes.ok) {
+        const idRaw = (await idRes.json().catch(() => null)) as
+          | (IdentifyResponse & { data?: IdentifyResponse })
+          | null
+        if (!idRaw || typeof idRaw !== 'object') {
           return null
         }
-        const idRaw = (await idRes.json()) as IdentifyResponse & { data?: IdentifyResponse }
-        const result: IdentifyResponse =
-          typeof idRaw.accepted === 'boolean' ? idRaw : (idRaw.data || { accepted: true })
+        const candidate: IdentifyResponse | undefined =
+          typeof idRaw.accepted === 'boolean'
+            ? idRaw
+            : idRaw.data && typeof idRaw.data.accepted === 'boolean'
+              ? idRaw.data
+              : undefined
+        // Strict schema check: never synthesize `{ accepted: true }` from an empty `{}` response!
+        if (!candidate || typeof candidate.accepted !== 'boolean') {
+          return null
+        }
+        if (!idRes.ok && candidate.accepted !== false) {
+          return null
+        }
 
-        lastIdentifiedToken = token
-        lastIdentifiedAt = Date.now()
-        return result
+        if (candidate.accepted) {
+          lastIdentifiedToken = token
+          lastIdentifiedAt = Date.now()
+        }
+        return candidate
       } catch {
         return null
       } finally {

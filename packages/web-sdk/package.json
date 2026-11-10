@@ -1,6 +1,6 @@
 {
   "name": "prismid-js",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Zero-dependency orthogonal hardware fingerprinting, WebGL shader challenge, and cross-thread lie detection SDK for Browser and Tauri WebView.",
   "license": "MIT",
   "repository": {

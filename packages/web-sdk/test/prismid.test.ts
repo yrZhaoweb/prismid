@@ -1,11 +1,13 @@
 import { spawn, type ChildProcess } from 'node:child_process'
 import crypto from 'node:crypto'
 import fs from 'node:fs'
+import net from 'node:net'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { chromium } from 'playwright-core'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import {
+  collectAndHealStorageBeacon,
   collectAudioProbe,
   collectFontsAndCanvasProbe,
   collectLieDetectorProbe,
@@ -21,6 +23,18 @@ import {
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const GO_SERVER_DIR = path.resolve(__dirname, '../../../server/go')
 const CHROME_MAC_PATH = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
+
+async function allocateFreeLocalPort(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const srv = net.createServer()
+    srv.listen(0, '127.0.0.1', () => {
+      const addr = srv.address()
+      const port = typeof addr === 'object' && addr ? addr.port : 0
+      srv.close((err) => (err ? reject(err) : resolve(port)))
+    })
+    srv.on('error', reject)
+  })
+}
 
 describe('PrismID Web SDK (prismid-js) Unit & Cross-Language Suite', () => {
   it('1. sha256Hex matches Node native crypto SHA-256 across empty, ASCII, and UTF-8 inputs', () => {
@@ -59,7 +73,7 @@ describe('PrismID Web SDK (prismid-js) Unit & Cross-Language Suite', () => {
   it('4. Probes gracefully execute and return structured signals even in headless Node test environment', async () => {
     const webgl = collectWebGLProbe([2.1, 3.2, 4.3, 5.4])
     expect(webgl.spot_pixels).toHaveLength(8)
-    expect(webgl.webgl_limits_vector.split('|').length).toBeGreaterThanOrEqual(10)
+    expect(webgl.webgl_limits_vector.split('|')).toHaveLength(11)
 
     const audioHash = await collectAudioProbe(100)
     expect(audioHash).toMatch(/^[0-9a-f]{64}$/)
@@ -82,15 +96,89 @@ describe('PrismID Web SDK (prismid-js) Unit & Cross-Language Suite', () => {
     expect(typeof workerLie.worker_unavailable).toBe('boolean')
   })
 
-  describe('5. Live Cross-Language E2E Integration (prismid-js -> prismid-go standalone server)', () => {
+  it('5. Audit Regressions (F5 & F6): empty HTTP 200 returns null (never fake accepted=true) and hung IndexedDB open finishes within bounded deadline', async () => {
+    // F6: HTTP 200 `{}` must return null instead of synthesizing `{ accepted: true }`
+    const mockFetchEmpty200: typeof fetch = async (input) => {
+      const url = String(input)
+      if (url.endsWith('/should-collect')) {
+        return new Response(JSON.stringify({ should_collect: true }), { status: 200 })
+      }
+      if (url.endsWith('/challenge')) {
+        return new Response(
+          JSON.stringify({
+            nonce: 'a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90',
+            render_seed: [2.1, 3.2, 4.3, 5.4],
+            sample_points: DEFAULT_SAMPLE_POINTS,
+            expires_at: Math.floor(Date.now() / 1000) + 60,
+          }),
+          { status: 200 }
+        )
+      }
+      // Malformed / empty 200 OK from gateway
+      return new Response(JSON.stringify({}), { status: 200 })
+    }
+    const clientEmpty = createPrismClient({ baseUrl: 'http://127.0.0.1:19999', fetchImpl: mockFetchEmpty200 })
+    const resEmpty = await clientEmpty.identify({ force: true })
+    expect(resEmpty).toBeNull()
+
+    // F6: HTTP 409 structured rejection is surfaced rather than swallowed
+    const mockFetch409: typeof fetch = async (input) => {
+      const url = String(input)
+      if (url.endsWith('/challenge')) {
+        return new Response(
+          JSON.stringify({
+            nonce: 'b1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90',
+            render_seed: [2.1, 3.2, 4.3, 5.4],
+            sample_points: DEFAULT_SAMPLE_POINTS,
+            expires_at: Math.floor(Date.now() / 1000) + 60,
+          }),
+          { status: 200 }
+        )
+      }
+      return new Response(
+        JSON.stringify({ accepted: false, code: 'PRISMID_CHALLENGE_INVALID', message: 'nonce replayed' }),
+        { status: 409 }
+      )
+    }
+    const client409 = createPrismClient({ baseUrl: 'http://127.0.0.1:19999', fetchImpl: mockFetch409 })
+    const res409 = await client409.identify({ force: true })
+    expect(res409).not.toBeNull()
+    expect(res409?.accepted).toBe(false)
+    expect(res409?.code).toBe('PRISMID_CHALLENGE_INVALID')
+
+    // F5: Hung indexedDB.open (never fires onsuccess/onerror/onupgradeneeded) must resolve within 450ms
+    const g = globalThis as unknown as Record<string, unknown>
+    const origIDB = g.indexedDB
+    g.indexedDB = {
+      open: () => ({
+        onsuccess: null,
+        onerror: null,
+        onblocked: null,
+        onupgradeneeded: null,
+      }),
+    }
+    try {
+      const t0 = Date.now()
+      const bcn = await collectAndHealStorageBeacon()
+      const elapsed = Date.now() - t0
+      expect(bcn.beacon_id).toMatch(/^[0-9a-f]{32}$/)
+      expect(elapsed).toBeLessThan(450)
+    } finally {
+      g.indexedDB = origIDB
+    }
+  })
+
+  describe('6. Live Cross-Language E2E Integration (prismid-js -> prismid-go standalone server)', () => {
     let serverProc: ChildProcess | null = null
-    const port = 18095
-    const baseUrl = `http://127.0.0.1:${port}`
+    let baseUrl = ''
 
     beforeAll(async () => {
+      const port = await allocateFreeLocalPort()
+      baseUrl = `http://127.0.0.1:${port}`
       serverProc = spawn('go', ['run', './cmd/prismid-server', '-addr', `127.0.0.1:${port}`], {
         cwd: GO_SERVER_DIR,
         stdio: 'pipe',
+        detached: true,
       })
 
       const deadline = Date.now() + 15000
@@ -107,8 +195,12 @@ describe('PrismID Web SDK (prismid-js) Unit & Cross-Language Suite', () => {
     }, 20000)
 
     afterAll(() => {
-      if (serverProc) {
-        serverProc.kill('SIGTERM')
+      if (serverProc && serverProc.pid) {
+        try {
+          process.kill(-serverProc.pid, 'SIGTERM')
+        } catch {
+          serverProc.kill('SIGTERM')
+        }
       }
     })
 
@@ -121,6 +213,7 @@ describe('PrismID Web SDK (prismid-js) Unit & Cross-Language Suite', () => {
       expect(webRes).not.toBeNull()
       expect(webRes?.accepted).toBe(true)
       expect(webRes?.exact_slice_id).toMatch(/^d_web_[0-9a-f]{32}$/)
+      expect(webRes?.beacon_slice_id).toMatch(/^d_bcn_[0-9a-f]{32}$/)
       expect(webRes?.gpu_audio_slice_id).toMatch(/^d_gpu_[0-9a-f]{32}$/)
       expect(webRes?.sys_net_slice_id).toMatch(/^d_sys_[0-9a-f]{32}$/)
 
@@ -143,6 +236,7 @@ describe('PrismID Web SDK (prismid-js) Unit & Cross-Language Suite', () => {
       expect(desktopRes?.accepted).toBe(true)
       expect(desktopRes?.is_native).toBe(true)
       expect(desktopRes?.exact_slice_id).toMatch(/^d_nat_[0-9a-f]{32}$/)
+      expect(desktopRes?.keychain_slice_id).toMatch(/^d_kch_[0-9a-f]{32}$/)
       expect(desktopRes?.gpu_audio_slice_id).toBe(webRes?.gpu_audio_slice_id)
     })
 
@@ -176,6 +270,7 @@ describe('PrismID Web SDK (prismid-js) Unit & Cross-Language Suite', () => {
 
           expect(serverRes.accepted).toBe(true)
           expect(serverRes.exact_slice_id).toMatch(/^d_web_[0-9a-f]{32}$/)
+          expect(serverRes.beacon_slice_id).toMatch(/^d_bcn_[0-9a-f]{32}$/)
           expect(serverRes.gpu_audio_slice_id).toMatch(/^d_gpu_[0-9a-f]{32}$/)
           expect(serverRes.sys_net_slice_id).toMatch(/^d_sys_[0-9a-f]{32}$/)
           expect(clientData.decrypted_payload.lies.worker_unavailable).toBe(false)
@@ -247,7 +342,9 @@ describe('PrismID Web SDK (prismid-js) Unit & Cross-Language Suite', () => {
           )
           expect(healedClientOut.decrypted_payload.lies.storage_healed).toBe(true)
           expect(healedClientOut.decrypted_payload.lies.canvas_noise_injected).toBe(true)
+          expect(healedServerOut.beacon_slice_id).toMatch(/^d_bcn_[0-9a-f]{32}$/)
           expect(healedServerOut.beacon_slice_id).toBe(serverRes.beacon_slice_id)
+          expect(healedServerOut.privacy_signals).toContain('storage_healed')
           expect(healedServerOut.spoof_flags).toContain('storage_healed')
           expect(healedServerOut.spoof_flags).toContain('canvas_noise_injected')
         } finally {

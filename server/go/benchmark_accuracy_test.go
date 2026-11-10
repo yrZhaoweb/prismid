@@ -1,11 +1,13 @@
-package prismid
+package prismid_test
 
 import (
 	"testing"
+
+	"github.com/yrZhaoweb/prismid/server/go/internal/bench"
 )
 
 func TestAccuracyConfusionMatrixBenchmark(t *testing.T) {
-	cohorts, fpr, fnr, err := RunFullConfusionMatrixBenchmark()
+	cohorts, fpr, fnr, err := bench.RunFullConfusionMatrixBenchmark()
 	if err != nil {
 		t.Fatalf("RunFullConfusionMatrixBenchmark failed: %v", err)
 	}
@@ -15,8 +17,8 @@ func TestAccuracyConfusionMatrixBenchmark(t *testing.T) {
 			t.Errorf("cohort %q had %d errors (expected 0)", c.CohortName, c.ErrorCount)
 		}
 	}
-	t.Logf("OVERALL BENCHMARK (1,000 cases): False Positive Rate (FPR) = %.2f%%, False Negative Rate (FNR) = %.2f%%", fpr, fnr)
+	t.Logf("SYNTHETIC RULE REGRESSION (1,000 cases): Rule FPR = %.2f%%, Rule FNR = %.2f%%", fpr, fnr)
 	if fpr != 0 || fnr != 0 {
-		t.Fatalf("expected 0.00%% FPR and 0.00%% FNR, got FPR=%.2f%% FNR=%.2f%%", fpr, fnr)
+		t.Fatalf("expected 0.00%% rule FPR and 0.00%% rule FNR, got FPR=%.2f%% FNR=%.2f%%", fpr, fnr)
 	}
 }

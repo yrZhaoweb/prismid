@@ -343,19 +343,15 @@ export function aes256GcmEncryptPureTS(key, iv, plaintext, aad) {
 /**
  * PrismID 5-Silo Self-Healing Cryptographic Beacon (`storageBeacon.ts`)
  *
- * Persists a 128-bit (32 hex chars) device beacon across 5 independent browser storage silos:
+ * Persists a 128-bit (32 hex chars) device installation beacon across 5 browser storage silos:
  *   1. `localStorage`
  *   2. `sessionStorage`
- *   3. `IndexedDB` (`prismid_vault` -> `beacons`)
- *   4. `CacheStorage` (`prismid-cache-v1` -> `https://prismid.local/__beacon`)
- *   5. `document.cookie` (`_prismid_bcn`)
+ *   3. `IndexedDB` (`prismid_vault_v1` -> `beacons`)
+ *   4. `CacheStorage` (`prismid-beacon-cache-v1` -> `https://prismid.invalid/__beacon_v1`)
+ *   5. `document.cookie` (`_prismid_bcn_v1`)
  *
- * Accuracy benefits:
- *   - Eliminates False Negatives (FNR) from browser version upgrades (e.g. Chrome 130 -> 131)
- *     and partial storage clearing (when a fraudster clears Cookies or localStorage in F12,
- *     IndexedDB or CacheStorage resurrects the original ID and flags `storage_healed = true`).
- *   - Eliminates False Positives (FPR) across identical hardware models (two innocent users
- *     with the same MacBook Pro M3 model have distinct cryptographic `beacon_id`s).
+ * All asynchronous reads and writes enforce strict per-operation and overall deadlines
+ * so blocked/corrupted browser storage engines can never hang `identify()`.
  */
 
 const STORAGE_KEY = '_prismid_bcn_v1';
@@ -459,10 +455,19 @@ function readIndexedDB(timeoutMs = 150) {
         const timer = setTimeout(() => finish({ available: false, value: null }), timeoutMs);
         try {
             const req = indexedDB.open(IDB_NAME, 1);
+            req.onblocked = () => {
+                clearTimeout(timer);
+                finish({ available: false, value: null });
+            };
             req.onupgradeneeded = () => {
-                const db = req.result;
-                if (!db.objectStoreNames.contains(IDB_STORE)) {
-                    db.createObjectStore(IDB_STORE);
+                try {
+                    const db = req.result;
+                    if (!db.objectStoreNames.contains(IDB_STORE)) {
+                        db.createObjectStore(IDB_STORE);
+                    }
+                }
+                catch {
+                    // ignore
                 }
             };
             req.onerror = () => {
@@ -478,12 +483,18 @@ function readIndexedDB(timeoutMs = 150) {
                     getReq.onsuccess = () => {
                         clearTimeout(timer);
                         const val = getReq.result;
-                        db.close();
+                        try {
+                            db.close();
+                        }
+                        catch { }
                         finish({ available: true, value: isValidBeaconId(val) ? val.trim() : null });
                     };
                     getReq.onerror = () => {
                         clearTimeout(timer);
-                        db.close();
+                        try {
+                            db.close();
+                        }
+                        catch { }
                         finish({ available: true, value: null });
                     };
                 }
@@ -499,40 +510,78 @@ function readIndexedDB(timeoutMs = 150) {
         }
     });
 }
-function writeIndexedDB(id) {
+function writeIndexedDB(id, timeoutMs = 150) {
     if (typeof indexedDB === 'undefined')
         return Promise.resolve();
     return new Promise((resolve) => {
+        let settled = false;
+        const finish = () => {
+            if (settled)
+                return;
+            settled = true;
+            resolve();
+        };
+        const timer = setTimeout(finish, timeoutMs);
         try {
             const req = indexedDB.open(IDB_NAME, 1);
+            req.onblocked = () => {
+                clearTimeout(timer);
+                finish();
+            };
             req.onupgradeneeded = () => {
-                const db = req.result;
-                if (!db.objectStoreNames.contains(IDB_STORE)) {
-                    db.createObjectStore(IDB_STORE);
+                try {
+                    const db = req.result;
+                    if (!db.objectStoreNames.contains(IDB_STORE)) {
+                        db.createObjectStore(IDB_STORE);
+                    }
+                }
+                catch {
+                    // ignore
                 }
             };
-            req.onerror = () => resolve();
+            req.onerror = () => {
+                clearTimeout(timer);
+                finish();
+            };
             req.onsuccess = () => {
                 try {
                     const db = req.result;
                     const tx = db.transaction(IDB_STORE, 'readwrite');
                     tx.objectStore(IDB_STORE).put(id, STORAGE_KEY);
                     tx.oncomplete = () => {
-                        db.close();
-                        resolve();
+                        clearTimeout(timer);
+                        try {
+                            db.close();
+                        }
+                        catch { }
+                        finish();
                     };
                     tx.onerror = () => {
-                        db.close();
-                        resolve();
+                        clearTimeout(timer);
+                        try {
+                            db.close();
+                        }
+                        catch { }
+                        finish();
+                    };
+                    tx.onabort = () => {
+                        clearTimeout(timer);
+                        try {
+                            db.close();
+                        }
+                        catch { }
+                        finish();
                     };
                 }
                 catch {
-                    resolve();
+                    clearTimeout(timer);
+                    finish();
                 }
             };
         }
         catch {
-            resolve();
+            clearTimeout(timer);
+            finish();
         }
     });
 }
@@ -541,92 +590,137 @@ async function readCacheStorage(timeoutMs = 150) {
         return { available: false, value: null };
     }
     return new Promise((resolve) => {
-        const timer = setTimeout(() => resolve({ available: false, value: null }), timeoutMs);
+        let settled = false;
+        const finish = (res) => {
+            if (settled)
+                return;
+            settled = true;
+            resolve(res);
+        };
+        const timer = setTimeout(() => finish({ available: false, value: null }), timeoutMs);
         caches
             .open(CACHE_NAME)
             .then((cache) => cache.match(CACHE_URL))
             .then((resp) => (resp ? resp.text() : null))
             .then((text) => {
             clearTimeout(timer);
-            resolve({ available: true, value: isValidBeaconId(text) ? text.trim() : null });
+            finish({ available: true, value: isValidBeaconId(text) ? text.trim() : null });
         })
             .catch(() => {
             clearTimeout(timer);
-            resolve({ available: false, value: null });
+            finish({ available: false, value: null });
         });
     });
 }
-async function writeCacheStorage(id) {
+function writeCacheStorage(id, timeoutMs = 150) {
     if (typeof caches === 'undefined' || typeof Response === 'undefined')
-        return;
-    try {
-        const cache = await caches.open(CACHE_NAME);
-        await cache.put(CACHE_URL, new Response(id, {
+        return Promise.resolve();
+    return new Promise((resolve) => {
+        let settled = false;
+        const finish = () => {
+            if (settled)
+                return;
+            settled = true;
+            resolve();
+        };
+        const timer = setTimeout(finish, timeoutMs);
+        caches
+            .open(CACHE_NAME)
+            .then((cache) => cache.put(CACHE_URL, new Response(id, {
             headers: {
                 'Content-Type': 'text/plain',
-                'ETag': `"${id}"`,
+                ETag: `"${id}"`,
                 'Cache-Control': 'max-age=31536000',
             },
-        }));
-    }
-    catch {
-        // ignore
-    }
+        })))
+            .then(() => {
+            clearTimeout(timer);
+            finish();
+        })
+            .catch(() => {
+            clearTimeout(timer);
+            finish();
+        });
+    });
 }
-export async function collectAndHealStorageBeacon() {
-    const ls = readLocalStorage();
-    const ss = readSessionStorage();
-    const ck = readCookie();
-    const [idb, cs] = await Promise.all([readIndexedDB(), readCacheStorage()]);
-    const silos = [
-        { name: 'localStorage', ...ls },
-        { name: 'sessionStorage', ...ss },
-        { name: 'cookie', ...ck },
-        { name: 'indexedDB', ...idb },
-        { name: 'cacheStorage', ...cs },
-    ];
-    const survivingSilos = [];
-    const freq = new Map();
-    let missingPrimarySilo = false;
-    for (const s of silos) {
-        if (s.value) {
-            survivingSilos.push(s.name);
-            freq.set(s.value, (freq.get(s.value) || 0) + 1);
-        }
-        else if (s.available && (s.name === 'localStorage' || s.name === 'cookie' || s.name === 'indexedDB')) {
-            missingPrimarySilo = true;
-        }
-    }
-    let canonicalId = '';
-    let storageHealed = false;
-    if (freq.size > 0) {
-        // Pick the majority / first surviving beacon ID
-        let bestCount = -1;
-        for (const [id, count] of freq.entries()) {
-            if (count > bestCount) {
-                bestCount = count;
-                canonicalId = id;
+export async function collectAndHealStorageBeacon(timeoutMs = 350) {
+    const fallbackId = generateBeaconId();
+    let timer;
+    const work = (async () => {
+        const ls = readLocalStorage();
+        const ss = readSessionStorage();
+        const ck = readCookie();
+        const perSiloMs = Math.max(40, Math.floor(timeoutMs * 0.4));
+        const [idb, cs] = await Promise.all([readIndexedDB(perSiloMs), readCacheStorage(perSiloMs)]);
+        const silos = [
+            { name: 'localStorage', ...ls },
+            { name: 'sessionStorage', ...ss },
+            { name: 'cookie', ...ck },
+            { name: 'indexedDB', ...idb },
+            { name: 'cacheStorage', ...cs },
+        ];
+        const survivingSilos = [];
+        const freq = new Map();
+        let missingPrimarySilo = false;
+        for (const s of silos) {
+            if (s.value) {
+                survivingSilos.push(s.name);
+                freq.set(s.value, (freq.get(s.value) || 0) + 1);
+            }
+            else if (s.available &&
+                (s.name === 'localStorage' || s.name === 'cookie' || s.name === 'indexedDB')) {
+                missingPrimarySilo = true;
             }
         }
-        // If at least one silo survived while a primary silo (like localStorage or cookie) was wiped,
-        // or if multiple conflicting beacons existed, mark storage_healed = true!
-        if (missingPrimarySilo || freq.size > 1) {
-            storageHealed = true;
+        let canonicalId = '';
+        let storageHealed = false;
+        if (freq.size > 0) {
+            let bestCount = -1;
+            for (const [id, count] of freq.entries()) {
+                if (count > bestCount) {
+                    bestCount = count;
+                    canonicalId = id;
+                }
+            }
+            if (missingPrimarySilo || freq.size > 1) {
+                storageHealed = true;
+            }
         }
+        else {
+            canonicalId = fallbackId;
+        }
+        writeLocalStorage(canonicalId);
+        writeSessionStorage(canonicalId);
+        writeCookie(canonicalId);
+        await Promise.all([
+            writeIndexedDB(canonicalId, perSiloMs),
+            writeCacheStorage(canonicalId, perSiloMs),
+        ]);
+        return {
+            beacon_id: canonicalId,
+            storage_healed: storageHealed,
+            surviving_silos: survivingSilos,
+        };
+    })();
+    const deadline = new Promise((resolve) => {
+        timer = setTimeout(() => {
+            writeLocalStorage(fallbackId);
+            writeSessionStorage(fallbackId);
+            writeCookie(fallbackId);
+            resolve({
+                beacon_id: fallbackId,
+                storage_healed: false,
+                surviving_silos: [],
+            });
+        }, timeoutMs);
+    });
+    try {
+        return await Promise.race([work, deadline]);
     }
-    else {
-        canonicalId = generateBeaconId();
+    finally {
+        if (timer !== undefined)
+            clearTimeout(timer);
     }
-    // Heal / synchronize all 5 silos with the canonical beacon ID
-    writeLocalStorage(canonicalId);
-    writeSessionStorage(canonicalId);
-    writeCookie(canonicalId);
-    await Promise.all([writeIndexedDB(canonicalId), writeCacheStorage(canonicalId)]);
-    return {
-        beacon_id: canonicalId,
-        storage_healed: storageHealed,
-        surviving_silos: survivingSilos,
-    };
 }
 
 // --- probes/webgl.js ---
@@ -819,14 +913,6 @@ function extractWebGLLimitsVector(gl) {
     catch {
         precisions.push(23, 23, 23, 23);
     }
-    let extHash = '00000000';
-    try {
-        const exts = (gl.getSupportedExtensions() || []).slice().sort().join(',');
-        extHash = sha256Hex(exts).slice(0, 8);
-    }
-    catch {
-        extHash = '00000000';
-    }
     return [
         p(gl.MAX_TEXTURE_SIZE),
         p(gl.MAX_CUBE_MAP_TEXTURE_SIZE),
@@ -839,17 +925,27 @@ function extractWebGLLimitsVector(gl) {
         p(gl.ALIASED_POINT_SIZE_RANGE),
         maxAnisotropy,
         precisions.join(','),
-        extHash,
     ].join('|');
+}
+function extractWebGLExtensionsHash(gl) {
+    try {
+        const exts = (gl.getSupportedExtensions() || []).slice().sort().join(',');
+        return sha256Hex(exts).slice(0, 16);
+    }
+    catch {
+        return '0000000000000000';
+    }
 }
 export function collectWebGLProbe(renderSeed, samplePoints = DEFAULT_SAMPLE_POINTS) {
     const gl = createWebGLContext(256, 256);
     if (!gl) {
-        // Fallback for non-WebGL headless unit test environments
+        // Headless / non-WebGL environment fallback (strictly marked webgl_available: false and SwiftShader,
+        // which server/go demotes to VirtualGPUConfidence = 0.30 / RiskPending = true)
         return {
             gpu_vendor: 'SwiftShader',
             gpu_renderer: 'Google SwiftShader (Headless Fallback)',
-            webgl_limits_vector: '8192|8192|8192,8192|8192|1024|1024|30|1,1|1,1024|0|23,23,23,23|00000000',
+            webgl_limits_vector: '8192|8192|8192,8192|8192|1024|1024|30|1,1|1,1024|0|23,23,23,23',
+            webgl_extensions_hash: '0000000000000000',
             static_webgl_fp_hash: sha256Hex('headless-no-webgl-static-fallback'),
             spot_pixels: samplePoints.map(([x, y]) => computeExpectedSpotPixelMath(x, y, renderSeed)),
             webgl_available: false,
@@ -873,6 +969,7 @@ export function collectWebGLProbe(renderSeed, samplePoints = DEFAULT_SAMPLE_POIN
         // ignore
     }
     const limitsVector = extractWebGLLimitsVector(gl);
+    const extensionsHash = extractWebGLExtensionsHash(gl);
     // Step 1: Render 64x64 static fingerprint scene and hash raw pixel buffer
     // Also perform dual readPixels determinism check to detect WebGL noise-injection extensions.
     let staticFpHash = '';
@@ -927,16 +1024,16 @@ export function collectWebGLProbe(renderSeed, samplePoints = DEFAULT_SAMPLE_POIN
     catch {
         // Fallback if shader compilation was blocked
     }
-    if (spotPixels.length !== samplePoints.length) {
-        spotPixels.length = 0;
-        for (const [x, y] of samplePoints) {
-            spotPixels.push(computeExpectedSpotPixelMath(x, y, renderSeed));
-        }
+    // Do NOT fall back to CPU math when a WebGL context exists but failed/blocked shader rendering:
+    // fill with [0,0,0,0] so broken/stubbed WebGL mocks fail spot-pixel verification honestly.
+    while (spotPixels.length < samplePoints.length) {
+        spotPixels.push([0, 0, 0, 0]);
     }
     return {
         gpu_vendor: gpuVendor,
         gpu_renderer: gpuRenderer,
         webgl_limits_vector: limitsVector,
+        webgl_extensions_hash: extensionsHash,
         static_webgl_fp_hash: staticFpHash,
         spot_pixels: spotPixels,
         webgl_available: true,
@@ -1835,15 +1932,39 @@ export function createPrismClient(options = {}) {
     const baseUrl = (options.baseUrl || '').replace(/\/+$/, '');
     const fetchFn = options.fetchImpl || (typeof fetch !== 'undefined' ? fetch.bind(globalThis) : undefined);
     const cooldownMs = options.cooldownMs ?? 5 * 60 * 1000;
+    const requestTimeoutMs = options.requestTimeoutMs ?? 5000;
     let lastIdentifiedToken = null;
     let lastIdentifiedAt = 0;
     let inFlightPromise = null;
+    function withDeadline(promise, timeoutMs, fallback) {
+        let timer;
+        const deadline = new Promise((resolve) => {
+            timer = setTimeout(() => resolve(fallback), timeoutMs);
+        });
+        return Promise.race([promise, deadline]).finally(() => {
+            if (timer !== undefined)
+                clearTimeout(timer);
+        });
+    }
+    async function fetchWithDeadline(url, init) {
+        if (!fetchFn)
+            throw new Error('fetch unavailable');
+        const controller = typeof AbortController !== 'undefined' ? new AbortController() : undefined;
+        const timer = controller ? setTimeout(() => controller.abort(), requestTimeoutMs) : undefined;
+        try {
+            return await fetchFn(url, controller ? { ...init, signal: controller.signal } : init);
+        }
+        finally {
+            if (timer !== undefined)
+                clearTimeout(timer);
+        }
+    }
     async function buildAuthHeaders() {
         const headers = {
             'Content-Type': 'application/json',
         };
         if (options.getAccessToken) {
-            const token = await options.getAccessToken();
+            const token = await withDeadline(Promise.resolve(options.getAccessToken()).catch(() => null), Math.min(requestTimeoutMs, 1500), null);
             if (token) {
                 headers['Authorization'] = token.startsWith('Bearer ') ? token : `Bearer ${token}`;
             }
@@ -1858,6 +1979,7 @@ export function createPrismClient(options = {}) {
         const webgl = collectWebGLProbe(challenge.render_seed, samplePoints);
         const fontsCanvas = collectFontsAndCanvasProbe();
         const lieDetector = collectLieDetectorProbe();
+        const providerTimeoutMs = Math.min(requestTimeoutMs, 1000);
         const [audioRes, workerLie, storageBeacon, nativeAnchor, turnstileToken] = await Promise.all([
             collectAudioProbeWithTrap(),
             collectWorkerLieProbe({
@@ -1870,10 +1992,10 @@ export function createPrismClient(options = {}) {
             }),
             collectAndHealStorageBeacon(),
             options.nativeAnchorProvider
-                ? options.nativeAnchorProvider().catch(() => null)
+                ? withDeadline(Promise.resolve(options.nativeAnchorProvider()).catch(() => null), providerTimeoutMs, null)
                 : Promise.resolve(null),
             options.getTurnstileToken
-                ? options.getTurnstileToken().catch(() => undefined)
+                ? withDeadline(Promise.resolve(options.getTurnstileToken()).catch(() => undefined), providerTimeoutMs, undefined)
                 : Promise.resolve(undefined),
         ]);
         const payload = {
@@ -1885,6 +2007,8 @@ export function createPrismClient(options = {}) {
                 gpu_vendor: webgl.gpu_vendor,
                 gpu_renderer: webgl.gpu_renderer,
                 webgl_limits_vector: webgl.webgl_limits_vector,
+                webgl_extensions_hash: webgl.webgl_extensions_hash,
+                webgl_available: webgl.webgl_available,
                 static_webgl_fp_hash: webgl.static_webgl_fp_hash,
                 spot_pixels: webgl.spot_pixels,
             },
@@ -1934,7 +2058,9 @@ export function createPrismClient(options = {}) {
     async function identify(callOpts) {
         if (!fetchFn)
             return null;
-        const token = options.getAccessToken ? (await options.getAccessToken()) || null : null;
+        const token = options.getAccessToken
+            ? (await withDeadline(Promise.resolve(options.getAccessToken()).catch(() => null), Math.min(requestTimeoutMs, 1500), null)) || null
+            : null;
         const now = Date.now();
         if (!callOpts?.force &&
             lastIdentifiedAt > 0 &&
@@ -1950,7 +2076,7 @@ export function createPrismClient(options = {}) {
                 const headers = await buildAuthHeaders();
                 if (!callOpts?.force) {
                     try {
-                        const scRes = await fetchFn(`${baseUrl}/api/v1/risk/should-collect`, {
+                        const scRes = await fetchWithDeadline(`${baseUrl}/api/v1/risk/should-collect`, {
                             method: 'GET',
                             headers,
                         });
@@ -1968,7 +2094,7 @@ export function createPrismClient(options = {}) {
                         // Proceed to challenge if should-collect endpoint is not used
                     }
                 }
-                const chRes = await fetchFn(`${baseUrl}/api/v1/risk/challenge`, {
+                const chRes = await fetchWithDeadline(`${baseUrl}/api/v1/risk/challenge`, {
                     method: 'POST',
                     headers,
                     body: '{}',
@@ -1982,19 +2108,32 @@ export function createPrismClient(options = {}) {
                     return null;
                 }
                 const { request } = await collectAndSeal(challenge);
-                const idRes = await fetchFn(`${baseUrl}/api/v1/risk/identify`, {
+                const idRes = await fetchWithDeadline(`${baseUrl}/api/v1/risk/identify`, {
                     method: 'POST',
                     headers,
                     body: JSON.stringify(request),
                 });
-                if (!idRes.ok) {
+                const idRaw = (await idRes.json().catch(() => null));
+                if (!idRaw || typeof idRaw !== 'object') {
                     return null;
                 }
-                const idRaw = (await idRes.json());
-                const result = typeof idRaw.accepted === 'boolean' ? idRaw : (idRaw.data || { accepted: true });
-                lastIdentifiedToken = token;
-                lastIdentifiedAt = Date.now();
-                return result;
+                const candidate = typeof idRaw.accepted === 'boolean'
+                    ? idRaw
+                    : idRaw.data && typeof idRaw.data.accepted === 'boolean'
+                        ? idRaw.data
+                        : undefined;
+                // Strict schema check: never synthesize `{ accepted: true }` from an empty `{}` response!
+                if (!candidate || typeof candidate.accepted !== 'boolean') {
+                    return null;
+                }
+                if (!idRes.ok && candidate.accepted !== false) {
+                    return null;
+                }
+                if (candidate.accepted) {
+                    lastIdentifiedToken = token;
+                    lastIdentifiedAt = Date.now();
+                }
+                return candidate;
             }
             catch {
                 return null;

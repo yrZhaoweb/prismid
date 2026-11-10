@@ -1,7 +1,9 @@
 package main
 
 import (
+	"crypto/rand"
 	_ "embed"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"log"
@@ -17,9 +19,14 @@ import (
 //go:embed static/prismid.bundle.js
 var embeddedPrismBundleJS []byte
 
+const maxRequestBodyBytes = 64 << 10 // 64 KiB
+
 func main() {
 	addr := flag.String("addr", ":8090", "HTTP listen address")
 	hmacSecret := flag.String("secret", "", "HMAC secret key (or PRISMID_HMAC_SECRET env)")
+	demoMode := flag.Bool("demo-mode", true, "Enable standalone lab playground UI and demo identity/IP simulation headers")
+	trustProxy := flag.Bool("trust-proxy", false, "Trust X-Forwarded-For and X-Real-IP headers from reverse proxy")
+	corsOrigin := flag.String("cors-origin", "", "Allowed CORS Origin (defaults to request origin only in -demo-mode)")
 	flag.Parse()
 
 	secret := strings.TrimSpace(*hmacSecret)
@@ -27,7 +34,15 @@ func main() {
 		secret = strings.TrimSpace(os.Getenv("PRISMID_HMAC_SECRET"))
 	}
 	if secret == "" {
-		secret = "prismid-standalone-server-hmac-secret-key-v1"
+		if !*demoMode {
+			log.Fatalf("PRISMID_HMAC_SECRET (or -secret flag) is required when -demo-mode=false")
+		}
+		var randKey [32]byte
+		if _, err := rand.Read(randKey[:]); err != nil {
+			log.Fatalf("failed to generate ephemeral HMAC secret: %v", err)
+		}
+		secret = hex.EncodeToString(randKey[:])
+		log.Printf("[WARN] Running in demo-mode with ephemeral per-process HMAC secret; pass -secret or PRISMID_HMAC_SECRET for persistent slice IDs")
 	}
 
 	verifier := prismid.NewVerifier(prismid.Config{
@@ -36,10 +51,16 @@ func main() {
 	}, prismid.NewMemoryChallengeStore())
 	riskGraph := prismid.NewRiskGraph(prismid.AuthoritativeConfidenceThreshold)
 
+	allowProxyHeaders := *trustProxy || *demoMode
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "engine": "prismid-go"})
+		writeJSON(w, http.StatusOK, map[string]any{
+			"status":    "ok",
+			"engine":    "prismid-go",
+			"version":   "0.4.0",
+			"demo_mode": *demoMode,
+		})
 	})
 
 	mux.HandleFunc("/prismid.bundle.js", func(w http.ResponseWriter, _ *http.Request) {
@@ -49,7 +70,7 @@ func main() {
 	})
 
 	mux.HandleFunc("/api/v1/risk/should-collect", func(w http.ResponseWriter, r *http.Request) {
-		enableCORS(w, r)
+		enableCORS(w, r, *demoMode, *corsOrigin)
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return
@@ -60,7 +81,7 @@ func main() {
 	})
 
 	mux.HandleFunc("/api/v1/risk/challenge", func(w http.ResponseWriter, r *http.Request) {
-		enableCORS(w, r)
+		enableCORS(w, r, *demoMode, *corsOrigin)
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return
@@ -69,7 +90,8 @@ func main() {
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
 			return
 		}
-		ch, err := verifier.IssueChallenge(r.Context(), extractClientIP(r))
+		r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
+		ch, err := verifier.IssueChallenge(r.Context(), extractClientIP(r, allowProxyHeaders))
 		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 			return
@@ -78,7 +100,7 @@ func main() {
 	})
 
 	mux.HandleFunc("/api/v1/risk/identify", func(w http.ResponseWriter, r *http.Request) {
-		enableCORS(w, r)
+		enableCORS(w, r, *demoMode, *corsOrigin)
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return
@@ -87,12 +109,13 @@ func main() {
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
 			return
 		}
+		r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
 		var req prismid.IdentifyRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid request body"})
+			writeJSON(w, http.StatusBadRequest, map[string]any{"accepted": false, "error": "invalid request body"})
 			return
 		}
-		res, err := verifier.VerifyAndDerive(r.Context(), req, extractClientIP(r))
+		res, err := verifier.VerifyAndDerive(r.Context(), req, extractClientIP(r, allowProxyHeaders))
 		if err != nil {
 			status := http.StatusBadRequest
 			if vErr, ok := err.(*prismid.VerificationError); ok {
@@ -110,24 +133,28 @@ func main() {
 			return
 		}
 
-		subjectID := extractSubjectID(r)
+		subjectID := extractSubjectID(r, *demoMode)
 		if subjectID != "" {
 			snap := riskGraph.RecordVerification(subjectID, time.Now().UTC(), res)
 			writeJSON(w, http.StatusOK, map[string]any{
-				"accepted":            res.Accepted,
-				"confidence":          res.Confidence,
-				"exact_slice_id":      res.ExactSliceID,
-				"gpu_audio_slice_id":  res.GpuAudioSliceID,
-				"sys_net_slice_id":    res.SysNetSliceID,
-				"crowd_slice_id":      res.CrowdSliceID,
-				"ip_subnet":           res.IPSubnet,
-				"is_native":           res.IsNative,
-				"is_virtual_gpu":      res.IsVirtualGPU,
-				"spoof_trap_triggered": res.SpoofTrapTriggered,
-				"spoof_flags":         res.SpoofFlags,
-				"risk_status":         snap.RiskStatus,
-				"risk_pending":        snap.RiskPending,
-				"component_snapshot":  snap,
+				"accepted":               res.Accepted,
+				"confidence":             res.Confidence,
+				"exact_slice_id":         res.ExactSliceID,
+				"keychain_slice_id":      res.KeychainSliceID,
+				"beacon_slice_id":        res.BeaconSliceID,
+				"gpu_audio_slice_id":     res.GpuAudioSliceID,
+				"sys_net_slice_id":       res.SysNetSliceID,
+				"crowd_slice_id":         res.CrowdSliceID,
+				"subnet_crowd_triggered": res.SubnetCrowdTriggered,
+				"ip_subnet":              res.IPSubnet,
+				"is_native":              res.IsNative,
+				"is_virtual_gpu":         res.IsVirtualGPU,
+				"spoof_trap_triggered":   res.SpoofTrapTriggered,
+				"spoof_flags":            res.SpoofFlags,
+				"privacy_signals":        res.PrivacySignals,
+				"risk_status":            snap.RiskStatus,
+				"risk_pending":           snap.RiskPending,
+				"component_snapshot":     snap,
 			})
 			return
 		}
@@ -135,23 +162,40 @@ func main() {
 	})
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
+		if !*demoMode {
+			writeJSON(w, http.StatusNotFound, map[string]any{"error": "demo console disabled"})
+			return
+		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		_, _ = w.Write([]byte(standaloneIndexHTML))
 	})
 
-	log.Printf("PrismID standalone verification server listening on %s", *addr)
-	if err := http.ListenAndServe(*addr, mux); err != nil {
+	srv := &http.Server{
+		Addr:              *addr,
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      10 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
+
+	log.Printf("PrismID standalone verification server v0.4.0 listening on %s (demo-mode=%v, trust-proxy=%v)", *addr, *demoMode, *trustProxy)
+	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("server error: %v", err)
 	}
 }
 
-func extractClientIP(r *http.Request) string {
-	if xff := strings.TrimSpace(r.Header.Get("X-Forwarded-For")); xff != "" {
-		parts := strings.Split(xff, ",")
-		return strings.TrimSpace(parts[0])
-	}
-	if xrip := strings.TrimSpace(r.Header.Get("X-Real-IP")); xrip != "" {
-		return xrip
+func extractClientIP(r *http.Request, allowProxyHeaders bool) string {
+	if allowProxyHeaders {
+		if xff := strings.TrimSpace(r.Header.Get("X-Forwarded-For")); xff != "" {
+			parts := strings.Split(xff, ",")
+			if ip := strings.TrimSpace(parts[0]); ip != "" {
+				return ip
+			}
+		}
+		if xrip := strings.TrimSpace(r.Header.Get("X-Real-IP")); xrip != "" {
+			return xrip
+		}
 	}
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err == nil {
@@ -160,9 +204,15 @@ func extractClientIP(r *http.Request) string {
 	return r.RemoteAddr
 }
 
-func extractSubjectID(r *http.Request) string {
-	if q := strings.TrimSpace(r.URL.Query().Get("subject_id")); q != "" {
-		return q
+// extractSubjectID extracts the caller's subject identifier.
+// Note: In standalone demo-mode, ?subject_id= or raw Bearer strings are accepted for interactive
+// lab testing. In production deployments, integrate Verifier as a Go library after your gateway's
+// JWT/session authentication middleware and pass the verified user ID to RiskGraph.
+func extractSubjectID(r *http.Request, demoMode bool) string {
+	if demoMode {
+		if q := strings.TrimSpace(r.URL.Query().Get("subject_id")); q != "" {
+			return q
+		}
 	}
 	auth := strings.TrimSpace(r.Header.Get("Authorization"))
 	if strings.HasPrefix(strings.ToLower(auth), "bearer ") {
@@ -171,12 +221,16 @@ func extractSubjectID(r *http.Request) string {
 	return ""
 }
 
-func enableCORS(w http.ResponseWriter, r *http.Request) {
-	origin := r.Header.Get("Origin")
-	if origin == "" {
-		origin = "*"
+func enableCORS(w http.ResponseWriter, r *http.Request, demoMode bool, configuredOrigin string) {
+	if configuredOrigin != "" {
+		w.Header().Set("Access-Control-Allow-Origin", configuredOrigin)
+	} else if demoMode {
+		origin := r.Header.Get("Origin")
+		if origin == "" {
+			origin = "*"
+		}
+		w.Header().Set("Access-Control-Allow-Origin", origin)
 	}
-	w.Header().Set("Access-Control-Allow-Origin", origin)
 	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Forwarded-For")
 }
@@ -209,8 +263,8 @@ const standaloneIndexHTML = `<!DOCTYPE html>
 </style>
 </head>
 <body>
-  <h1>PrismID Standalone Verification Console</h1>
-  <div class="subtitle">Zero-cost Orthogonal Hardware Fingerprinting, Dynamic WebGL Shader Challenge &amp; Cross-Thread Lie Detector</div>
+  <h1>PrismID Standalone Verification Console (Demo Lab)</h1>
+  <div class="subtitle">Orthogonal Hardware Signal Collection, Dynamic WebGL Shader Challenge &amp; Cross-Thread Lie Detector</div>
   <div class="actions">
     <button id="btn-identify">1. Run Live Browser Identify (prismid-js)</button>
     <button id="btn-proxy" class="secondary">2. Simulate Residential Proxy Rotation + Canvas Noise</button>
