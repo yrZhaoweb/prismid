@@ -12,6 +12,8 @@ import { sha256Hex } from '../crypto/aead.js'
 
 export interface AudioProbeResult {
   audio_compressor_hash: string
+  audio_copy_hash: string
+  audio_silent_delta: number
   audio_noise_injected: boolean
 }
 
@@ -28,8 +30,11 @@ export async function collectAudioProbeWithTrap(timeoutMs = 400): Promise<AudioP
       : undefined
 
   if (!OfflineCtx) {
+    const fallbackHash = sha256Hex('prismid-audio-context-unavailable')
     return {
-      audio_compressor_hash: sha256Hex('prismid-audio-context-unavailable'),
+      audio_compressor_hash: fallbackHash,
+      audio_copy_hash: fallbackHash,
+      audio_silent_delta: 0,
       audio_noise_injected: false,
     }
   }
@@ -43,8 +48,11 @@ export async function collectAudioProbeWithTrap(timeoutMs = 400): Promise<AudioP
     }
 
     const timer = setTimeout(() => {
+      const timeoutHash = sha256Hex('prismid-audio-context-timeout')
       finish({
-        audio_compressor_hash: sha256Hex('prismid-audio-context-timeout'),
+        audio_compressor_hash: timeoutHash,
+        audio_copy_hash: timeoutHash,
+        audio_silent_delta: 0,
         audio_noise_injected: false,
       })
     }, timeoutMs)
@@ -81,10 +89,10 @@ export async function collectAudioProbeWithTrap(timeoutMs = 400): Promise<AudioP
         }
 
         let noiseInjected = false
+        let copyAcc = ''
+        let silentDelta = 0
 
         // Trap 1: Cross-Surface `copyFromChannel` vs `getChannelData` consistency
-        // Extensions like AudioContext Fingerprint Defender hook `getChannelData` but miss `copyFromChannel`,
-        // or inject per-call random noise so a second read differs from the first!
         if (typeof buffer.copyFromChannel === 'function') {
           try {
             const copySlice = new Float32Array(500)
@@ -92,8 +100,8 @@ export async function collectAudioProbeWithTrap(timeoutMs = 400): Promise<AudioP
             for (let i = 0; i < 500; i++) {
               if (copySlice[i] !== sliceA[i]) {
                 noiseInjected = true
-                break
               }
+              copyAcc += copySlice[i].toFixed(7) + ','
             }
           } catch {
             // ignore
@@ -109,13 +117,14 @@ export async function collectAudioProbeWithTrap(timeoutMs = 400): Promise<AudioP
           }
         }
 
-        // Trap 3: Pristine Silent AudioBuffer Invariant (catches deterministic PRNG seed hooks on AudioBuffer.prototype.getChannelData)
+        // Trap 3: Pristine Silent AudioBuffer Invariant
         try {
           const silentBuf = ctx.createBuffer(1, 16, 44100)
           const silentData = silentBuf.getChannelData(0)
           for (let i = 0; i < silentData.length; i++) {
             if (silentData[i] !== 0) {
               noiseInjected = true
+              silentDelta += Math.abs(silentData[i])
               break
             }
           }
@@ -123,7 +132,7 @@ export async function collectAudioProbeWithTrap(timeoutMs = 400): Promise<AudioP
           // ignore
         }
 
-        // Trap 4: Realistic magnitude & NaN/Infinity check (CreepJS audio magnitude invariant)
+        // Trap 4: Realistic magnitude & NaN/Infinity check
         let nonZeroCount = 0
         let acc = ''
         for (let i = 0; i < 500; i++) {
@@ -138,8 +147,13 @@ export async function collectAudioProbeWithTrap(timeoutMs = 400): Promise<AudioP
           noiseInjected = true
         }
 
+        const primaryHash = sha256Hex(acc)
+        const copyHash = copyAcc ? sha256Hex(copyAcc) : primaryHash
+
         return {
-          audio_compressor_hash: sha256Hex(acc),
+          audio_compressor_hash: primaryHash,
+          audio_copy_hash: copyHash,
+          audio_silent_delta: silentDelta,
           audio_noise_injected: noiseInjected,
         }
       }
@@ -153,8 +167,11 @@ export async function collectAudioProbeWithTrap(timeoutMs = 400): Promise<AudioP
           })
           .catch(() => {
             clearTimeout(timer)
+            const rejHash = sha256Hex('prismid-audio-render-rejected')
             finish({
-              audio_compressor_hash: sha256Hex('prismid-audio-render-rejected'),
+              audio_compressor_hash: rejHash,
+              audio_copy_hash: rejHash,
+              audio_silent_delta: 0,
               audio_noise_injected: false,
             })
           })
@@ -166,8 +183,11 @@ export async function collectAudioProbeWithTrap(timeoutMs = 400): Promise<AudioP
       }
     } catch {
       clearTimeout(timer)
+      const excHash = sha256Hex('prismid-audio-exception')
       finish({
-        audio_compressor_hash: sha256Hex('prismid-audio-exception'),
+        audio_compressor_hash: excHash,
+        audio_copy_hash: excHash,
+        audio_silent_delta: 0,
         audio_noise_injected: false,
       })
     }

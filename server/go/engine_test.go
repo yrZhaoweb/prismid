@@ -2,6 +2,11 @@ package prismid
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -802,5 +807,315 @@ func TestAuditRegression_F8_GraphDeduplicationAndClockInjection(t *testing.T) {
 		if snap.RiskStatus != RiskStatusGreen || len(snap.SliceIDs) != 4 {
 			t.Fatalf("repeat %d: expected green with 4 deduplicated slices, got %+v", repeat, snap)
 		}
+	}
+}
+
+// TestRereview_R1_PermutationInvarianceAnd100xDeterministic verifies GPT v0.4.0 Re-Review Finding R1:
+// 1. EvaluateSubjectComponent produces the exact same result across all 6 permutations of [A(0m), B(20m), C(121m)].
+// 2. RiskGraph.EvaluateSubject("B") called 100 times in a loop is 100/100 deterministic (never green:89, red:11).
+func TestRereview_R1_PermutationInvarianceAnd100xDeterministic(t *testing.T) {
+	t0 := time.Date(2026, 11, 10, 12, 0, 0, 0, time.UTC)
+	edgeA := GraphEdge{SubjectID: "A", SubjectCreatedAt: t0, SliceID: "d_web_same", Confidence: 0.95, HasBeacon: true, BeaconSliceID: "d_bcn_1"}
+	edgeB := GraphEdge{SubjectID: "B", SubjectCreatedAt: t0.Add(20 * time.Minute), SliceID: "d_web_same", Confidence: 0.95, HasBeacon: true, BeaconSliceID: "d_bcn_2"}
+	edgeC := GraphEdge{SubjectID: "C", SubjectCreatedAt: t0.Add(121 * time.Minute), SliceID: "d_web_same", Confidence: 0.95, HasBeacon: true, BeaconSliceID: "d_bcn_3"}
+
+	perms := [][]GraphEdge{
+		{edgeA, edgeB, edgeC},
+		{edgeA, edgeC, edgeB},
+		{edgeB, edgeA, edgeC},
+		{edgeB, edgeC, edgeA},
+		{edgeC, edgeA, edgeB},
+		{edgeC, edgeB, edgeA},
+	}
+
+	baseline := EvaluateSubjectComponent(perms[0], "B", AuthoritativeConfidenceThreshold)
+	for idx, p := range perms {
+		got := EvaluateSubjectComponent(p, "B", AuthoritativeConfidenceThreshold)
+		if got.RiskStatus != baseline.RiskStatus || got.EarliestSubjectID != baseline.EarliestSubjectID || len(got.ComponentSubjects) != len(baseline.ComponentSubjects) {
+			t.Fatalf("permutation %d differed from baseline: got %+v, want %+v", idx, got, baseline)
+		}
+	}
+
+	// Also verify 100 repeated evaluations on RiskGraph:
+	g := NewRiskGraph(AuthoritativeConfidenceThreshold)
+	for i, e := range []GraphEdge{edgeA, edgeB, edgeC} {
+		g.RecordVerification(e.SubjectID, e.SubjectCreatedAt, &VerifyResult{
+			Accepted:        true,
+			Confidence:      0.95,
+			ExactSliceID:    "d_web_same",
+			BeaconSliceID:   e.BeaconSliceID,
+			GpuAudioSliceID: fmt.Sprintf("d_gpu_%d", i),
+			SysNetSliceID:   fmt.Sprintf("d_sys_%d", i),
+		})
+	}
+	firstSnap := g.EvaluateSubject("B")
+	for iter := 0; iter < 100; iter++ {
+		snap := g.EvaluateSubject("B")
+		if snap.RiskStatus != firstSnap.RiskStatus || snap.BurstSuspicion != firstSnap.BurstSuspicion || len(snap.ComponentSubjects) != len(firstSnap.ComponentSubjects) {
+			t.Fatalf("iteration %d non-deterministic: got %+v, want %+v", iter, snap, firstSnap)
+		}
+	}
+}
+
+// TestRereview_R2_ThreeOrMoreColleaguesNeverMergedIntoRed verifies GPT Finding R2 & DeepSeek #3:
+// When 3, 5, or 10 colleagues on the same /24 office Wi-Fi with the exact same company MacBook model
+// (identical d_gpu_* and d_sys_*, so identical d_gpusys_*) and distinct clean beacons register 1m apart:
+// - None of them is ever merged into another colleague's ComponentSubjects (len == 1).
+// - None of them is ever marked Red.
+// - Instead, BurstSuspicion=true and RiskPending=true are set with status Yellow for step-up review.
+func TestRereview_R2_ThreeOrMoreColleaguesNeverMergedIntoRed(t *testing.T) {
+	ctx := context.Background()
+	v := NewVerifier(Config{HMACSecret: []byte("test-secret-key-32-bytes-long-000")}, nil)
+	graph := NewRiskGraph(AuthoritativeConfidenceThreshold)
+	t0 := time.Date(2026, 11, 10, 9, 0, 0, 0, time.UTC)
+
+	for i := 0; i < 5; i++ {
+		ip := fmt.Sprintf("198.51.100.%d", 10+i)
+		ch, _ := v.IssueChallenge(ctx, ip)
+		p := buildValidPayload(ch)
+		p.BeaconID = fmt.Sprintf("c011ea60e0000000000000000000%04x", i)
+		// Different local font subset per colleague, but identical GPU/Audio and /24 subnet (identical d_gpusys_*):
+		p.System.FontsBitmapHash = fmt.Sprintf("colleague_font_subset_%d", i)
+		res, err := v.VerifyAndDerive(ctx, IdentifyRequest{
+			ChallengeNonce: ch.Nonce,
+			SealedPayload:  sealProbePayload(t, ch.Nonce, p),
+		}, ip)
+		if err != nil {
+			t.Fatalf("colleague %d verify: %v", i, err)
+		}
+		uid := fmt.Sprintf("office_colleague_%d", i)
+		snap := graph.RecordVerification(uid, t0.Add(time.Duration(i)*time.Minute), res)
+		if snap.RiskStatus == RiskStatusRed {
+			t.Fatalf("colleague %d falsely marked RED on shared d_gpusys_*: %+v", i, snap)
+		}
+		if len(snap.ComponentSubjects) != 1 || snap.ComponentSubjects[0] != uid {
+			t.Fatalf("colleague %d falsely merged with other colleagues: ComponentSubjects=%v", i, snap.ComponentSubjects)
+		}
+		if i >= 2 && (!snap.BurstSuspicion || !snap.RiskPending || snap.RiskStatus != RiskStatusYellow) {
+			t.Fatalf("colleague %d expected BurstSuspicion=true, RiskPending=true, RiskStatus=yellow, got %+v", i, snap)
+		}
+	}
+}
+
+// TestRereview_R3_MultiHopHardSliceChainNoTruncation verifies GPT Finding R3:
+// On a 4-hop hard-beacon/keychain chain A—B—C—D—E where A is globally earliest (t=0) and E (t=1m)
+// is earlier than B(t=2m), C(t=3m), D(t=4m), querying E traverses the full hard-slice chain without
+// truncating at 3 hops, returning EarliestSubjectID="A" and RiskStatus="red".
+func TestRereview_R3_MultiHopHardSliceChainNoTruncation(t *testing.T) {
+	graph := NewRiskGraph(AuthoritativeConfidenceThreshold)
+	t0 := time.Date(2026, 11, 10, 10, 0, 0, 0, time.UTC)
+
+	// Chain: A(t=0) --[bcn1]-- B(t=2m, kch1) --[kch1]-- C(t=3m, bcn2) --[bcn2]-- D(t=4m, kch2) --[kch2]-- E(t=1m)
+	records := []struct {
+		id  string
+		at  time.Time
+		bcn string
+		kch string
+	}{
+		{"A", t0, "d_bcn_chain_1", ""},
+		{"B", t0.Add(2 * time.Minute), "d_bcn_chain_1", "d_kch_chain_1"},
+		{"C", t0.Add(3 * time.Minute), "d_bcn_chain_2", "d_kch_chain_1"},
+		{"D", t0.Add(4 * time.Minute), "d_bcn_chain_2", "d_kch_chain_2"},
+		{"E", t0.Add(1 * time.Minute), "", "d_kch_chain_2"},
+	}
+
+	for idx, r := range records {
+		graph.RecordVerification(r.id, r.at, &VerifyResult{
+			Accepted:        true,
+			Confidence:      0.95,
+			ExactSliceID:    fmt.Sprintf("d_web_%d", idx),
+			BeaconSliceID:   r.bcn,
+			KeychainSliceID: r.kch,
+			GpuAudioSliceID: fmt.Sprintf("d_gpu_%d", idx),
+			SysNetSliceID:   fmt.Sprintf("d_sys_%d", idx),
+		})
+	}
+
+	snapE := graph.EvaluateSubject("E")
+	if len(snapE.ComponentSubjects) != 5 {
+		t.Fatalf("expected all 5 subjects A..E in connected component, got %v", snapE.ComponentSubjects)
+	}
+	if snapE.EarliestSubjectID != "A" {
+		t.Fatalf("expected EarliestSubjectID=A (t=0), got %s", snapE.EarliestSubjectID)
+	}
+	if snapE.RiskStatus != RiskStatusRed {
+		t.Fatalf("expected E to be red (since A is earlier than E), got %s (%+v)", snapE.RiskStatus, snapE)
+	}
+}
+
+// TestDeepSeek_1_2_ECDSAP256DeviceKeyTOFUAndSilentAttacker verifies DeepSeek Roadmap #1 & #2:
+// 1. Valid ECDSA P-256 challenge signature derives d_key_* and binds to d_bcn_* (TOFU).
+// 2. Replaying the same beacon_id without the private key (or with a different key) triggers device_key_tofu_mismatch.
+// 3. A "silent attacker" client that sets all boolean flags in Lies to false while tampering with raw
+//    CanvasControlRGBA, AudioCopyHash, or stripping Worker fields is caught by server-side inference.
+func TestDeepSeek_1_2_ECDSAP256DeviceKeyTOFUAndSilentAttacker(t *testing.T) {
+	ctx := context.Background()
+	v := NewVerifier(Config{HMACSecret: []byte("test-secret-key-32-bytes-long-000")}, nil)
+	graph := NewRiskGraph(AuthoritativeConfidenceThreshold)
+	t0 := time.Date(2026, 11, 10, 11, 0, 0, 0, time.UTC)
+
+	privKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	pubBytes := elliptic.Marshal(elliptic.P256(), privKey.PublicKey.X, privKey.PublicKey.Y)
+	pubB64 := base64.RawURLEncoding.EncodeToString(pubBytes)
+
+	signPayload := func(p *ProbePayload) {
+		msg := strings.Join([]string{
+			"prismid-v2-sig",
+			p.Nonce,
+			strings.ToLower(p.BeaconID),
+			strings.ToLower(p.WebGL.StaticWebGLFpHash),
+			strings.ToLower(p.AudioCompressorHash),
+		}, "|")
+		digest := sha256.Sum256([]byte(msg))
+		r, s, err := ecdsa.Sign(rand.Reader, privKey, digest[:])
+		if err != nil {
+			t.Fatalf("ecdsa.Sign: %v", err)
+		}
+		var rawSig [64]byte
+		r.FillBytes(rawSig[:32])
+		s.FillBytes(rawSig[32:64])
+		p.DeviceKey = &DeviceKeyProof{
+			Alg:       "ES256",
+			PubKey:    pubB64,
+			Signature: base64.RawURLEncoding.EncodeToString(rawSig[:]),
+		}
+	}
+
+	// 1. Genuine attested browser establishes d_key_* + TOFU binding with d_bcn_*
+	ch1, _ := v.IssueChallenge(ctx, "198.51.100.10")
+	p1 := buildValidPayload(ch1)
+	p1.BeaconID = "aa010000000000000000000000000001"
+	signPayload(&p1)
+	res1, err := v.VerifyAndDerive(ctx, IdentifyRequest{
+		ChallengeNonce: ch1.Nonce,
+		SealedPayload:  sealProbePayload(t, ch1.Nonce, p1),
+	}, "198.51.100.10")
+	if err != nil {
+		t.Fatalf("attested verify: %v", err)
+	}
+	if !res1.DeviceKeyAttested || !strings.HasPrefix(res1.DeviceKeySliceID, "d_key_") || res1.Confidence != 0.99 {
+		t.Fatalf("expected DeviceKeyAttested=true, d_key_* slice, and Confidence=0.99, got %+v", res1)
+	}
+	snap1 := graph.RecordVerification("honest_key_user", t0, res1)
+	if snap1.RiskStatus != RiskStatusGreen {
+		t.Fatalf("expected honest_key_user green, got %+v", snap1)
+	}
+
+	// 2. Attacker steals beacon_id "aa01..." and replays it from a script WITHOUT the non-extractable private key:
+	ch2, _ := v.IssueChallenge(ctx, "203.0.113.50")
+	p2 := buildValidPayload(ch2)
+	p2.BeaconID = "aa010000000000000000000000000001"
+	p2.DeviceKey = nil // Missing private key signature!
+	res2, err := v.VerifyAndDerive(ctx, IdentifyRequest{
+		ChallengeNonce: ch2.Nonce,
+		SealedPayload:  sealProbePayload(t, ch2.Nonce, p2),
+	}, "203.0.113.50")
+	if err != nil {
+		t.Fatalf("stolen beacon verify: %v", err)
+	}
+	if !res2.SpoofTrapTriggered {
+		t.Fatalf("expected TOFU mismatch to trigger SpoofTrapTriggered=true when bound beacon omits device_key, got %+v", res2)
+	}
+
+	// 3. Silent Attacker sets ALL boolean flags in Lies to false, but tampers with raw measurements:
+	ch3, _ := v.IssueChallenge(ctx, "203.0.113.60")
+	p3 := buildValidPayload(ch3)
+	p3.BeaconID = "bb020000000000000000000000000002"
+	p3.Lies.WorkerLieDetected = false
+	p3.Lies.CanvasNoiseInjected = false
+	p3.Lies.AudioNoiseInjected = false
+	p3.Lies.WebGLNoiseInjected = false
+	// Tamper raw CanvasControlRGBA (1-LSB noise in transparent control pixel):
+	p3.System.CanvasControlRGBA = []int{0, 0, 1, 0, 17, 136, 221, 255}
+	res3, err := v.VerifyAndDerive(ctx, IdentifyRequest{
+		ChallengeNonce: ch3.Nonce,
+		SealedPayload:  sealProbePayload(t, ch3.Nonce, p3),
+	}, "203.0.113.60")
+	if err != nil {
+		t.Fatalf("silent attacker verify: %v", err)
+	}
+	if !res3.SpoofTrapTriggered {
+		t.Fatalf("expected silent attacker with raw CanvasControlRGBA noise to be caught, got %+v", res3)
+	}
+	snap3 := graph.RecordVerification("silent_attacker_1", t0.Add(5*time.Minute), res3)
+	if snap3.RiskStatus != RiskStatusRed {
+		t.Fatalf("expected silent_attacker_1 to be marked red, got %+v", snap3)
+	}
+}
+
+// TestDeepSeek_6_ExplainabilityEvidenceChainAndPrivacyDeletion verifies DeepSeek Roadmap #6:
+// 1. Non-green verdicts include LogOddsScore and structured EvidenceChain items.
+// 2. RiskGraph.RemoveSubject completely erases a subject's graph edges (GDPR/CCPA deletion).
+func TestDeepSeek_6_ExplainabilityEvidenceChainAndPrivacyDeletion(t *testing.T) {
+	graph := NewRiskGraph(AuthoritativeConfidenceThreshold)
+	t0 := time.Date(2026, 11, 10, 13, 0, 0, 0, time.UTC)
+
+	res := &VerifyResult{
+		Accepted:        true,
+		Confidence:      0.95,
+		ExactSliceID:    "d_web_del_1",
+		BeaconSliceID:   "d_bcn_del_shared",
+		GpuAudioSliceID: "d_gpu_del_1",
+		SysNetSliceID:   "d_sys_del_1",
+	}
+	graph.RecordVerification("user_del_1", t0, res)
+	snap2 := graph.RecordVerification("user_del_2", t0.Add(time.Minute), res)
+	if snap2.RiskStatus != RiskStatusRed || len(snap2.EvidenceChain) == 0 || snap2.LogOddsScore <= 0 {
+		t.Fatalf("expected red verdict with positive LogOddsScore and non-empty EvidenceChain, got %+v", snap2)
+	}
+
+	// Erase user_del_1 via GDPR/CCPA RemoveSubject:
+	if !graph.RemoveSubject("user_del_1") {
+		t.Fatalf("expected RemoveSubject(user_del_1) to return true")
+	}
+	snap1After := graph.EvaluateSubject("user_del_1")
+	if snap1After.RiskStatus != RiskStatusUnknown {
+		t.Fatalf("expected erased subject user_del_1 to return unknown, got %+v", snap1After)
+	}
+	snap2After := graph.EvaluateSubject("user_del_2")
+	if snap2After.RiskStatus != RiskStatusGreen || len(snap2After.ComponentSubjects) != 1 {
+		t.Fatalf("expected user_del_2 to become green after user_del_1 was erased, got %+v", snap2After)
+	}
+}
+
+// TestEngineeringBounds_ChallengeStoreAndPerSubjectSlices verifies GPT Re-Review Engineering Bounds:
+// 1. MemoryChallengeStore enforces hard capacity <= 4096 even when all challenges are unexpired.
+// 2. RiskGraph caps per-subject slices at MaxSlicesPerSubject (16) even if a subject mutates signals 100 times.
+func TestEngineeringBounds_ChallengeStoreAndPerSubjectSlices(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 11, 10, 14, 0, 0, 0, time.UTC)
+	store := NewMemoryChallengeStoreWithClock(func() time.Time { return now })
+
+	for i := 0; i < 4200; i++ {
+		_ = store.SaveChallenge(ctx, Challenge{
+			Nonce:     fmt.Sprintf("nonce_%d", i),
+			IssuedAt:  now.UnixMilli(),
+			ExpiresAt: now.Add(60 * time.Second).UnixMilli(),
+		}, 60*time.Second)
+	}
+	store.mu.Lock()
+	chCount := len(store.challenges)
+	store.mu.Unlock()
+	if chCount > 4096 {
+		t.Fatalf("expected MemoryChallengeStore.challenges hard-capped at <= 4096, got %d", chCount)
+	}
+
+	graph := NewRiskGraph(AuthoritativeConfidenceThreshold)
+	for i := 0; i < 50; i++ {
+		graph.RecordVerification("mutating_subject", now.Add(time.Duration(i)*time.Second), &VerifyResult{
+			Accepted:        true,
+			Confidence:      0.95,
+			ExactSliceID:    fmt.Sprintf("d_web_mut_%d", i),
+			BeaconSliceID:   "d_bcn_persistent_anchor",
+			GpuAudioSliceID: fmt.Sprintf("d_gpu_mut_%d", i),
+			SysNetSliceID:   fmt.Sprintf("d_sys_mut_%d", i),
+		})
+	}
+	snap := graph.EvaluateSubject("mutating_subject")
+	if len(snap.SliceIDs) > MaxSlicesPerSubject {
+		t.Fatalf("expected subject slices capped at <= %d, got %d", MaxSlicesPerSubject, len(snap.SliceIDs))
 	}
 }

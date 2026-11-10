@@ -1,12 +1,12 @@
 # PrismID Full-Stack Integration Guide (`INTEGRATION_GUIDE.md`)
 
-This guide shows how to integrate **PrismID v0.4.0** into a Web application (`prismid-js`), a Tauri 2 Desktop application (`prismid-native`), and a Go + PostgreSQL + Redis backend (`prismid-go`).
+This guide shows how to integrate **PrismID v0.5.0** into a Web application (`prismid-js`), a Tauri 2 Desktop application (`prismid-native`), and a Go + PostgreSQL + Redis backend (`prismid-go`).
 
 ---
 
 ## 1. Browser Web Application Integration (`prismid-js`)
 
-Install `prismid-js` (`>= 0.4.0`):
+Install `prismid-js` (`>= 0.5.0`):
 
 ```bash
 npm install prismid-js
@@ -36,11 +36,11 @@ if (result && result.accepted) {
 
 ### 2.1 Rust Side (`src-tauri/Cargo.toml` & `src-tauri/src/lib.rs`)
 
-Add `prismid-native` (`0.4.0`) to `src-tauri/Cargo.toml`:
+Add `prismid-native` (`0.5.0`) to `src-tauri/Cargo.toml`:
 
 ```toml
 [dependencies]
-prismid-native = { git = "https://github.com/yrZhaoweb/prismid", version = "0.4.0" }
+prismid-native = { git = "https://github.com/yrZhaoweb/prismid", version = "0.5.0" }
 ```
 
 Expose a Tauri command in `src-tauri/src/lib.rs`:

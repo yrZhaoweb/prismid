@@ -1,7 +1,9 @@
 package main
 
 import (
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
 	_ "embed"
 	"encoding/hex"
 	"encoding/json"
@@ -58,7 +60,7 @@ func main() {
 		writeJSON(w, http.StatusOK, map[string]any{
 			"status":    "ok",
 			"engine":    "prismid-go",
-			"version":   "0.4.0",
+			"version":   "0.5.0",
 			"demo_mode": *demoMode,
 		})
 	})
@@ -133,12 +135,21 @@ func main() {
 			return
 		}
 
-		subjectID := extractSubjectID(r, *demoMode)
+		subjectID, authErr := extractVerifiedSubjectID(r, *demoMode, []byte(secret))
+		if authErr {
+			writeJSON(w, http.StatusUnauthorized, map[string]any{
+				"accepted": false,
+				"error":    "invalid or unverified bearer token; when -demo-mode=false, Authorization must be Bearer <subject_id>.<hmac_sha256_hex>",
+			})
+			return
+		}
 		if subjectID != "" {
 			snap := riskGraph.RecordVerification(subjectID, time.Now().UTC(), res)
 			writeJSON(w, http.StatusOK, map[string]any{
 				"accepted":               res.Accepted,
 				"confidence":             res.Confidence,
+				"device_key_slice_id":    res.DeviceKeySliceID,
+				"device_key_attested":    res.DeviceKeyAttested,
 				"exact_slice_id":         res.ExactSliceID,
 				"keychain_slice_id":      res.KeychainSliceID,
 				"beacon_slice_id":        res.BeaconSliceID,
@@ -161,6 +172,50 @@ func main() {
 		writeJSON(w, http.StatusOK, res)
 	})
 
+	// Explainability endpoint (DeepSeek #6): returns the full ComponentSnapshot, calibrated
+	// LogOddsScore, SharedSliceIDs, and human-readable EvidenceChain for a subject.
+	mux.HandleFunc("/api/v1/risk/explain", func(w http.ResponseWriter, r *http.Request) {
+		enableCORS(w, r, *demoMode, *corsOrigin)
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		if r.Method != http.MethodGet {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
+			return
+		}
+		subjectID, authErr := extractVerifiedSubjectID(r, *demoMode, []byte(secret))
+		if authErr || subjectID == "" {
+			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "verified subject identity required"})
+			return
+		}
+		snap := riskGraph.EvaluateSubject(subjectID)
+		writeJSON(w, http.StatusOK, snap)
+	})
+
+	// Privacy erasure endpoint (DeepSeek #6 GDPR/CCPA): removes all graph edges for a subject.
+	mux.HandleFunc("/api/v1/risk/subject", func(w http.ResponseWriter, r *http.Request) {
+		enableCORS(w, r, *demoMode, *corsOrigin)
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		if r.Method != http.MethodDelete {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
+			return
+		}
+		subjectID, authErr := extractVerifiedSubjectID(r, *demoMode, []byte(secret))
+		if authErr || subjectID == "" {
+			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "verified subject identity required"})
+			return
+		}
+		removed := riskGraph.RemoveSubject(subjectID)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"subject_id": subjectID,
+			"deleted":    removed,
+		})
+	})
+
 	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
 		if !*demoMode {
 			writeJSON(w, http.StatusNotFound, map[string]any{"error": "demo console disabled"})
@@ -179,7 +234,7 @@ func main() {
 		IdleTimeout:       60 * time.Second,
 	}
 
-	log.Printf("PrismID standalone verification server v0.4.0 listening on %s (demo-mode=%v, trust-proxy=%v)", *addr, *demoMode, *trustProxy)
+	log.Printf("PrismID standalone verification server v0.5.0 listening on %s (demo-mode=%v, trust-proxy=%v)", *addr, *demoMode, *trustProxy)
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("server error: %v", err)
 	}
@@ -204,21 +259,58 @@ func extractClientIP(r *http.Request, allowProxyHeaders bool) string {
 	return r.RemoteAddr
 }
 
-// extractSubjectID extracts the caller's subject identifier.
-// Note: In standalone demo-mode, ?subject_id= or raw Bearer strings are accepted for interactive
-// lab testing. In production deployments, integrate Verifier as a Go library after your gateway's
-// JWT/session authentication middleware and pass the verified user ID to RiskGraph.
-func extractSubjectID(r *http.Request, demoMode bool) string {
+// SignSubjectBearerToken creates an HMAC-SHA256 authenticated bearer token for a subject:
+// `<subject_id>.<hex(HMAC_SHA256(secret, "prismid-auth|" + subject_id))>`.
+func SignSubjectBearerToken(subjectID string, secret []byte) string {
+	mac := hmac.New(sha256.New, secret)
+	mac.Write([]byte("prismid-auth|" + subjectID))
+	return subjectID + "." + hex.EncodeToString(mac.Sum(nil))
+}
+
+// extractVerifiedSubjectID extracts and authenticates the caller's subject identifier.
+//   - When demoMode=true: accepts ?subject_id= or Bearer tokens for interactive lab testing.
+//   - When demoMode=false (GPT R4): ignores ?subject_id= and strictly requires any Authorization
+//     header to be an HMAC-SHA256 signed token `Bearer <subject_id>.<hmac_sha256_hex>`.
+//     Unverified Bearer strings are rejected with 401 Unauthorized.
+func extractVerifiedSubjectID(r *http.Request, demoMode bool, hmacSecret []byte) (string, bool) {
 	if demoMode {
 		if q := strings.TrimSpace(r.URL.Query().Get("subject_id")); q != "" {
-			return q
+			return q, false
 		}
 	}
 	auth := strings.TrimSpace(r.Header.Get("Authorization"))
-	if strings.HasPrefix(strings.ToLower(auth), "bearer ") {
-		return strings.TrimSpace(auth[7:])
+	if auth == "" {
+		return "", false
 	}
-	return ""
+	if !strings.HasPrefix(strings.ToLower(auth), "bearer ") {
+		if demoMode {
+			return "", false
+		}
+		return "", true
+	}
+	rawToken := strings.TrimSpace(auth[7:])
+	if rawToken == "" {
+		if demoMode {
+			return "", false
+		}
+		return "", true
+	}
+	if idx := strings.LastIndexByte(rawToken, '.'); idx > 0 && idx < len(rawToken)-1 {
+		sid := rawToken[:idx]
+		sigHex := rawToken[idx+1:]
+		sigBytes, err := hex.DecodeString(sigHex)
+		if err == nil {
+			mac := hmac.New(sha256.New, hmacSecret)
+			mac.Write([]byte("prismid-auth|" + sid))
+			if hmac.Equal(sigBytes, mac.Sum(nil)) {
+				return sid, false
+			}
+		}
+	}
+	if demoMode {
+		return rawToken, false
+	}
+	return "", true
 }
 
 func enableCORS(w http.ResponseWriter, r *http.Request, demoMode bool, configuredOrigin string) {
@@ -231,7 +323,7 @@ func enableCORS(w http.ResponseWriter, r *http.Request, demoMode bool, configure
 		}
 		w.Header().Set("Access-Control-Allow-Origin", origin)
 	}
-	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Forwarded-For")
 }
 

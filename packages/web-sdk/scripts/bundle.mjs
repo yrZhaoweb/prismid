@@ -7,6 +7,7 @@ const distDir = path.resolve(__dirname, '../dist')
 
 const filesInOrder = [
   'crypto/aead.js',
+  'crypto/deviceKey.js',
   'probes/storageBeacon.js',
   'probes/webgl.js',
   'probes/workerLie.js',

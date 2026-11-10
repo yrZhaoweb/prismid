@@ -4,6 +4,8 @@ import (
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
@@ -14,6 +16,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"math/big"
 	"net"
 	"strconv"
 	"strings"
@@ -74,6 +77,14 @@ type IdentifyRequest struct {
 	TurnstileToken string `json:"ts,omitempty"`
 }
 
+// DeviceKeyProof carries a challenge-bound ECDSA P-256 signature produced by a non-extractable
+// WebCrypto CryptoKey stored in IndexedDB (or OS hardware keystore).
+type DeviceKeyProof struct {
+	Alg       string `json:"alg"`
+	PubKey    string `json:"pub_key"`
+	Signature string `json:"signature"`
+}
+
 // ProbePayload is the plaintext JSON structure sealed inside IdentifyRequest.SealedPayload.
 type ProbePayload struct {
 	Version             int                   `json:"v"`
@@ -82,8 +93,11 @@ type ProbePayload struct {
 	BeaconID            string                `json:"beacon_id,omitempty"`
 	WebGL               WebGLProbeData        `json:"webgl"`
 	AudioCompressorHash string                `json:"audio_compressor_hash"`
+	AudioCopyHash       string                `json:"audio_copy_hash,omitempty"`
+	AudioSilentDelta    float64               `json:"audio_silent_delta,omitempty"`
 	System              SystemProbeData       `json:"system"`
 	Lies                LieProbeData          `json:"lies"`
+	DeviceKey           *DeviceKeyProof       `json:"device_key,omitempty"`
 	NativeAnchor        *NativeHardwareAnchor `json:"native_anchor,omitempty"`
 }
 
@@ -100,18 +114,20 @@ type WebGLProbeData struct {
 
 // SystemProbeData captures browser and OS environment signals.
 type SystemProbeData struct {
-	UserAgent        string   `json:"user_agent"`
-	Platform         string   `json:"platform"`
-	CPUCores         int      `json:"cpu_cores"`
-	DeviceMemory     float64  `json:"device_memory,omitempty"`
-	Timezone         string   `json:"timezone"`
-	Languages        []string `json:"languages"`
-	ScreenSpec       string   `json:"screen_spec"`
-	DisplayGamutSpec string   `json:"display_gamut_spec,omitempty"`
-	VoicesHash       string   `json:"voices_hash,omitempty"`
-	IntlHash         string   `json:"intl_hash,omitempty"`
-	Canvas2DHash     string   `json:"canvas_2d_hash"`
-	FontsBitmapHash  string   `json:"fonts_bitmap_hash"`
+	UserAgent           string   `json:"user_agent"`
+	Platform            string   `json:"platform"`
+	CPUCores            int      `json:"cpu_cores"`
+	DeviceMemory        float64  `json:"device_memory,omitempty"`
+	Timezone            string   `json:"timezone"`
+	Languages           []string `json:"languages"`
+	ScreenSpec          string   `json:"screen_spec"`
+	DisplayGamutSpec    string   `json:"display_gamut_spec,omitempty"`
+	VoicesHash          string   `json:"voices_hash,omitempty"`
+	IntlHash            string   `json:"intl_hash,omitempty"`
+	Canvas2DHash        string   `json:"canvas_2d_hash"`
+	FontsBitmapHash     string   `json:"fonts_bitmap_hash"`
+	CanvasControlRGBA   []int    `json:"canvas_control_rgba,omitempty"`
+	CanvasReadbackDelta int      `json:"canvas_readback_delta,omitempty"`
 }
 
 // LieProbeData captures cross-thread Web Worker + OffscreenCanvas comparisons,
@@ -153,6 +169,8 @@ type NativeHardwareAnchor struct {
 type VerifyResult struct {
 	Accepted             bool          `json:"accepted"`
 	Confidence           float64       `json:"confidence"`
+	DeviceKeySliceID     string        `json:"device_key_slice_id,omitempty"`
+	DeviceKeyAttested    bool          `json:"device_key_attested,omitempty"`
 	ExactSliceID         string        `json:"exact_slice_id"`
 	KeychainSliceID      string        `json:"keychain_slice_id,omitempty"`
 	BeaconSliceID        string        `json:"beacon_slice_id,omitempty"`
@@ -173,8 +191,8 @@ type VerifyResult struct {
 // Note: CrowdSliceID (d_ip24_crowd_*) is intentionally excluded from graph linking so that
 // high-density mobile CGNAT or large office /24 networks never falsely merge unrelated users.
 func (r *VerifyResult) SliceNodes() []string {
-	nodes := make([]string, 0, 5)
-	for _, id := range []string{r.ExactSliceID, r.KeychainSliceID, r.BeaconSliceID, r.GpuAudioSliceID, r.SysNetSliceID} {
+	nodes := make([]string, 0, 6)
+	for _, id := range []string{r.DeviceKeySliceID, r.ExactSliceID, r.KeychainSliceID, r.BeaconSliceID, r.GpuAudioSliceID, r.SysNetSliceID} {
 		if strings.TrimSpace(id) != "" {
 			nodes = append(nodes, id)
 		}
@@ -194,6 +212,13 @@ type ChallengeStore interface {
 	// RecordSubnetGPU records an (ipSubnet, gpuSliceID) pair within a rolling window and
 	// returns the number of distinct gpuSliceIDs observed on that subnet.
 	RecordSubnetGPU(ctx context.Context, ipSubnet, gpuSliceID string, window time.Duration) (int, error)
+}
+
+// DeviceKeyBindingStore is an optional extension of ChallengeStore that enforces
+// Trust-On-First-Use (TOFU) binding between a storage beacon (d_bcn_*) and an attested
+// ECDSA P-256 public key (d_key_*), preventing stolen beacon replay from headless scripts.
+type DeviceKeyBindingStore interface {
+	CheckOrBindBeaconDeviceKey(ctx context.Context, beaconSliceID, deviceKeySliceID string) (bool, error)
 }
 
 // Config configures the PrismID Verifier engine.
@@ -389,22 +414,60 @@ func (v *Verifier) VerifyAndDerive(ctx context.Context, req IdentifyRequest, cli
 			effectiveTimezone = wTZ
 			spoofFlags = appendUniqueFlag(spoofFlags, "worker_timezone_mismatch")
 		}
+		// Server-side inference (DeepSeek #2): if the client claims WorkerUnavailable=false on Web
+		// but strips all raw Worker telemetry fields, treat as stripped telemetry tampering.
+		if payload.NativeAnchor == nil &&
+			strings.TrimSpace(payload.Lies.WorkerStaticWebGLFpHash) == "" &&
+			strings.TrimSpace(payload.Lies.WorkerGPURenderer) == "" &&
+			strings.TrimSpace(payload.Lies.WorkerPlatform) == "" &&
+			strings.TrimSpace(payload.Lies.WorkerUserAgent) == "" &&
+			payload.Lies.WorkerCPUCores == 0 {
+			workerLie = true
+			spoofFlags = appendUniqueFlag(spoofFlags, "worker_telemetry_stripped")
+		}
 		if workerLie {
 			spoofFlags = appendUniqueFlag(spoofFlags, "worker_lie_detected")
 			spoofTrapTriggered = true
 		}
 	}
 
-	if payload.Lies.CanvasNoiseInjected {
+	// Server-side raw measurement inference for Canvas 2D (DeepSeek #2):
+	// Even if a silent attacker sets payload.Lies.CanvasNoiseInjected=false, the server
+	// independently verifies raw control-pixel RGBA values and dual-readback delta.
+	canvasNoiseInferred := payload.Lies.CanvasNoiseInjected || payload.System.CanvasReadbackDelta != 0
+	if len(payload.System.CanvasControlRGBA) > 0 {
+		c := payload.System.CanvasControlRGBA
+		if len(c) != 8 ||
+			c[0] != 0 || c[1] != 0 || c[2] != 0 || c[3] != 0 ||
+			absInt(c[4]-17) > 2 || absInt(c[5]-136) > 2 || absInt(c[6]-221) > 2 || absInt(c[7]-255) > 2 {
+			canvasNoiseInferred = true
+		}
+	}
+	if canvasNoiseInferred {
 		spoofFlags = appendUniqueFlag(spoofFlags, "canvas_noise_injected")
 		spoofTrapTriggered = true
 	}
+
 	if payload.Lies.WebGLNoiseInjected {
 		spoofFlags = appendUniqueFlag(spoofFlags, "webgl_noise_injected")
 		spoofTrapTriggered = true
 	}
-	if payload.Lies.AudioNoiseInjected {
+
+	// Server-side raw measurement inference for WebAudio (DeepSeek #2):
+	// Even if a silent attacker sets payload.Lies.AudioNoiseInjected=false, the server
+	// independently compares raw getChannelData vs copyFromChannel hashes and silent-tail delta.
+	audioNoiseInferred := payload.Lies.AudioNoiseInjected || payload.AudioSilentDelta != 0
+	if copyHash := strings.TrimSpace(payload.AudioCopyHash); copyHash != "" &&
+		!strings.EqualFold(copyHash, strings.TrimSpace(payload.AudioCompressorHash)) {
+		audioNoiseInferred = true
+	}
+	if audioNoiseInferred {
 		spoofFlags = appendUniqueFlag(spoofFlags, "audio_noise_injected")
+		spoofTrapTriggered = true
+	}
+
+	if strings.TrimSpace(payload.Lies.MathEngineSignature) == "unknown_tampered_math" {
+		spoofFlags = appendUniqueFlag(spoofFlags, "math_engine_tampered")
 		spoofTrapTriggered = true
 	}
 	// StorageHealed is recorded as a telemetry/privacy signal; by itself it does NOT set
@@ -488,6 +551,36 @@ func (v *Verifier) VerifyAndDerive(ctx context.Context, req IdentifyRequest, cli
 		beaconSliceID = "d_bcn_" + v.hmacHex32("bcn|"+bcn)
 	}
 
+	// 2C. DeviceKeySliceID (d_key_*): Challenge-bound ECDSA P-256 signature from non-extractable
+	// WebCrypto CryptoKey (DeepSeek #1 Trust Root) + TOFU binding against BeaconSliceID.
+	var deviceKeySliceID string
+	deviceKeyAttested := false
+	if payload.DeviceKey != nil &&
+		(strings.TrimSpace(payload.DeviceKey.PubKey) != "" || strings.TrimSpace(payload.DeviceKey.Signature) != "") {
+		okSig, pubKeyHex := VerifyECDSAP256DeviceKey(
+			payload.DeviceKey,
+			nonce,
+			payload.BeaconID,
+			payload.WebGL.StaticWebGLFpHash,
+			payload.AudioCompressorHash,
+		)
+		if okSig && pubKeyHex != "" {
+			deviceKeyAttested = true
+			deviceKeySliceID = "d_key_" + v.hmacHex32("key|"+pubKeyHex)
+		} else {
+			spoofFlags = appendUniqueFlag(spoofFlags, "device_key_signature_invalid")
+			spoofTrapTriggered = true
+		}
+	}
+	if beaconSliceID != "" {
+		if tofuStore, ok := v.store.(DeviceKeyBindingStore); ok {
+			if okBind, err := tofuStore.CheckOrBindBeaconDeviceKey(ctx, beaconSliceID, deviceKeySliceID); err == nil && !okBind {
+				spoofFlags = appendUniqueFlag(spoofFlags, "device_key_tofu_mismatch")
+				spoofTrapTriggered = true
+			}
+		}
+	}
+
 	// 3. SysNetSliceID (d_sys_*): OS family + CPU cores + Timezone + /24 IP subnet
 	ipSubnet := ExtractIPSubnet(clientIP)
 	osFamily := NormalizeOSFamily(effectivePlatform, payload.NativeAnchor)
@@ -555,7 +648,7 @@ func (v *Verifier) VerifyAndDerive(ctx context.Context, req IdentifyRequest, cli
 
 	// Rule-tier confidence weight (0.99 / 0.95 / 0.85 / 0.30):
 	confidence := 0.95
-	if isNative {
+	if isNative || deviceKeyAttested {
 		confidence = 0.99
 	}
 	if spoofTrapTriggered {
@@ -568,6 +661,8 @@ func (v *Verifier) VerifyAndDerive(ctx context.Context, req IdentifyRequest, cli
 	return &VerifyResult{
 		Accepted:             true,
 		Confidence:           confidence,
+		DeviceKeySliceID:     deviceKeySliceID,
+		DeviceKeyAttested:    deviceKeyAttested,
 		ExactSliceID:         exactSliceID,
 		KeychainSliceID:      keychainSliceID,
 		BeaconSliceID:        beaconSliceID,
@@ -583,6 +678,85 @@ func (v *Verifier) VerifyAndDerive(ctx context.Context, req IdentifyRequest, cli
 		PrivacySignals:       privacySignals,
 		DecryptedPayload:     &payload,
 	}, nil
+}
+
+// VerifyECDSAP256DeviceKey verifies a challenge-bound ECDSA P-256 signature over the canonical
+// transcript "prismid-v2-sig|<nonce>|<beacon_id>|<static_webgl_fp_hash>|<audio_compressor_hash>".
+// It accepts uncompressed SEC1 P-256 public keys (65 bytes: 0x04 || X[32] || Y[32]) and either
+// IEEE P1363 64-byte (r || s) signatures (WebCrypto standard) or ASN.1 DER signatures.
+func VerifyECDSAP256DeviceKey(proof *DeviceKeyProof, nonce, beaconID, staticWebGLHash, audioHash string) (bool, string) {
+	if proof == nil {
+		return false, ""
+	}
+	alg := strings.ToLower(strings.TrimSpace(proof.Alg))
+	if alg != "" && alg != "ecdsa-p256" && alg != "es256" {
+		return false, ""
+	}
+	pubRaw, err := decodeHexOrBase64(strings.TrimSpace(proof.PubKey))
+	if err != nil || len(pubRaw) != 65 || pubRaw[0] != 0x04 {
+		return false, ""
+	}
+	curve := elliptic.P256()
+	x := new(big.Int).SetBytes(pubRaw[1:33])
+	y := new(big.Int).SetBytes(pubRaw[33:65])
+	if !curve.IsOnCurve(x, y) {
+		return false, ""
+	}
+	pubKey := &ecdsa.PublicKey{Curve: curve, X: x, Y: y}
+
+	sigRaw, err := decodeHexOrBase64(strings.TrimSpace(proof.Signature))
+	if err != nil || len(sigRaw) == 0 {
+		return false, ""
+	}
+
+	transcript := strings.Join([]string{
+		"prismid-v2-sig",
+		strings.TrimSpace(nonce),
+		strings.ToLower(strings.TrimSpace(beaconID)),
+		strings.ToLower(strings.TrimSpace(staticWebGLHash)),
+		strings.ToLower(strings.TrimSpace(audioHash)),
+	}, "|")
+	digest := sha256.Sum256([]byte(transcript))
+
+	valid := false
+	if len(sigRaw) == 64 {
+		r := new(big.Int).SetBytes(sigRaw[:32])
+		s := new(big.Int).SetBytes(sigRaw[32:64])
+		valid = ecdsa.Verify(pubKey, digest[:], r, s)
+	} else {
+		valid = ecdsa.VerifyASN1(pubKey, digest[:], sigRaw)
+	}
+	if !valid {
+		return false, ""
+	}
+	return true, hex.EncodeToString(pubRaw)
+}
+
+func decodeHexOrBase64(s string) ([]byte, error) {
+	if len(s)%2 == 0 && isHexOnly(s) {
+		return hex.DecodeString(s)
+	}
+	return decodeBase64Flexible(s)
+}
+
+func isHexOnly(s string) bool {
+	if len(s) == 0 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+			return false
+		}
+	}
+	return true
+}
+
+func absInt(x int) int {
+	if x < 0 {
+		return -x
+	}
+	return x
 }
 
 func isValidHexBeacon(s string) bool {
@@ -750,6 +924,7 @@ type MemoryChallengeStore struct {
 	challenges  map[string]Challenge
 	gpuToNative map[string]map[string]struct{}
 	subnetToGPU map[string]map[string]time.Time
+	beaconToKey map[string]string
 }
 
 // NewMemoryChallengeStore creates an initialized MemoryChallengeStore using time.Now.
@@ -767,6 +942,7 @@ func NewMemoryChallengeStoreWithClock(nowFunc func() time.Time) *MemoryChallenge
 		challenges:  make(map[string]Challenge),
 		gpuToNative: make(map[string]map[string]struct{}),
 		subnetToGPU: make(map[string]map[string]time.Time),
+		beaconToKey: make(map[string]string),
 	}
 }
 
@@ -774,11 +950,26 @@ func (m *MemoryChallengeStore) SaveChallenge(_ context.Context, ch Challenge, _ 
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	nowMs := m.nowFunc().UnixMilli()
-	if len(m.challenges) > 4096 {
+	if len(m.challenges) >= 4096 {
 		for k, v := range m.challenges {
 			if nowMs > v.ExpiresAt {
 				delete(m.challenges, k)
 			}
+		}
+		// Hard capacity enforcement even if all 4096 entries are unexpired:
+		for len(m.challenges) >= 4096 {
+			var oldestKey string
+			var oldestExp int64 = math.MaxInt64
+			for k, v := range m.challenges {
+				if v.ExpiresAt < oldestExp {
+					oldestExp = v.ExpiresAt
+					oldestKey = k
+				}
+			}
+			if oldestKey == "" {
+				break
+			}
+			delete(m.challenges, oldestKey)
 		}
 	}
 	m.challenges[ch.Nonce] = ch
@@ -802,8 +993,7 @@ func (m *MemoryChallengeStore) ConsumeChallenge(_ context.Context, nonce string)
 func (m *MemoryChallengeStore) RecordNativeAnchorForGPU(_ context.Context, anchorScopeKey, nativeSliceID string) (int, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if len(m.gpuToNative) > 32768 {
-		// Bounded eviction when capacity limit is reached
+	if _, exists := m.gpuToNative[anchorScopeKey]; !exists && len(m.gpuToNative) >= 32768 {
 		for k := range m.gpuToNative {
 			delete(m.gpuToNative, k)
 			break
@@ -814,6 +1004,12 @@ func (m *MemoryChallengeStore) RecordNativeAnchorForGPU(_ context.Context, ancho
 		set = make(map[string]struct{})
 		m.gpuToNative[anchorScopeKey] = set
 	}
+	if _, exists := set[nativeSliceID]; !exists && len(set) >= 16 {
+		for k := range set {
+			delete(set, k)
+			break
+		}
+	}
 	set[nativeSliceID] = struct{}{}
 	return len(set), nil
 }
@@ -823,7 +1019,7 @@ func (m *MemoryChallengeStore) RecordSubnetGPU(_ context.Context, ipSubnet, gpuS
 	defer m.mu.Unlock()
 	now := m.nowFunc()
 	cutoff := now.Add(-window)
-	if len(m.subnetToGPU) > 16384 {
+	if _, exists := m.subnetToGPU[ipSubnet]; !exists && len(m.subnetToGPU) >= 4096 {
 		for sub, mset := range m.subnetToGPU {
 			for k, seenAt := range mset {
 				if seenAt.Before(cutoff) {
@@ -832,6 +1028,12 @@ func (m *MemoryChallengeStore) RecordSubnetGPU(_ context.Context, ipSubnet, gpuS
 			}
 			if len(mset) == 0 {
 				delete(m.subnetToGPU, sub)
+			}
+		}
+		for len(m.subnetToGPU) >= 4096 {
+			for sub := range m.subnetToGPU {
+				delete(m.subnetToGPU, sub)
+				break
 			}
 		}
 	}
@@ -845,6 +1047,43 @@ func (m *MemoryChallengeStore) RecordSubnetGPU(_ context.Context, ipSubnet, gpuS
 			delete(set, k)
 		}
 	}
+	if _, exists := set[gpuSliceID]; !exists && len(set) >= 128 {
+		for k := range set {
+			delete(set, k)
+			break
+		}
+	}
 	set[gpuSliceID] = now
 	return len(set), nil
+}
+
+// CheckOrBindBeaconDeviceKey enforces Trust-On-First-Use (TOFU) binding between a storage beacon
+// (d_bcn_*) and an attested ECDSA P-256 public key (d_key_*).
+//   - If beaconSliceID has not yet been bound to a device key, and deviceKeySliceID != "", it binds them and returns true.
+//   - If beaconSliceID was previously bound to key K1, and a subsequent request with beaconSliceID
+//     either omits deviceKeySliceID or presents K2 != K1, it returns false (flagging stolen beacon replay).
+func (m *MemoryChallengeStore) CheckOrBindBeaconDeviceKey(_ context.Context, beaconSliceID, deviceKeySliceID string) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if beaconSliceID == "" {
+		return true, nil
+	}
+	boundKey, exists := m.beaconToKey[beaconSliceID]
+	if !exists {
+		if deviceKeySliceID != "" {
+			if len(m.beaconToKey) >= 32768 {
+				for k := range m.beaconToKey {
+					delete(m.beaconToKey, k)
+					break
+				}
+			}
+			m.beaconToKey[beaconSliceID] = deviceKeySliceID
+		}
+		return true, nil
+	}
+	// Beacon was previously bound to an attested ECDSA P-256 key:
+	if deviceKeySliceID == "" || deviceKeySliceID != boundKey {
+		return false, nil
+	}
+	return true, nil
 }

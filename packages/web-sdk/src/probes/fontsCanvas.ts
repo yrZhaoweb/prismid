@@ -69,6 +69,8 @@ export interface FontsCanvasProbeResult {
   canvas_2d_hash: string
   fonts_bitmap_hash: string
   canvas_noise_injected: boolean
+  canvas_control_rgba: number[]
+  canvas_readback_delta: number
 }
 
 function renderCompositeScene(canvas: HTMLCanvasElement): string {
@@ -104,14 +106,24 @@ function renderCompositeScene(canvas: HTMLCanvasElement): string {
   return canvas.toDataURL()
 }
 
-function detectCanvasNoiseInjection(): boolean {
+function detectCanvasNoiseWithRawMeasurements(): {
+  noiseInjected: boolean
+  controlRgba: number[]
+  readbackDelta: number
+} {
+  let noiseInjected = false
+  let controlRgba: number[] = [0, 0, 0, 0, 17, 136, 221, 255]
+  let readbackDelta = 0
+
   try {
     // Trap 1: 16x16 Pure Solid-Color Exactness Trap
     const trapCanvas = document.createElement('canvas')
     trapCanvas.width = 16
     trapCanvas.height = 16
     const trapCtx = trapCanvas.getContext('2d')
-    if (!trapCtx) return false
+    if (!trapCtx) {
+      return { noiseInjected, controlRgba, readbackDelta }
+    }
 
     trapCtx.globalCompositeOperation = 'copy'
     trapCtx.fillStyle = 'rgb(17, 136, 221)'
@@ -124,21 +136,20 @@ function detectCanvasNoiseInjection(): boolean {
         imgData[i + 2] !== 221 ||
         imgData[i + 3] !== 255
       ) {
-        return true
+        noiseInjected = true
+        controlRgba = [0, 0, 0, 0, imgData[i], imgData[i + 1], imgData[i + 2], imgData[i + 3]]
+        break
       }
     }
 
-    // Trap 2: In-Scene Complex Text+Arc Deterministic Seed Trap (CreepJS / LiarJS Blank & Solid Invariant)
-    // Smart anti-detect browsers only activate their deterministic PRNG noise filter after `fillText`
-    // and `arc` are called on a context. We draw a full complex scene on `c1`, then carve out:
-    //   - Zone A (x: 224..240, y: 0..16): pristine transparent `clearRect` -> must be strictly rgba(0,0,0,0)
-    //   - Zone B (x: 224..240, y: 16..32): pure solid `rgb(17, 136, 221)` -> must be strictly [17,136,221,255]
+    // Trap 2: In-Scene Complex Text+Arc Deterministic Seed Trap
     const c1 = document.createElement('canvas')
     const c2 = document.createElement('canvas')
     const url1 = renderCompositeScene(c1)
     const url2 = renderCompositeScene(c2)
     if (url1 !== url2) {
-      return true
+      noiseInjected = true
+      readbackDelta += 1
     }
 
     const ctx1 = c1.getContext('2d')
@@ -149,13 +160,26 @@ function detectCanvasNoiseInjection(): boolean {
       ctx1.fillRect(224, 16, 16, 16)
 
       const blankData = ctx1.getImageData(224, 0, 16, 16).data
+      const solidInScene = ctx1.getImageData(224, 16, 16, 16).data
+      controlRgba = [
+        blankData[0] ?? 0,
+        blankData[1] ?? 0,
+        blankData[2] ?? 0,
+        blankData[3] ?? 0,
+        solidInScene[0] ?? 17,
+        solidInScene[1] ?? 136,
+        solidInScene[2] ?? 221,
+        solidInScene[3] ?? 255,
+      ]
+
       for (let i = 0; i < blankData.length; i++) {
         if (blankData[i] !== 0) {
-          return true
+          noiseInjected = true
+          controlRgba[i % 4] = blankData[i]
+          break
         }
       }
 
-      const solidInScene = ctx1.getImageData(224, 16, 16, 16).data
       for (let i = 0; i < solidInScene.length; i += 4) {
         if (
           solidInScene[i] !== 17 ||
@@ -163,23 +187,34 @@ function detectCanvasNoiseInjection(): boolean {
           solidInScene[i + 2] !== 221 ||
           solidInScene[i + 3] !== 255
         ) {
-          return true
+          noiseInjected = true
+          controlRgba[4] = solidInScene[i]
+          controlRgba[5] = solidInScene[i + 1]
+          controlRgba[6] = solidInScene[i + 2]
+          controlRgba[7] = solidInScene[i + 3]
+          break
         }
       }
 
-      // Trap 3: Stateful PRNG Seed Advance Trap (reading getImageData twice on the same complex canvas)
+      // Trap 3: Stateful PRNG Seed Advance Trap
       const readA = ctx1.getImageData(0, 0, 220, 60).data
       const readB = ctx1.getImageData(0, 0, 220, 60).data
       for (let i = 0; i < readA.length; i += 16) {
-        if (readA[i] !== readB[i] || readA[i + 1] !== readB[i + 1] || readA[i + 2] !== readB[i + 2]) {
-          return true
+        const diff =
+          Math.abs(readA[i] - readB[i]) +
+          Math.abs(readA[i + 1] - readB[i + 1]) +
+          Math.abs(readA[i + 2] - readB[i + 2])
+        if (diff !== 0) {
+          noiseInjected = true
+          readbackDelta += diff
+          break
         }
       }
     }
   } catch {
-    return false
+    // ignore
   }
-  return false
+  return { noiseInjected, controlRgba, readbackDelta }
 }
 
 export function collectFontsAndCanvasProbe(): FontsCanvasProbeResult {
@@ -188,12 +223,16 @@ export function collectFontsAndCanvasProbe(): FontsCanvasProbeResult {
       canvas_2d_hash: sha256Hex('headless-canvas2d-fallback'),
       fonts_bitmap_hash: sha256Hex('headless-fonts-fallback'),
       canvas_noise_injected: false,
+      canvas_control_rgba: [0, 0, 0, 0, 17, 136, 221, 255],
+      canvas_readback_delta: 0,
     }
   }
 
   let canvas2dHash = ''
   let fontsBitmapHash = ''
   let canvasNoiseInjected = false
+  let canvasControlRgba: number[] = [0, 0, 0, 0, 17, 136, 221, 255]
+  let canvasReadbackDelta = 0
 
   try {
     const canvas = document.createElement('canvas')
@@ -226,8 +265,11 @@ export function collectFontsAndCanvasProbe(): FontsCanvasProbeResult {
       }
     }
 
-    // 3. Anti-detect Canvas Noise Injection Trap
-    canvasNoiseInjected = detectCanvasNoiseInjection()
+    // 3. Anti-detect Canvas Noise Injection Trap + Raw Measurements
+    const rawCheck = detectCanvasNoiseWithRawMeasurements()
+    canvasNoiseInjected = rawCheck.noiseInjected
+    canvasControlRgba = rawCheck.controlRgba
+    canvasReadbackDelta = rawCheck.readbackDelta
   } catch {
     // Fallback if canvas is blocked
   }
@@ -236,5 +278,7 @@ export function collectFontsAndCanvasProbe(): FontsCanvasProbeResult {
     canvas_2d_hash: canvas2dHash || sha256Hex('canvas2d-fallback'),
     fonts_bitmap_hash: fontsBitmapHash || sha256Hex('fonts-fallback'),
     canvas_noise_injected: canvasNoiseInjected,
+    canvas_control_rgba: canvasControlRgba,
+    canvas_readback_delta: canvasReadbackDelta,
   }
 }

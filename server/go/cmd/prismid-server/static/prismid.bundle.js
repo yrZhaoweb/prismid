@@ -339,6 +339,244 @@ export function aes256GcmEncryptPureTS(key, iv, plaintext, aad) {
     return out;
 }
 
+// --- crypto/deviceKey.js ---
+/**
+ * PrismID Non-Extractable WebCrypto ECDSA P-256 Device Trust Root (`d_key_*`)
+ *
+ * Generates a hardware/browser-backed `ECDSA P-256` keypair with `extractable: false` on the
+ * private key and persists the `CryptoKey` object in `IndexedDB` (`_prismid_key_v1`).
+ *
+ * Security Properties:
+ * 1. Because `privateKey.extractable === false`, injected scripts or attackers in DevTools
+ *    cannot export the private key bytes via `crypto.subtle.exportKey`.
+ * 2. Every `/api/v1/risk/identify` payload is signed over the canonical challenge transcript:
+ *    `prismid-v2-sig|<nonce>|<beacon_id>|<static_webgl_fp_hash>|<audio_compressor_hash>`
+ * 3. The Go server verifies the P-256 signature, derives `d_key_<hmac>`, and enforces
+ *    Trust-On-First-Use (TOFU) binding between `d_bcn_*` and `d_key_*`.
+ */
+const KEY_DB_NAME = '_prismid_key_v1';
+const KEY_STORE_NAME = 'keystore';
+const KEY_RECORD_ID = 'hw_ecdsa_p256';
+const IDB_KEY_TIMEOUT_MS = 150;
+let memoryCachedKey = null;
+function bytesToHex(bytes) {
+    let out = '';
+    for (let i = 0; i < bytes.length; i++) {
+        out += bytes[i].toString(16).padStart(2, '0');
+    }
+    return out;
+}
+function getSubtleCrypto() {
+    if (typeof globalThis !== 'undefined' &&
+        typeof globalThis.crypto !== 'undefined' &&
+        globalThis.crypto &&
+        typeof globalThis.crypto.subtle !== 'undefined') {
+        return globalThis.crypto.subtle;
+    }
+    return null;
+}
+function readKeyFromIDB() {
+    return new Promise((resolve) => {
+        if (typeof indexedDB === 'undefined' || !indexedDB) {
+            resolve(null);
+            return;
+        }
+        let settled = false;
+        const done = (val) => {
+            if (settled)
+                return;
+            settled = true;
+            resolve(val);
+        };
+        const timer = setTimeout(() => done(null), IDB_KEY_TIMEOUT_MS);
+        try {
+            const req = indexedDB.open(KEY_DB_NAME, 1);
+            req.onupgradeneeded = () => {
+                const db = req.result;
+                if (!db.objectStoreNames.contains(KEY_STORE_NAME)) {
+                    db.createObjectStore(KEY_STORE_NAME);
+                }
+            };
+            req.onerror = () => {
+                clearTimeout(timer);
+                done(null);
+            };
+            req.onblocked = () => {
+                clearTimeout(timer);
+                done(null);
+            };
+            req.onsuccess = () => {
+                const db = req.result;
+                try {
+                    const tx = db.transaction(KEY_STORE_NAME, 'readonly');
+                    const store = tx.objectStore(KEY_STORE_NAME);
+                    const getReq = store.get(KEY_RECORD_ID);
+                    getReq.onsuccess = () => {
+                        clearTimeout(timer);
+                        const rec = getReq.result;
+                        db.close();
+                        if (rec &&
+                            typeof rec === 'object' &&
+                            rec.privateKey &&
+                            typeof rec.pubKeyHex === 'string' &&
+                            /^[0-9a-f]{130}$/.test(rec.pubKeyHex)) {
+                            done(rec);
+                        }
+                        else {
+                            done(null);
+                        }
+                    };
+                    getReq.onerror = () => {
+                        clearTimeout(timer);
+                        db.close();
+                        done(null);
+                    };
+                }
+                catch {
+                    clearTimeout(timer);
+                    db.close();
+                    done(null);
+                }
+            };
+        }
+        catch {
+            clearTimeout(timer);
+            done(null);
+        }
+    });
+}
+function writeKeyToIDB(rec) {
+    return new Promise((resolve) => {
+        if (typeof indexedDB === 'undefined' || !indexedDB) {
+            resolve();
+            return;
+        }
+        let settled = false;
+        const done = () => {
+            if (settled)
+                return;
+            settled = true;
+            resolve();
+        };
+        const timer = setTimeout(done, IDB_KEY_TIMEOUT_MS);
+        try {
+            const req = indexedDB.open(KEY_DB_NAME, 1);
+            req.onupgradeneeded = () => {
+                const db = req.result;
+                if (!db.objectStoreNames.contains(KEY_STORE_NAME)) {
+                    db.createObjectStore(KEY_STORE_NAME);
+                }
+            };
+            req.onerror = () => {
+                clearTimeout(timer);
+                done();
+            };
+            req.onblocked = () => {
+                clearTimeout(timer);
+                done();
+            };
+            req.onsuccess = () => {
+                const db = req.result;
+                try {
+                    const tx = db.transaction(KEY_STORE_NAME, 'readwrite');
+                    const store = tx.objectStore(KEY_STORE_NAME);
+                    store.put(rec, KEY_RECORD_ID);
+                    tx.oncomplete = () => {
+                        clearTimeout(timer);
+                        db.close();
+                        done();
+                    };
+                    tx.onerror = () => {
+                        clearTimeout(timer);
+                        db.close();
+                        done();
+                    };
+                    tx.onabort = () => {
+                        clearTimeout(timer);
+                        db.close();
+                        done();
+                    };
+                }
+                catch {
+                    clearTimeout(timer);
+                    db.close();
+                    done();
+                }
+            };
+        }
+        catch {
+            clearTimeout(timer);
+            done();
+        }
+    });
+}
+async function getOrCreateDeviceKeyRecord() {
+    if (memoryCachedKey) {
+        return memoryCachedKey;
+    }
+    const subtle = getSubtleCrypto();
+    if (!subtle) {
+        return null;
+    }
+    const existing = await readKeyFromIDB();
+    if (existing) {
+        memoryCachedKey = existing;
+        return existing;
+    }
+    try {
+        const keyPair = await subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, false, // non-extractable private key!
+        ['sign', 'verify']);
+        const rawPub = await subtle.exportKey('raw', keyPair.publicKey);
+        const pubKeyHex = bytesToHex(new Uint8Array(rawPub));
+        const record = {
+            privateKey: keyPair.privateKey,
+            pubKeyHex,
+        };
+        memoryCachedKey = record;
+        await writeKeyToIDB(record);
+        return record;
+    }
+    catch {
+        return null;
+    }
+}
+export function buildDeviceKeyTranscript(params) {
+    return [
+        'prismid-v2-sig',
+        params.nonce.trim(),
+        params.beaconId.trim().toLowerCase(),
+        params.staticWebGLFpHash.trim().toLowerCase(),
+        params.audioCompressorHash.trim().toLowerCase(),
+    ].join('|');
+}
+export async function signChallengeWithDeviceKey(params) {
+    const subtle = getSubtleCrypto();
+    if (!subtle) {
+        return undefined;
+    }
+    const rec = await getOrCreateDeviceKeyRecord();
+    if (!rec) {
+        return undefined;
+    }
+    try {
+        const transcript = buildDeviceKeyTranscript(params);
+        const msgBytes = new TextEncoder().encode(transcript);
+        const sigBuf = await subtle.sign({ name: 'ECDSA', hash: { name: 'SHA-256' } }, rec.privateKey, msgBytes);
+        const sigHex = bytesToHex(new Uint8Array(sigBuf));
+        if (sigHex.length !== 128) {
+            return undefined;
+        }
+        return {
+            alg: 'ecdsa-p256',
+            pub_key: rec.pubKeyHex,
+            signature: sigHex,
+        };
+    }
+    catch {
+        return undefined;
+    }
+}
+
 // --- probes/storageBeacon.js ---
 /**
  * PrismID 5-Silo Self-Healing Cryptographic Beacon (`storageBeacon.ts`)
@@ -1245,8 +1483,11 @@ export async function collectAudioProbeWithTrap(timeoutMs = 400) {
             globalThis.webkitOfflineAudioContext
         : undefined;
     if (!OfflineCtx) {
+        const fallbackHash = sha256Hex('prismid-audio-context-unavailable');
         return {
-            audio_compressor_hash: sha256Hex('prismid-audio-context-unavailable'),
+            audio_compressor_hash: fallbackHash,
+            audio_copy_hash: fallbackHash,
+            audio_silent_delta: 0,
             audio_noise_injected: false,
         };
     }
@@ -1259,8 +1500,11 @@ export async function collectAudioProbeWithTrap(timeoutMs = 400) {
             resolve(res);
         };
         const timer = setTimeout(() => {
+            const timeoutHash = sha256Hex('prismid-audio-context-timeout');
             finish({
-                audio_compressor_hash: sha256Hex('prismid-audio-context-timeout'),
+                audio_compressor_hash: timeoutHash,
+                audio_copy_hash: timeoutHash,
+                audio_silent_delta: 0,
                 audio_noise_injected: false,
             });
         }, timeoutMs);
@@ -1292,9 +1536,9 @@ export async function collectAudioProbeWithTrap(timeoutMs = 400) {
                     sliceA[i] = ch0A[4500 + i];
                 }
                 let noiseInjected = false;
+                let copyAcc = '';
+                let silentDelta = 0;
                 // Trap 1: Cross-Surface `copyFromChannel` vs `getChannelData` consistency
-                // Extensions like AudioContext Fingerprint Defender hook `getChannelData` but miss `copyFromChannel`,
-                // or inject per-call random noise so a second read differs from the first!
                 if (typeof buffer.copyFromChannel === 'function') {
                     try {
                         const copySlice = new Float32Array(500);
@@ -1302,8 +1546,8 @@ export async function collectAudioProbeWithTrap(timeoutMs = 400) {
                         for (let i = 0; i < 500; i++) {
                             if (copySlice[i] !== sliceA[i]) {
                                 noiseInjected = true;
-                                break;
                             }
+                            copyAcc += copySlice[i].toFixed(7) + ',';
                         }
                     }
                     catch {
@@ -1318,13 +1562,14 @@ export async function collectAudioProbeWithTrap(timeoutMs = 400) {
                         break;
                     }
                 }
-                // Trap 3: Pristine Silent AudioBuffer Invariant (catches deterministic PRNG seed hooks on AudioBuffer.prototype.getChannelData)
+                // Trap 3: Pristine Silent AudioBuffer Invariant
                 try {
                     const silentBuf = ctx.createBuffer(1, 16, 44100);
                     const silentData = silentBuf.getChannelData(0);
                     for (let i = 0; i < silentData.length; i++) {
                         if (silentData[i] !== 0) {
                             noiseInjected = true;
+                            silentDelta += Math.abs(silentData[i]);
                             break;
                         }
                     }
@@ -1332,7 +1577,7 @@ export async function collectAudioProbeWithTrap(timeoutMs = 400) {
                 catch {
                     // ignore
                 }
-                // Trap 4: Realistic magnitude & NaN/Infinity check (CreepJS audio magnitude invariant)
+                // Trap 4: Realistic magnitude & NaN/Infinity check
                 let nonZeroCount = 0;
                 let acc = '';
                 for (let i = 0; i < 500; i++) {
@@ -1347,8 +1592,12 @@ export async function collectAudioProbeWithTrap(timeoutMs = 400) {
                 if (nonZeroCount === 0) {
                     noiseInjected = true;
                 }
+                const primaryHash = sha256Hex(acc);
+                const copyHash = copyAcc ? sha256Hex(copyAcc) : primaryHash;
                 return {
-                    audio_compressor_hash: sha256Hex(acc),
+                    audio_compressor_hash: primaryHash,
+                    audio_copy_hash: copyHash,
+                    audio_silent_delta: silentDelta,
                     audio_noise_injected: noiseInjected,
                 };
             };
@@ -1361,8 +1610,11 @@ export async function collectAudioProbeWithTrap(timeoutMs = 400) {
                 })
                     .catch(() => {
                     clearTimeout(timer);
+                    const rejHash = sha256Hex('prismid-audio-render-rejected');
                     finish({
-                        audio_compressor_hash: sha256Hex('prismid-audio-render-rejected'),
+                        audio_compressor_hash: rejHash,
+                        audio_copy_hash: rejHash,
+                        audio_silent_delta: 0,
                         audio_noise_injected: false,
                     });
                 });
@@ -1376,8 +1628,11 @@ export async function collectAudioProbeWithTrap(timeoutMs = 400) {
         }
         catch {
             clearTimeout(timer);
+            const excHash = sha256Hex('prismid-audio-exception');
             finish({
-                audio_compressor_hash: sha256Hex('prismid-audio-exception'),
+                audio_compressor_hash: excHash,
+                audio_copy_hash: excHash,
+                audio_silent_delta: 0,
                 audio_noise_injected: false,
             });
         }
@@ -1480,15 +1735,19 @@ function renderCompositeScene(canvas) {
     ctx.stroke();
     return canvas.toDataURL();
 }
-function detectCanvasNoiseInjection() {
+function detectCanvasNoiseWithRawMeasurements() {
+    let noiseInjected = false;
+    let controlRgba = [0, 0, 0, 0, 17, 136, 221, 255];
+    let readbackDelta = 0;
     try {
         // Trap 1: 16x16 Pure Solid-Color Exactness Trap
         const trapCanvas = document.createElement('canvas');
         trapCanvas.width = 16;
         trapCanvas.height = 16;
         const trapCtx = trapCanvas.getContext('2d');
-        if (!trapCtx)
-            return false;
+        if (!trapCtx) {
+            return { noiseInjected, controlRgba, readbackDelta };
+        }
         trapCtx.globalCompositeOperation = 'copy';
         trapCtx.fillStyle = 'rgb(17, 136, 221)';
         trapCtx.fillRect(0, 0, 16, 16);
@@ -1498,20 +1757,19 @@ function detectCanvasNoiseInjection() {
                 imgData[i + 1] !== 136 ||
                 imgData[i + 2] !== 221 ||
                 imgData[i + 3] !== 255) {
-                return true;
+                noiseInjected = true;
+                controlRgba = [0, 0, 0, 0, imgData[i], imgData[i + 1], imgData[i + 2], imgData[i + 3]];
+                break;
             }
         }
-        // Trap 2: In-Scene Complex Text+Arc Deterministic Seed Trap (CreepJS / LiarJS Blank & Solid Invariant)
-        // Smart anti-detect browsers only activate their deterministic PRNG noise filter after `fillText`
-        // and `arc` are called on a context. We draw a full complex scene on `c1`, then carve out:
-        //   - Zone A (x: 224..240, y: 0..16): pristine transparent `clearRect` -> must be strictly rgba(0,0,0,0)
-        //   - Zone B (x: 224..240, y: 16..32): pure solid `rgb(17, 136, 221)` -> must be strictly [17,136,221,255]
+        // Trap 2: In-Scene Complex Text+Arc Deterministic Seed Trap
         const c1 = document.createElement('canvas');
         const c2 = document.createElement('canvas');
         const url1 = renderCompositeScene(c1);
         const url2 = renderCompositeScene(c2);
         if (url1 !== url2) {
-            return true;
+            noiseInjected = true;
+            readbackDelta += 1;
         }
         const ctx1 = c1.getContext('2d');
         if (ctx1) {
@@ -1520,34 +1778,56 @@ function detectCanvasNoiseInjection() {
             ctx1.fillStyle = 'rgb(17, 136, 221)';
             ctx1.fillRect(224, 16, 16, 16);
             const blankData = ctx1.getImageData(224, 0, 16, 16).data;
+            const solidInScene = ctx1.getImageData(224, 16, 16, 16).data;
+            controlRgba = [
+                blankData[0] ?? 0,
+                blankData[1] ?? 0,
+                blankData[2] ?? 0,
+                blankData[3] ?? 0,
+                solidInScene[0] ?? 17,
+                solidInScene[1] ?? 136,
+                solidInScene[2] ?? 221,
+                solidInScene[3] ?? 255,
+            ];
             for (let i = 0; i < blankData.length; i++) {
                 if (blankData[i] !== 0) {
-                    return true;
+                    noiseInjected = true;
+                    controlRgba[i % 4] = blankData[i];
+                    break;
                 }
             }
-            const solidInScene = ctx1.getImageData(224, 16, 16, 16).data;
             for (let i = 0; i < solidInScene.length; i += 4) {
                 if (solidInScene[i] !== 17 ||
                     solidInScene[i + 1] !== 136 ||
                     solidInScene[i + 2] !== 221 ||
                     solidInScene[i + 3] !== 255) {
-                    return true;
+                    noiseInjected = true;
+                    controlRgba[4] = solidInScene[i];
+                    controlRgba[5] = solidInScene[i + 1];
+                    controlRgba[6] = solidInScene[i + 2];
+                    controlRgba[7] = solidInScene[i + 3];
+                    break;
                 }
             }
-            // Trap 3: Stateful PRNG Seed Advance Trap (reading getImageData twice on the same complex canvas)
+            // Trap 3: Stateful PRNG Seed Advance Trap
             const readA = ctx1.getImageData(0, 0, 220, 60).data;
             const readB = ctx1.getImageData(0, 0, 220, 60).data;
             for (let i = 0; i < readA.length; i += 16) {
-                if (readA[i] !== readB[i] || readA[i + 1] !== readB[i + 1] || readA[i + 2] !== readB[i + 2]) {
-                    return true;
+                const diff = Math.abs(readA[i] - readB[i]) +
+                    Math.abs(readA[i + 1] - readB[i + 1]) +
+                    Math.abs(readA[i + 2] - readB[i + 2]);
+                if (diff !== 0) {
+                    noiseInjected = true;
+                    readbackDelta += diff;
+                    break;
                 }
             }
         }
     }
     catch {
-        return false;
+        // ignore
     }
-    return false;
+    return { noiseInjected, controlRgba, readbackDelta };
 }
 export function collectFontsAndCanvasProbe() {
     if (typeof document === 'undefined' || typeof document.createElement !== 'function') {
@@ -1555,11 +1835,15 @@ export function collectFontsAndCanvasProbe() {
             canvas_2d_hash: sha256Hex('headless-canvas2d-fallback'),
             fonts_bitmap_hash: sha256Hex('headless-fonts-fallback'),
             canvas_noise_injected: false,
+            canvas_control_rgba: [0, 0, 0, 0, 17, 136, 221, 255],
+            canvas_readback_delta: 0,
         };
     }
     let canvas2dHash = '';
     let fontsBitmapHash = '';
     let canvasNoiseInjected = false;
+    let canvasControlRgba = [0, 0, 0, 0, 17, 136, 221, 255];
+    let canvasReadbackDelta = 0;
     try {
         const canvas = document.createElement('canvas');
         canvas.width = 240;
@@ -1587,8 +1871,11 @@ export function collectFontsAndCanvasProbe() {
                 canvas2dHash = sha256Hex(dataUrl);
             }
         }
-        // 3. Anti-detect Canvas Noise Injection Trap
-        canvasNoiseInjected = detectCanvasNoiseInjection();
+        // 3. Anti-detect Canvas Noise Injection Trap + Raw Measurements
+        const rawCheck = detectCanvasNoiseWithRawMeasurements();
+        canvasNoiseInjected = rawCheck.noiseInjected;
+        canvasControlRgba = rawCheck.controlRgba;
+        canvasReadbackDelta = rawCheck.readbackDelta;
     }
     catch {
         // Fallback if canvas is blocked
@@ -1597,6 +1884,8 @@ export function collectFontsAndCanvasProbe() {
         canvas_2d_hash: canvas2dHash || sha256Hex('canvas2d-fallback'),
         fonts_bitmap_hash: fontsBitmapHash || sha256Hex('fonts-fallback'),
         canvas_noise_injected: canvasNoiseInjected,
+        canvas_control_rgba: canvasControlRgba,
+        canvas_readback_delta: canvasReadbackDelta,
     };
 }
 
@@ -1814,16 +2103,17 @@ export function collectLieDetectorProbe() {
 
 // --- index.js ---
 /**
- * PrismID Web & WebView SDK (`prismid-js`)
+ * PrismID Web & WebView SDK (`prismid-js` v0.5.0)
  *
  * Provides 3-line integration for Browser Web apps and Tauri Desktop WebViews:
  *   1. Requests a 60s single-use challenge (`nonce` + `render_seed` [s0,s1,s2,s3])
- *   2. Executes WebGL shader spot-pixel sampling, inline Blob Worker + OffscreenCanvas
- *      cross-thread lie detection, 5-silo self-healing storage beacon, Canvas 2D solid-patch
- *      noise trap, OfflineAudioContext integral, sub-pixel TextMetrics font bounding boxes,
- *      FDLIBM Math constants, and optional Rust NativeHardwareAnchor
+ *   2. Executes WebGL shader spot-pixel sampling, non-extractable WebCrypto ECDSA P-256
+ *      device key signing (`d_key_*`), inline Blob Worker + OffscreenCanvas cross-thread
+ *      lie detection, 5-silo self-healing storage beacon, raw Canvas/Audio exactness
+ *      measurements, sub-pixel TextMetrics font bounding boxes, and optional Rust NativeHardwareAnchor
  *   3. Seals the entire probe payload via AES-256-GCM (AEAD) and submits to `/api/v1/risk/identify`
  */
+
 
 
 
@@ -1946,13 +2236,34 @@ export function createPrismClient(options = {}) {
                 clearTimeout(timer);
         });
     }
-    async function fetchWithDeadline(url, init) {
+    // Covers both HTTP response headers AND full response body reading within a single deadline!
+    async function fetchJsonWithDeadline(url, init) {
         if (!fetchFn)
             throw new Error('fetch unavailable');
         const controller = typeof AbortController !== 'undefined' ? new AbortController() : undefined;
-        const timer = controller ? setTimeout(() => controller.abort(), requestTimeoutMs) : undefined;
+        let timer;
+        const timeoutPromise = new Promise((_, reject) => {
+            timer = setTimeout(() => {
+                if (controller)
+                    controller.abort();
+                reject(new Error('request deadline exceeded'));
+            }, requestTimeoutMs);
+        });
         try {
-            return await fetchFn(url, controller ? { ...init, signal: controller.signal } : init);
+            const work = (async () => {
+                const res = await fetchFn(url, controller ? { ...init, signal: controller.signal } : init);
+                const text = await res.text();
+                if (!text) {
+                    return { ok: res.ok, status: res.status, data: null };
+                }
+                try {
+                    return { ok: res.ok, status: res.status, data: JSON.parse(text) };
+                }
+                catch {
+                    return { ok: res.ok, status: res.status, data: null };
+                }
+            })();
+            return await Promise.race([work, timeoutPromise]);
         }
         finally {
             if (timer !== undefined)
@@ -1998,11 +2309,22 @@ export function createPrismClient(options = {}) {
                 ? withDeadline(Promise.resolve(options.getTurnstileToken()).catch(() => undefined), providerTimeoutMs, undefined)
                 : Promise.resolve(undefined),
         ]);
+        const effectiveWebGLHash = workerLie.worker_static_webgl_fp_hash &&
+            workerLie.worker_static_webgl_fp_hash !== 'worker-webgl-unavailable'
+            ? workerLie.worker_static_webgl_fp_hash
+            : webgl.static_webgl_fp_hash;
+        const deviceKey = await withDeadline(signChallengeWithDeviceKey({
+            nonce: challenge.nonce,
+            beaconId: storageBeacon.beacon_id,
+            staticWebGLFpHash: effectiveWebGLHash,
+            audioCompressorHash: audioRes.audio_compressor_hash,
+        }), 350, undefined);
         const payload = {
             v: 1,
             nonce: challenge.nonce,
             collected_at: Date.now(),
             beacon_id: storageBeacon.beacon_id,
+            ...(deviceKey ? { device_key: deviceKey } : {}),
             webgl: {
                 gpu_vendor: webgl.gpu_vendor,
                 gpu_renderer: webgl.gpu_renderer,
@@ -2013,6 +2335,8 @@ export function createPrismClient(options = {}) {
                 spot_pixels: webgl.spot_pixels,
             },
             audio_compressor_hash: audioRes.audio_compressor_hash,
+            audio_copy_hash: audioRes.audio_copy_hash,
+            audio_silent_delta: audioRes.audio_silent_delta,
             system: {
                 user_agent: sysMeta.userAgent,
                 platform: sysMeta.platform,
@@ -2026,6 +2350,8 @@ export function createPrismClient(options = {}) {
                 ...(sysMeta.intlHash ? { intl_hash: sysMeta.intlHash } : {}),
                 canvas_2d_hash: fontsCanvas.canvas_2d_hash,
                 fonts_bitmap_hash: fontsCanvas.fonts_bitmap_hash,
+                canvas_control_rgba: fontsCanvas.canvas_control_rgba,
+                canvas_readback_delta: fontsCanvas.canvas_readback_delta,
             },
             lies: {
                 worker_unavailable: workerLie.worker_unavailable,
@@ -2040,6 +2366,7 @@ export function createPrismClient(options = {}) {
                 webgl_noise_injected: webgl.webgl_noise_injected,
                 audio_noise_injected: audioRes.audio_noise_injected,
                 storage_healed: storageBeacon.storage_healed,
+                storage_silos_mask: storageBeacon.surviving_silos.length,
                 math_engine_signature: lieDetector.math_engine_signature,
                 math_constants_hash: lieDetector.math_constants_hash,
                 prototype_lies: lieDetector.prototype_lies,
@@ -2076,13 +2403,12 @@ export function createPrismClient(options = {}) {
                 const headers = await buildAuthHeaders();
                 if (!callOpts?.force) {
                     try {
-                        const scRes = await fetchWithDeadline(`${baseUrl}/api/v1/risk/should-collect`, {
+                        const scRes = await fetchJsonWithDeadline(`${baseUrl}/api/v1/risk/should-collect`, {
                             method: 'GET',
                             headers,
                         });
-                        if (scRes.ok) {
-                            const scJson = (await scRes.json());
-                            const shouldCollect = scJson.should_collect ?? scJson.data?.should_collect ?? true;
+                        if (scRes.ok && scRes.data) {
+                            const shouldCollect = scRes.data.should_collect ?? scRes.data.data?.should_collect ?? true;
                             if (shouldCollect === false) {
                                 lastIdentifiedToken = token;
                                 lastIdentifiedAt = Date.now();
@@ -2094,26 +2420,26 @@ export function createPrismClient(options = {}) {
                         // Proceed to challenge if should-collect endpoint is not used
                     }
                 }
-                const chRes = await fetchWithDeadline(`${baseUrl}/api/v1/risk/challenge`, {
+                const chRes = await fetchJsonWithDeadline(`${baseUrl}/api/v1/risk/challenge`, {
                     method: 'POST',
                     headers,
                     body: '{}',
                 });
-                if (!chRes.ok) {
+                if (!chRes.ok || !chRes.data) {
                     return null;
                 }
-                const chRaw = (await chRes.json());
+                const chRaw = chRes.data;
                 const challenge = chRaw.nonce ? chRaw : chRaw.data;
                 if (!challenge || !challenge.nonce || !Array.isArray(challenge.render_seed)) {
                     return null;
                 }
                 const { request } = await collectAndSeal(challenge);
-                const idRes = await fetchWithDeadline(`${baseUrl}/api/v1/risk/identify`, {
+                const idRes = await fetchJsonWithDeadline(`${baseUrl}/api/v1/risk/identify`, {
                     method: 'POST',
                     headers,
                     body: JSON.stringify(request),
                 });
-                const idRaw = (await idRes.json().catch(() => null));
+                const idRaw = idRes.data;
                 if (!idRaw || typeof idRaw !== 'object') {
                     return null;
                 }

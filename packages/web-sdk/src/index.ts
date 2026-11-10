@@ -1,12 +1,12 @@
 /**
- * PrismID Web & WebView SDK (`prismid-js`)
+ * PrismID Web & WebView SDK (`prismid-js` v0.5.0)
  *
  * Provides 3-line integration for Browser Web apps and Tauri Desktop WebViews:
  *   1. Requests a 60s single-use challenge (`nonce` + `render_seed` [s0,s1,s2,s3])
- *   2. Executes WebGL shader spot-pixel sampling, inline Blob Worker + OffscreenCanvas
- *      cross-thread lie detection, 5-silo self-healing storage beacon, Canvas 2D solid-patch
- *      noise trap, OfflineAudioContext integral, sub-pixel TextMetrics font bounding boxes,
- *      FDLIBM Math constants, and optional Rust NativeHardwareAnchor
+ *   2. Executes WebGL shader spot-pixel sampling, non-extractable WebCrypto ECDSA P-256
+ *      device key signing (`d_key_*`), inline Blob Worker + OffscreenCanvas cross-thread
+ *      lie detection, 5-silo self-healing storage beacon, raw Canvas/Audio exactness
+ *      measurements, sub-pixel TextMetrics font bounding boxes, and optional Rust NativeHardwareAnchor
  *   3. Seals the entire probe payload via AES-256-GCM (AEAD) and submits to `/api/v1/risk/identify`
  */
 
@@ -19,6 +19,11 @@ import {
   sha256Hex,
   toBase64RawURL,
 } from './crypto/aead.js'
+import {
+  buildDeviceKeyTranscript,
+  signChallengeWithDeviceKey,
+  type DeviceKeyProof,
+} from './crypto/deviceKey.js'
 import { collectAudioProbe, collectAudioProbeWithTrap } from './probes/audio.js'
 import { collectFontsAndCanvasProbe } from './probes/fontsCanvas.js'
 import { collectLieDetectorProbe } from './probes/lieDetector.js'
@@ -33,6 +38,7 @@ import { collectWorkerLieProbe } from './probes/workerLie.js'
 export {
   AEAD_KEY_DOMAIN_PREFIX,
   aes256GcmEncryptPureTS,
+  buildDeviceKeyTranscript,
   collectAndHealStorageBeacon,
   collectAudioProbe,
   collectFontsAndCanvasProbe,
@@ -45,7 +51,9 @@ export {
   sealPayload,
   sha256Bytes,
   sha256Hex,
+  signChallengeWithDeviceKey,
   toBase64RawURL,
+  type DeviceKeyProof,
   type StorageBeaconResult,
 }
 
@@ -75,12 +83,21 @@ export interface IdentifyWireRequest {
   ts?: string
 }
 
+export interface RiskEvidenceItem {
+  category: string
+  slice_id?: string
+  rule_name: string
+  log_odds_delta: number
+  description: string
+}
+
 export interface IdentifyResponse {
   accepted: boolean
   code?: string
   message?: string
   confidence?: number
   exact_slice_id?: string
+  device_key_slice_id?: string
   keychain_slice_id?: string
   beacon_slice_id?: string
   gpu_audio_slice_id?: string
@@ -94,6 +111,9 @@ export interface IdentifyResponse {
   privacy_signals?: string[]
   risk_status?: string
   risk_pending?: boolean
+  burst_suspicion?: boolean
+  log_odds_score?: number
+  evidence_chain?: RiskEvidenceItem[]
 }
 
 export interface ProbePayload {
@@ -101,6 +121,7 @@ export interface ProbePayload {
   nonce: string
   collected_at: number
   beacon_id?: string
+  device_key?: DeviceKeyProof
   webgl: {
     gpu_vendor: string
     gpu_renderer: string
@@ -111,6 +132,8 @@ export interface ProbePayload {
     spot_pixels: [number, number, number, number][]
   }
   audio_compressor_hash: string
+  audio_copy_hash?: string
+  audio_silent_delta?: number
   system: {
     user_agent: string
     platform: string
@@ -124,6 +147,8 @@ export interface ProbePayload {
     intl_hash?: string
     canvas_2d_hash: string
     fonts_bitmap_hash: string
+    canvas_control_rgba?: number[]
+    canvas_readback_delta?: number
   }
   lies: {
     worker_unavailable: boolean
@@ -138,6 +163,7 @@ export interface ProbePayload {
     webgl_noise_injected?: boolean
     audio_noise_injected?: boolean
     storage_healed?: boolean
+    storage_silos_mask?: number
     math_engine_signature: string
     math_constants_hash: string
     prototype_lies: string[]
@@ -162,7 +188,7 @@ export interface PrismClientOptions {
   fetchImpl?: typeof fetch
   /** Session cooldown in milliseconds to avoid redundant collections (default: 5 minutes). */
   cooldownMs?: number
-  /** Per-request network & provider timeout in milliseconds (default: 5000ms). */
+  /** Per-request network (headers + body) & provider timeout in milliseconds (default: 5000ms). */
   requestTimeoutMs?: number
 }
 
@@ -303,12 +329,34 @@ export function createPrismClient(options: PrismClientOptions = {}): PrismClient
     })
   }
 
-  async function fetchWithDeadline(url: string, init: RequestInit): Promise<Response> {
+  // Covers both HTTP response headers AND full response body reading within a single deadline!
+  async function fetchJsonWithDeadline<T>(
+    url: string,
+    init: RequestInit
+  ): Promise<{ ok: boolean; status: number; data: T | null }> {
     if (!fetchFn) throw new Error('fetch unavailable')
     const controller = typeof AbortController !== 'undefined' ? new AbortController() : undefined
-    const timer = controller ? setTimeout(() => controller.abort(), requestTimeoutMs) : undefined
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        if (controller) controller.abort()
+        reject(new Error('request deadline exceeded'))
+      }, requestTimeoutMs)
+    })
     try {
-      return await fetchFn(url, controller ? { ...init, signal: controller.signal } : init)
+      const work = (async () => {
+        const res = await fetchFn(url, controller ? { ...init, signal: controller.signal } : init)
+        const text = await res.text()
+        if (!text) {
+          return { ok: res.ok, status: res.status, data: null }
+        }
+        try {
+          return { ok: res.ok, status: res.status, data: JSON.parse(text) as T }
+        } catch {
+          return { ok: res.ok, status: res.status, data: null }
+        }
+      })()
+      return await Promise.race([work, timeoutPromise])
     } finally {
       if (timer !== undefined) clearTimeout(timer)
     }
@@ -373,11 +421,29 @@ export function createPrismClient(options: PrismClientOptions = {}): PrismClient
         : Promise.resolve(undefined),
     ])
 
+    const effectiveWebGLHash =
+      workerLie.worker_static_webgl_fp_hash &&
+      workerLie.worker_static_webgl_fp_hash !== 'worker-webgl-unavailable'
+        ? workerLie.worker_static_webgl_fp_hash
+        : webgl.static_webgl_fp_hash
+
+    const deviceKey = await withDeadline(
+      signChallengeWithDeviceKey({
+        nonce: challenge.nonce,
+        beaconId: storageBeacon.beacon_id,
+        staticWebGLFpHash: effectiveWebGLHash,
+        audioCompressorHash: audioRes.audio_compressor_hash,
+      }),
+      350,
+      undefined
+    )
+
     const payload: ProbePayload = {
       v: 1,
       nonce: challenge.nonce,
       collected_at: Date.now(),
       beacon_id: storageBeacon.beacon_id,
+      ...(deviceKey ? { device_key: deviceKey } : {}),
       webgl: {
         gpu_vendor: webgl.gpu_vendor,
         gpu_renderer: webgl.gpu_renderer,
@@ -388,6 +454,8 @@ export function createPrismClient(options: PrismClientOptions = {}): PrismClient
         spot_pixels: webgl.spot_pixels,
       },
       audio_compressor_hash: audioRes.audio_compressor_hash,
+      audio_copy_hash: audioRes.audio_copy_hash,
+      audio_silent_delta: audioRes.audio_silent_delta,
       system: {
         user_agent: sysMeta.userAgent,
         platform: sysMeta.platform,
@@ -401,6 +469,8 @@ export function createPrismClient(options: PrismClientOptions = {}): PrismClient
         ...(sysMeta.intlHash ? { intl_hash: sysMeta.intlHash } : {}),
         canvas_2d_hash: fontsCanvas.canvas_2d_hash,
         fonts_bitmap_hash: fontsCanvas.fonts_bitmap_hash,
+        canvas_control_rgba: fontsCanvas.canvas_control_rgba,
+        canvas_readback_delta: fontsCanvas.canvas_readback_delta,
       },
       lies: {
         worker_unavailable: workerLie.worker_unavailable,
@@ -415,6 +485,7 @@ export function createPrismClient(options: PrismClientOptions = {}): PrismClient
         webgl_noise_injected: webgl.webgl_noise_injected,
         audio_noise_injected: audioRes.audio_noise_injected,
         storage_healed: storageBeacon.storage_healed,
+        storage_silos_mask: storageBeacon.surviving_silos.length,
         math_engine_signature: lieDetector.math_engine_signature,
         math_constants_hash: lieDetector.math_constants_hash,
         prototype_lies: lieDetector.prototype_lies,
@@ -462,17 +533,16 @@ export function createPrismClient(options: PrismClientOptions = {}): PrismClient
 
         if (!callOpts?.force) {
           try {
-            const scRes = await fetchWithDeadline(`${baseUrl}/api/v1/risk/should-collect`, {
+            const scRes = await fetchJsonWithDeadline<{
+              should_collect?: boolean
+              data?: { should_collect?: boolean }
+            }>(`${baseUrl}/api/v1/risk/should-collect`, {
               method: 'GET',
               headers,
             })
-            if (scRes.ok) {
-              const scJson = (await scRes.json()) as {
-                should_collect?: boolean
-                data?: { should_collect?: boolean }
-              }
+            if (scRes.ok && scRes.data) {
               const shouldCollect =
-                scJson.should_collect ?? scJson.data?.should_collect ?? true
+                scRes.data.should_collect ?? scRes.data.data?.should_collect ?? true
               if (shouldCollect === false) {
                 lastIdentifiedToken = token
                 lastIdentifiedAt = Date.now()
@@ -484,15 +554,17 @@ export function createPrismClient(options: PrismClientOptions = {}): PrismClient
           }
         }
 
-        const chRes = await fetchWithDeadline(`${baseUrl}/api/v1/risk/challenge`, {
+        const chRes = await fetchJsonWithDeadline<
+          ChallengeResponse & { data?: ChallengeResponse }
+        >(`${baseUrl}/api/v1/risk/challenge`, {
           method: 'POST',
           headers,
           body: '{}',
         })
-        if (!chRes.ok) {
+        if (!chRes.ok || !chRes.data) {
           return null
         }
-        const chRaw = (await chRes.json()) as ChallengeResponse & { data?: ChallengeResponse }
+        const chRaw = chRes.data
         const challenge: ChallengeResponse = chRaw.nonce ? chRaw : (chRaw.data as ChallengeResponse)
         if (!challenge || !challenge.nonce || !Array.isArray(challenge.render_seed)) {
           return null
@@ -500,14 +572,14 @@ export function createPrismClient(options: PrismClientOptions = {}): PrismClient
 
         const { request } = await collectAndSeal(challenge)
 
-        const idRes = await fetchWithDeadline(`${baseUrl}/api/v1/risk/identify`, {
+        const idRes = await fetchJsonWithDeadline<
+          IdentifyResponse & { data?: IdentifyResponse }
+        >(`${baseUrl}/api/v1/risk/identify`, {
           method: 'POST',
           headers,
           body: JSON.stringify(request),
         })
-        const idRaw = (await idRes.json().catch(() => null)) as
-          | (IdentifyResponse & { data?: IdentifyResponse })
-          | null
+        const idRaw = idRes.data
         if (!idRaw || typeof idRaw !== 'object') {
           return null
         }

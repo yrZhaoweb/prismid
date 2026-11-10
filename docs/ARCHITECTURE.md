@@ -20,20 +20,20 @@ Conventional client-side fingerprinting libraries collect ~20 browser attributes
 flowchart TB
     subgraph L1["Tier 1 & Tier 2: Client Probes & Dynamic Shader Challenge"]
         direction LR
-        Desktop["Desktop App (Tauri 2 + prismid-native v0.4.0)<br/>• macOS: ioreg IOPlatformUUID + Serial + Keychain (12ms)<br/>• Windows: MachineGuid + BIOS Serial + SMBIOS UUID + HKCU Registry<br/>• Linux: /etc/machine-id + product_uuid<br/>• Hypervisor VM Detection + OnceLock Cache"]
-        Web["Web / WebView Layer (prismid-js v0.4.0)<br/>• 11 Canonical WebGL Register Limits + Static 3D Hash<br/>• Bounded 350ms 5-Silo Self-Healing Storage Beacon<br/>• Dynamic render_seed 256x256 Fragment Shader<br/>• Inline Blob Worker + OffscreenCanvas Lie Probe<br/>• OfflineAudioContext Hash + copyFromChannel Trap<br/>• Cyclic __proto__ Proxy Trap + In-Scene Canvas Traps"]
+        Desktop["Desktop App (Tauri 2 + prismid-native v0.5.0)<br/>• macOS: ioreg IOPlatformUUID + Serial + Keychain (12ms)<br/>• Windows: MachineGuid + BIOS Serial + SMBIOS UUID + HKCU Registry<br/>• Linux: /etc/machine-id + product_uuid<br/>• Hypervisor VM Detection + OnceLock Cache"]
+        Web["Web / WebView Layer (prismid-js v0.5.0)<br/>• Non-Extractable WebCrypto ECDSA P-256 Device Key (d_key_*)<br/>• 11 Canonical WebGL Register Limits + Static 3D Hash<br/>• Bounded 350ms 5-Silo Self-Healing Storage Beacon<br/>• Dynamic render_seed 256x256 Fragment Shader<br/>• Inline Blob Worker + OffscreenCanvas Lie Probe<br/>• Raw Control-Pixel & Audio copyFromChannel Telemetry"]
     end
 
     subgraph Wire["Encrypted Transport Layer (Replay-Protected AEAD Envelope)"]
         ChReq["1. POST /api/v1/risk/challenge<br/>Returns 60s single-use nonce + render_seed [s0,s1,s2,s3] in [1.25, 6.75]"]
-        Seal["2. GPU renders shader -> samples 8 spot pixels<br/>Seals payload via AES-256-GCM (Key=SHA256('prismid-v1-aead:'+nonce))"]
+        Seal["2. GPU renders shader -> samples 8 spot pixels + signs transcript with ECDSA P-256<br/>Seals payload via AES-256-GCM (Key=SHA256('prismid-v1-aead:'+nonce))"]
         IdReq["3. POST /api/v1/risk/identify<br/>{ c: nonce, p: Base64RawURL(IV || Ciphertext || Tag) }"]
         ChReq --> Seal --> IdReq
     end
 
-    subgraph L3["Tier 3: Go Verification Engine & Identity-Safe Risk Graph (prismid-go v0.4.0)"]
-        AntiForgery["5-Layer Verification & Telemetry Engine<br/>① Atomic single-use nonce consumption & TTL bounds<br/>② GLSL +0.5 pixel-center math verification (absDiff <= 2)<br/>③ GPU Register Laws + Worker Lie override + Per-Anchor UUID Split Trap<br/>④ Virtual GPU / Software Renderer Demotion (Confidence = 0.30)<br/>⑤ /24 Subnet Hardware Diversity Telemetry (SubnetCrowdTriggered)"]
-        Slices["Hard Identity Slices vs. Soft Environment Slices<br/>• Hard Per-Device Slices: d_nat_* (Desktop), d_kch_* (Keychain/Registry), d_bcn_* (5-Silo Beacon)<br/>• Soft Model/Env Slices: d_gpu_* (11 registers + 3D + Audio), d_web_*, d_sys_*, d_gpusys_*"]
+    subgraph L3["Tier 3: Go Verification Engine & Identity-Safe Risk Graph (prismid-go v0.5.0)"]
+        AntiForgery["5-Layer Verification & Raw-Measurement Inference Engine<br/>① Atomic single-use nonce consumption & TTL bounds<br/>② GLSL +0.5 pixel-center math verification (absDiff <= 2)<br/>③ ECDSA P-256 + TOFU binding + Raw Canvas/Audio/Worker inference<br/>④ Virtual GPU / Software Renderer Demotion (Confidence = 0.30)<br/>⑤ /24 Subnet Hardware Diversity Telemetry (SubnetCrowdTriggered)"]
+        Slices["Hard Identity Slices vs. Soft Environment Slices<br/>• Hard Per-Device Slices: d_key_* (ECDSA P-256), d_nat_* (Desktop), d_kch_* (Keychain/Registry), d_bcn_* (5-Silo Beacon)<br/>• Soft Model/Env Slices: d_gpu_* (11 registers + 3D + Audio), d_web_*, d_sys_*, d_gpusys_*"]
         AntiForgery --> Slices
     end
 
@@ -48,6 +48,10 @@ When a client report passes decryption and verification, `prismid-go` derives **
 
 ### 3.1 Per-Device Hard Identity Slices (Always Link Unconditionally when `Confidence >= 0.60`)
 
+0. **`DeviceKeySliceID` (`d_key_*`) — Non-Extractable WebCrypto ECDSA P-256 Key + TOFU Binding**:
+   $$\text{d\_key\_*} = \texttt{"d\_key\_"} \parallel \text{Hex}_{32}\big(\text{HMAC}(K, \texttt{"key|"} \parallel \text{pub\_key\_sec1\_hex})\big)$$
+   *Generated with `extractable: false` on the private key and persisted in `IndexedDB`. Verified against the challenge transcript `prismid-v2-sig|<nonce>|<beacon_id>|<static_webgl_fp_hash>|<audio_compressor_hash>` and bound via Trust-On-First-Use (TOFU) to `d_bcn_*`.*
+
 1. **`ExactSliceID` in Desktop Mode (`d_nat_*`) & `KeychainSliceID` (`d_kch_*`)**:
    $$\text{d\_nat\_*} = \texttt{"d\_nat\_"} \parallel \text{Hex}_{32}\big(\text{HMAC}(K, \text{platform} \mid \text{hw\_uuid} \mid \text{serial} \mid \text{keychain\_anchor})\big)$$
    $$\text{d\_kch\_*} = \texttt{"d\_kch\_"} \parallel \text{Hex}_{32}\big(\text{HMAC}(K, \texttt{"kch|"} \parallel \text{keychain\_anchor})\big)$$
@@ -56,21 +60,21 @@ When a client report passes decryption and verification, `prismid-go` derives **
 2. **`BeaconSliceID` (`d_bcn_*`) — 128-Bit 5-Silo Self-Healing Beacon (Decoupled from GPU Drift)**:
    $$\text{d\_bcn\_*} = \texttt{"d\_bcn\_"} \parallel \text{Hex}_{32}\big(\text{HMAC}(K, \texttt{"bcn|"} \parallel \text{beacon\_id})\big)$$
    > [!IMPORTANT]
-   > In `v0.4.0`, `d_bcn_*` is derived **exclusively** from the 128-bit cryptographic `beacon_id` without mixing in `d_gpu_*`. Consequently, browser upgrades (e.g., Chrome 130 $\to$ 131 altering ANGLE shader hashes, WebGL extension lists, or `OfflineAudioContext` output) **never** cause `d_bcn_*` drift.
+   > In `v0.5.0`, `d_bcn_*` is persisted across 5 browser storage silos (`localStorage`, `sessionStorage`, `IndexedDB`, `CacheStorage`, and `document.cookie`) and derived **exclusively** from the 128-bit cryptographic `beacon_id` without mixing in `d_gpu_*`. Consequently, browser upgrades (e.g., Chrome 130 $\to$ 131 altering ANGLE shader hashes, WebGL extension lists, or `OfflineAudioContext` output) **never** cause `d_bcn_*` drift.
 
-### 3.2 Shared-Model & Environment Soft Slices (Conditional Promotion Only)
+### 3.2 Shared-Model & Environment Soft Slices (Conditional Promotion & Velocity Scoring)
 
 1. **`GpuAudioSliceID` (`d_gpu_*`) — Canonical Hardware Model Cohort**:
    $$\text{d\_gpu\_*} = \texttt{"d\_gpu\_"} \parallel \text{Hex}_{32}\big(\text{HMAC}(K, \text{effective\_static\_webgl\_fp\_hash} \mid \text{canonical\_11\_webgl\_limits} \mid \text{audio\_compressor\_hash})\big)$$
    - **100% Decoupled from IP & Self-Reported `gpu_renderer` Text**.
    - **Canonical 11 Hardware Registers**: Strips the volatile WebGL extension list hash (`webgl_extensions_hash`) so browser updates adding new WebGL extensions do not alter `d_gpu_*`.
-   - **Model-Collision Safety**: Because all laptops of the exact same hardware model (e.g., stock MacBook Pro M3) share `d_gpu_*`, `RiskGraph` **never** merges two accounts with distinct, un-spoofed `d_bcn_*` or `d_nat_*` anchors based on `d_gpu_*` alone. `d_gpu_*` promotes to an active graph link **only** when `SpoofTrapTriggered == true` (e.g., Canvas/Audio noise injection, Worker lie, ES6 Proxy hook) or when beacons are absent within the 25-minute burst window.
+   - **Model-Collision Safety**: Because all laptops of the exact same hardware model (e.g., stock MacBook Pro M3) share `d_gpu_*`, `RiskGraph` **never** merges accounts with distinct, un-spoofed `d_bcn_*` or `d_nat_*` anchors based on `d_gpu_*` alone. `d_gpu_*` promotes to an active identity link **only** when `SpoofTrapTriggered == true` (e.g., Canvas/Audio noise injection, Worker lie, ES6 Proxy hook, or TOFU device-key mismatch) or when beacons are absent within the 25-minute burst window.
 
 2. **`ExactSliceID` in Browser Web Mode (`d_web_*`) & `SysNetSliceID` (`d_sys_*`)**:
    $$\text{d\_web\_*} = \texttt{"d\_web\_"} \parallel \text{Hex}_{32}\big(\text{HMAC}(K, \text{static\_webgl\_fp} \mid \text{canonical\_11\_limits} \mid \text{audio} \mid \text{canvas2d} \mid \text{fonts} \mid \text{screen} \mid \text{tz})\big)$$
    $$\text{d\_sys\_*} = \texttt{"d\_sys\_"} \parallel \text{Hex}_{32}\big(\text{HMAC}(K, \text{os\_family} \mid \text{cpu\_cores} \mid \text{timezone} \mid \text{ip\_subnet})\big)$$
    - `d_sys_*` excludes `navigator.deviceMemory` and `screen.width/height` for cross-engine (`Blink` vs. `WKWebView`) and dual-monitor consistency.
-   - When clean beacons differ (`d_bcn_A != d_bcn_B` and `SpoofTrapTriggered == false`), `d_gpusys_*` (same `/24` + same GPU/OS) and `d_web_*` never merge a pair of users ($\text{count} < 3$), guaranteeing 0% false merges between office colleagues or simultaneous cross-city users, while catching $\ge 3$-account Incognito farming batches within the burst window.
+   - **Zero Colleague False Merges (`R2` & `DeepSeek #3`)**: When clean beacons differ (`d_bcn_A != d_bcn_B` and `SpoofTrapTriggered == false`), `d_gpusys_*` (same `/24` + same GPU/OS) and `d_web_*` **never** merge accounts into `ComponentSubjects` and **never** mark them `red` (even if 3, 5, or 100 office colleagues register 1 minute apart). Instead, when $\ge 3$ distinct clean-beacon accounts arrive within the velocity window, `ComponentSnapshot` sets `BurstSuspicion = true`, `RiskPending = true`, and elevates `green` $\to$ `yellow` for step-up verification.
 
 ---
 
@@ -78,15 +82,15 @@ When a client report passes decryption and verification, `prismid-go` derives **
 
 | Layer | Mechanism | What It Detects | Server Action |
 |---|---|---|---|
-| **Layer 1: Dynamic Shader Challenge-Response** | Server issues 60s single-use `nonce` + `render_seed` `[s0, s1, s2, s3]` in `[1.25, 6.75]`. Client renders `256x256` WebGL shader and returns 8 sampled RGBA pixels inside AES-256-GCM ciphertext. | Packet replay (`GETDEL`), random byte scripts, broken/stubbed WebGL contexts. | Rejects with `PRISMID_CHALLENGE_INVALID` or `PRISMID_SHADER_PIXEL_MISMATCH`. |
-| **Layer 2: Cross-Thread Worker + In-Scene Noise & Proxy Traps** | Inline `Blob` Web Worker + `OffscreenCanvas`, ECMAScript `§10.1.2.1` cyclic `__proto__` Proxy check, in-scene Canvas transparent/solid patch checks, and `copyFromChannel` vs `getChannelData` audio check. | Anti-detect browsers & stealth extensions injecting Canvas/Audio noise or hooking main-thread getters. | Sets `SpoofTrapTriggered = true`, substitutes Worker's unhooked GPU hash into `d_gpu_*`, and promotes `d_gpu_*` in `RiskGraph`. |
+| **Layer 1: Dynamic Shader Challenge-Response** | Server issues 60s single-use `nonce` + `render_seed` `[s0, s1, s2, s3]` in `[1.25, 6.75]`. Client renders `256x256` WebGL shader and returns 8 sampled RGBA pixels inside AES-256-GCM ciphertext. | Packet replay (`GETDEL`), random byte scripts, broken/stubbed WebGL contexts. | Rejects with `CHALLENGE_NONCE_INVALID_OR_REPLAYED` or `SHADER_SPOT_PIXEL_MATH_MISMATCH`. |
+| **Layer 2: Server-Side Raw Measurement Inference + Cross-Thread Worker** | Server independently inspects raw `canvas_control_rgba`, `canvas_readback_delta`, `audio_copy_hash`, `audio_silent_delta`, and raw `worker_*` telemetry alongside ECMAScript `§10.1.2.1` cyclic `__proto__` Proxy checks and ECDSA P-256 TOFU key binding. | Silent attackers setting `lies.* = false` while injecting Canvas/Audio noise, stripping Worker telemetry, or replaying stolen beacons without the private key. | Sets `SpoofTrapTriggered = true`, substitutes Worker's unhooked GPU hash into `d_gpu_*`, and promotes `d_gpu_*` in `RiskGraph`. |
 | **Layer 3: GPU Register Laws & Per-Anchor UUID Split Trap** | Validates OS/GPU register pairing laws and tracks distinct `d_nat_*` UUIDs observed under the same per-device `d_kch_*` or `d_bcn_*` anchor. | Impossible OS/GPU combinations & kernel/API hooks randomizing `HWUUID` on an existing installation. | Flags `gpu_register_law_violation` or `native_uuid_split_trap` (`SpoofTrapTriggered = true`). Two distinct physical MacBooks with distinct `d_kch_*`/`d_bcn_*` never trigger this trap. |
 | **Layer 4: Virtual GPU & Software Renderer Veto** | Detects `SwiftShader`, `llvmpipe`, `Mesa OffScreen`, `VMware`, `VirtualBox`, `Parallels`, `QEMU`, or native Hypervisor bit (`kern.hv_vmm_present`). | Headless Docker browser farms & VM clones. | Assigns rule-tier weight `Confidence = 0.30` (below `0.60` threshold), keeping `RiskPending = true` (`RiskStatusUnknown`). |
 | **Layer 5: Privacy-Safe Telemetry (`storage_healed` & `SubnetCrowdTriggered`)** | Records partial storage recovery (`storage_healed`) and `/24` subnet GPU diversity (`> MaxDistinctGPUsPerSubnet`) in `PrivacySignals` / `SubnetCrowdTriggered`. | Provides risk telemetry for downstream rules without merging CGNAT `/24` users or marking single Cookie-clearing users `red`. | Populates `PrivacySignals`, `SubnetCrowdTriggered`, and `CrowdSliceID` (excluded from `SliceNodes()`). |
 
 ---
 
-## 5. Native Hardware Anchor Architecture (`crates/prismid-native` v0.4.0)
+## 5. Native Hardware Anchor Architecture (`crates/prismid-native` v0.5.0)
 
 - **macOS (`src/macos.rs`)**:
   - Reads `IOPlatformUUID` and `IOPlatformSerialNumber` via `ioreg -rd1 -c IOPlatformExpertDevice` (~12ms, cached in `std::sync::OnceLock`), `sysctl` CPU/VM flags, and persists a 32-byte hex anchor in macOS Login Keychain (`security find-generic-password` / `add-generic-password`) with file fallback.

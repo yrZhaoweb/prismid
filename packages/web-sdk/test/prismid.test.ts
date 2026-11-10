@@ -166,6 +166,40 @@ describe('PrismID Web SDK (prismid-js) Unit & Cross-Language Suite', () => {
     } finally {
       g.indexedDB = origIDB
     }
+
+    // R5: Stalled HTTP response body (headers returned immediately, JSON stream never closes)
+    // must time out within requestTimeoutMs and release inFlightPromise!
+    const mockFetchStalledBody: typeof fetch = async (input) => {
+      const url = String(input)
+      if (url.endsWith('/challenge')) {
+        return new Response(
+          JSON.stringify({
+            nonce: 'c1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90',
+            render_seed: [2.1, 3.2, 4.3, 5.4],
+            sample_points: DEFAULT_SAMPLE_POINTS,
+            expires_at: Math.floor(Date.now() / 1000) + 60,
+          }),
+          { status: 200 }
+        )
+      }
+      const stalledStream = new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode('{"accepted":'))
+          // Intentionally never call controller.close()
+        },
+      })
+      return new Response(stalledStream, { status: 200, headers: { 'Content-Type': 'application/json' } })
+    }
+    const clientStalled = createPrismClient({
+      baseUrl: 'http://127.0.0.1:19999',
+      fetchImpl: mockFetchStalledBody,
+      requestTimeoutMs: 50,
+    })
+    const tStall = Date.now()
+    const resStalled = await clientStalled.identify({ force: true })
+    const stallElapsed = Date.now() - tStall
+    expect(resStalled).toBeNull()
+    expect(stallElapsed).toBeLessThan(1500)
   })
 
   describe('6. Live Cross-Language E2E Integration (prismid-js -> prismid-go standalone server)', () => {
@@ -212,6 +246,8 @@ describe('PrismID Web SDK (prismid-js) Unit & Cross-Language Suite', () => {
       const webRes = await webClient.identify({ force: true })
       expect(webRes).not.toBeNull()
       expect(webRes?.accepted).toBe(true)
+      expect(webRes?.device_key_attested).toBe(true)
+      expect(webRes?.device_key_slice_id).toMatch(/^d_key_[0-9a-f]{32}$/)
       expect(webRes?.exact_slice_id).toMatch(/^d_web_[0-9a-f]{32}$/)
       expect(webRes?.beacon_slice_id).toMatch(/^d_bcn_[0-9a-f]{32}$/)
       expect(webRes?.gpu_audio_slice_id).toMatch(/^d_gpu_[0-9a-f]{32}$/)

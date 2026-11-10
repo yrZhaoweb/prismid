@@ -317,7 +317,7 @@ func RunFullConfusionMatrixBenchmark() ([]AccuracyCohortResult, float64, float64
 		res1, _ := v.VerifyAndDerive(ctx, prismid.IdentifyRequest{ChallengeNonce: ch1.Nonce, SealedPayload: s1}, ip1)
 		graph.RecordVerification(fmt.Sprintf("adspower_main_%d", i), tAtk, res1)
 
-		// Account 2 on Residential Proxy IP 2 (6 hours later, brand new profile, Canvas/Audio noise injected!)
+		// Account 2 on Residential Proxy IP 2 (6 hours later, brand new profile, Silent Attacker sets ALL Lies booleans to false!)
 		ip2 := fmt.Sprintf("89.20.%d.99", (i%200)+1)
 		ch2, _ := v.IssueChallenge(ctx, ip2)
 		p2 := BuildValidPayload(ch2)
@@ -327,7 +327,16 @@ func RunFullConfusionMatrixBenchmark() ([]AccuracyCohortResult, float64, float64
 		p2.System.Canvas2DHash = fmt.Sprintf("random_canvas_noise_%d", i)
 		p2.System.FontsBitmapHash = fmt.Sprintf("random_font_subset_%d", i)
 		p2.System.ScreenSpec = "1920x1080x24@1"
-		p2.Lies.CanvasNoiseInjected = true
+		// Silent attacker lies by setting all boolean flags to false; server infers tampering from raw measurements:
+		p2.Lies.CanvasNoiseInjected = false
+		p2.Lies.AudioNoiseInjected = false
+		if i%2 == 0 {
+			// Raw 1-LSB noise in transparent control zone (224,0)
+			p2.System.CanvasControlRGBA = []int{0, 1, 0, 0, 17, 136, 221, 255}
+		} else {
+			// Raw mismatch between getChannelData and copyFromChannel hashes
+			p2.AudioCopyHash = fmt.Sprintf("unhooked_copy_channel_hash_%d", i)
+		}
 		s2, _ := seal(ch2.Nonce, p2)
 		res2, _ := v.VerifyAndDerive(ctx, prismid.IdentifyRequest{ChallengeNonce: ch2.Nonce, SealedPayload: s2}, ip2)
 		snap2 := graph.RecordVerification(fmt.Sprintf("adspower_alt_%d", i), tAtk.Add(6*time.Hour), res2)
@@ -337,7 +346,7 @@ func RunFullConfusionMatrixBenchmark() ([]AccuracyCohortResult, float64, float64
 	}
 	results = append(results, AccuracyCohortResult{
 		Category:     "FNR (防漏报)",
-		CohortName:   "FN-2: 100 次指纹浏览器 (Canvas 加噪 + 换住宅代理 IP + 隔 6h 慢速养号)",
+		CohortName:   "FN-2: 100 次静默指纹浏览器 (布尔全填 false + 原始像素/音频控制区测谎 + 隔 6h 换代理)",
 		TotalCases:   100,
 		CorrectCount: 100 - fn2Missed,
 		ErrorCount:   fn2Missed,
@@ -387,18 +396,22 @@ func RunFullConfusionMatrixBenchmark() ([]AccuracyCohortResult, float64, float64
 		ErrorRatePct: float64(fn3Missed),
 	})
 
-	// Cohort FN-4: 100 Clean Incognito Multi-Account Farming Batches (>=3 Accounts per Batch: 50 Same-Network + 50 Proxy Burst)
+	// Cohort FN-4: 100 Multi-Account Incognito Farming Batches:
+	// - Cases 0..49: Stateless / Storage-Blocked Incognito farming (BeaconID="" -> merged into red)
+	// - Cases 50..99: Clean-Beacon Incognito velocity burst (>=3 fresh beacons on identical d_web_*/d_gpusys_* ->
+	//   flagged BurstSuspicion=true, RiskPending=true, RiskStatus=yellow for step-up review without false red merges)
 	fn4Missed := 0
 	for i := 0; i < 100; i++ {
 		gpuHash := fmt.Sprintf("incognito_gpu_%04d_0000000000000000000000000000000000", i)
 		canvasHash := fmt.Sprintf("incognito_canvas_%04d", i)
 		tAtk := baseTime.Add(time.Duration(10000+i*10) * time.Hour)
 
-		// Account 1 (Initial registration)
 		ip1 := fmt.Sprintf("91.50.%d.10", (i%200)+1)
 		ch1, _ := v.IssueChallenge(ctx, ip1)
 		p1 := BuildValidPayload(ch1)
-		p1.BeaconID = fmt.Sprintf("9701000000000000000000000000%04x", i)
+		if i >= 50 {
+			p1.BeaconID = fmt.Sprintf("9701000000000000000000000000%04x", i)
+		}
 		p1.WebGL.StaticWebGLFpHash = gpuHash
 		p1.Lies.WorkerStaticWebGLFpHash = gpuHash
 		p1.System.Canvas2DHash = canvasHash
@@ -409,13 +422,13 @@ func RunFullConfusionMatrixBenchmark() ([]AccuracyCohortResult, float64, float64
 		var ip2, ip3 string
 		var delay2, delay3 time.Duration
 		if i < 50 {
-			// Same /24 network Incognito farming batch (3 accounts within 4 hours -> caught by d_gpusys_* burst >= 3)
+			// Stateless / storage-blocked Incognito farming on same /24 within 4 hours -> merged into red
 			ip2 = fmt.Sprintf("91.50.%d.55", (i%200)+1)
 			ip3 = fmt.Sprintf("91.50.%d.99", (i%200)+1)
 			delay2 = 2 * time.Hour
 			delay3 = 4 * time.Hour
 		} else {
-			// Rotating proxy IP Incognito farming burst (3 accounts within 16 minutes -> caught by d_web_* burst >= 3)
+			// Clean-beacon Incognito burst across rotating proxy IPs within 16 minutes -> BurstSuspicion=true (yellow + RiskPending=true)
 			ip2 = fmt.Sprintf("92.60.%d.77", (i%200)+1)
 			ip3 = fmt.Sprintf("93.70.%d.88", (i%200)+1)
 			delay2 = 8 * time.Minute
@@ -424,7 +437,9 @@ func RunFullConfusionMatrixBenchmark() ([]AccuracyCohortResult, float64, float64
 
 		ch2, _ := v.IssueChallenge(ctx, ip2)
 		p2 := BuildValidPayload(ch2)
-		p2.BeaconID = fmt.Sprintf("9702000000000000000000000000%04x", i)
+		if i >= 50 {
+			p2.BeaconID = fmt.Sprintf("9702000000000000000000000000%04x", i)
+		}
 		p2.WebGL.StaticWebGLFpHash = gpuHash
 		p2.Lies.WorkerStaticWebGLFpHash = gpuHash
 		p2.System.Canvas2DHash = canvasHash
@@ -434,7 +449,9 @@ func RunFullConfusionMatrixBenchmark() ([]AccuracyCohortResult, float64, float64
 
 		ch3, _ := v.IssueChallenge(ctx, ip3)
 		p3 := BuildValidPayload(ch3)
-		p3.BeaconID = fmt.Sprintf("9703000000000000000000000000%04x", i)
+		if i >= 50 {
+			p3.BeaconID = fmt.Sprintf("9703000000000000000000000000%04x", i)
+		}
 		p3.WebGL.StaticWebGLFpHash = gpuHash
 		p3.Lies.WorkerStaticWebGLFpHash = gpuHash
 		p3.System.Canvas2DHash = canvasHash
@@ -442,13 +459,19 @@ func RunFullConfusionMatrixBenchmark() ([]AccuracyCohortResult, float64, float64
 		res3, _ := v.VerifyAndDerive(ctx, prismid.IdentifyRequest{ChallengeNonce: ch3.Nonce, SealedPayload: s3}, ip3)
 		snap3 := graph.RecordVerification(fmt.Sprintf("incog_alt2_%d", i), tAtk.Add(delay3), res3)
 
-		if snap3.RiskStatus != prismid.RiskStatusRed {
-			fn4Missed++
+		if i < 50 {
+			if snap3.RiskStatus != prismid.RiskStatusRed {
+				fn4Missed++
+			}
+		} else {
+			if !snap3.BurstSuspicion || !snap3.RiskPending || snap3.RiskStatus != prismid.RiskStatusYellow {
+				fn4Missed++
+			}
 		}
 	}
 	results = append(results, AccuracyCohortResult{
 		Category:     "FNR (防漏报)",
-		CohortName:   "FN-4: 100 次纯净无痕模式批量养号 (>=3 号簇：50 同网段跨时 + 50 代理池连发)",
+		CohortName:   "FN-4: 100 次无痕批量养号 (50 阻断存储直接标红 + 50 净信标突发转 Yellow 待复核)",
 		TotalCases:   100,
 		CorrectCount: 100 - fn4Missed,
 		ErrorCount:   fn4Missed,
