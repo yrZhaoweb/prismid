@@ -103,15 +103,22 @@ func VerifyGPURegisterLaws(payload *ProbePayload) []string {
 		strings.Contains(rendererLower, "apple m2") ||
 		strings.Contains(rendererLower, "apple m3") ||
 		strings.Contains(rendererLower, "apple m4") ||
+		strings.Contains(rendererLower, "apple m5") ||
+		strings.Contains(rendererLower, "angle metal renderer: apple") ||
 		strings.Contains(rendererLower, "apple gpu")
 
-	// Law 1: Apple Silicon GPUs only exist on Apple operating systems, always enforce
-	// ALIASED_LINE_WIDTH_RANGE == [1,1] in Metal/WebGL, and support MAX_TEXTURE_SIZE >= 16384.
-	if isAppleSiliconGPU {
+	isAppleOnlyDriver := isAppleSiliconGPU ||
+		strings.Contains(rendererLower, "angle metal renderer") ||
+		strings.Contains(rendererLower, "opengl engine")
+
+	// Law 1: Apple Silicon GPUs & macOS Metal/CGL OpenGL Engine drivers only exist on Apple operating systems.
+	if isAppleOnlyDriver {
 		if strings.Contains(platformLower, "win") || strings.Contains(platformLower, "linux") ||
-			strings.Contains(uaLower, "windows nt") {
+			strings.Contains(uaLower, "windows nt") || strings.Contains(uaLower, "x11; linux") || strings.Contains(uaLower, "android") {
 			violations = append(violations, "gpu_register_law_violation:apple_gpu_on_non_apple_os")
 		}
+	}
+	if isAppleSiliconGPU {
 		if lineWidthRange != "1,1" {
 			violations = append(violations, "gpu_register_law_violation:apple_gpu_invalid_line_width")
 		}
@@ -123,10 +130,12 @@ func VerifyGPURegisterLaws(payload *ProbePayload) []string {
 		}
 	}
 
-	// Law 2: ANGLE Direct3D11 / Direct3D9 backends only exist on Windows, never on macOS or Linux.
+	// Law 2: ANGLE Direct3D11 / Direct3D9 backends only exist on Windows, never on macOS, iOS, Linux, or Android.
 	if strings.Contains(rendererLower, "direct3d") || strings.Contains(rendererLower, "d3d11") || strings.Contains(rendererLower, "d3d9") {
 		if strings.Contains(platformLower, "mac") || strings.Contains(platformLower, "iphone") || strings.Contains(platformLower, "ipad") {
 			violations = append(violations, "gpu_register_law_violation:d3d_backend_on_apple_platform")
+		} else if strings.Contains(platformLower, "linux") || strings.Contains(uaLower, "x11; linux") || strings.Contains(uaLower, "android") {
+			violations = append(violations, "gpu_register_law_violation:d3d_backend_on_non_windows_platform")
 		}
 		// ANGLE Direct3D11 always reports ALIASED_LINE_WIDTH_RANGE as [1,1].
 		if lineWidthRange != "1,1" {
@@ -162,21 +171,36 @@ func VerifyGPURegisterLaws(payload *ProbePayload) []string {
 		if mathSig == "v8" && strings.Contains(uaLower, "firefox/") {
 			violations = append(violations, "math_engine_ua_mismatch:v8_claiming_firefox")
 		}
+		if mathSig == "v8" &&
+			strings.Contains(uaLower, "safari/") &&
+			strings.Contains(uaLower, "version/") &&
+			!strings.Contains(uaLower, "chrome/") &&
+			!strings.Contains(uaLower, "crios/") &&
+			!strings.Contains(uaLower, "chromium/") &&
+			!strings.Contains(uaLower, "edg/") &&
+			!strings.Contains(uaLower, "opr/") &&
+			!strings.Contains(uaLower, "android") {
+			violations = append(violations, "math_engine_ua_mismatch:v8_claiming_safari")
+		}
 	}
 
 	// Law 6: System.Platform vs System.UserAgent OS family cross-consistency.
 	if platformLower != "" && uaLower != "" {
 		isWinPlat := strings.Contains(platformLower, "win")
 		isMacPlat := strings.Contains(platformLower, "mac")
+		isIOSPlat := strings.Contains(platformLower, "iphone") || strings.Contains(platformLower, "ipad")
 		isLinuxPlat := strings.Contains(platformLower, "linux") && !strings.Contains(platformLower, "android")
 
 		claimsWinUA := strings.Contains(uaLower, "windows nt")
-		claimsMacUA := strings.Contains(uaLower, "macintosh") || strings.Contains(uaLower, "mac os x")
+		claimsIOSUA := strings.Contains(uaLower, "iphone") || strings.Contains(uaLower, "ipad")
+		claimsMacUA := (strings.Contains(uaLower, "macintosh") || strings.Contains(uaLower, "mac os x")) && !claimsIOSUA
 		claimsLinuxDesktopUA := strings.Contains(uaLower, "x11; linux") || strings.Contains(uaLower, "x11; ubuntu")
+		claimsAndroidUA := strings.Contains(uaLower, "android")
 
-		if (isWinPlat && (claimsMacUA || claimsLinuxDesktopUA)) ||
-			(isMacPlat && (claimsWinUA || claimsLinuxDesktopUA)) ||
-			(isLinuxPlat && (claimsWinUA || claimsMacUA)) {
+		if (isWinPlat && (claimsMacUA || claimsIOSUA || claimsLinuxDesktopUA || claimsAndroidUA)) ||
+			(isMacPlat && (claimsWinUA || claimsLinuxDesktopUA || claimsAndroidUA)) ||
+			(isIOSPlat && (claimsWinUA || claimsLinuxDesktopUA || claimsAndroidUA)) ||
+			(isLinuxPlat && (claimsWinUA || claimsMacUA || claimsIOSUA)) {
 			violations = append(violations, "gpu_register_law_violation:platform_ua_os_mismatch")
 		}
 	}

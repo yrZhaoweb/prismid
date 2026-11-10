@@ -80,13 +80,32 @@ export function collectLieDetectorProbe(): LieDetectorResult {
       ) {
         prototypeLies.push(`${label}:unexpected_name_${fn.name || 'empty'}`)
       }
+      // Native function .toString reference identity invariant:
+      // Apify fingerprint-injector's redirectToString attaches a `get(target, 'toString')` trap
+      // that returns a freshly allocated `new Proxy(target.toString, ...)` on each access.
+      if (fn.toString !== fnToString || fn.toString !== fn.toString) {
+        prototypeLies.push(`${label}:toString_proxy_getter`)
+      }
+      // Non-cyclic prototype identity invariant:
+      // Setting a native function's prototype to its own current prototype (`origProto`) MUST
+      // succeed (`Reflect.setPrototypeOf(fn, origProto) === true`) and NEVER throw.
+      // Apify fingerprint-injector's `redirectToString` unconditionally throws `Cyclic __proto__ value`
+      // or returns `false` inside its `setPrototypeOf` trap even for non-cyclic `origProto`!
+      const origProto = Object.getPrototypeOf(fn)
+      try {
+        if (Reflect.setPrototypeOf(fn, origProto) !== true) {
+          prototypeLies.push(`${label}:non_cyclic_setPrototypeOf_rejected`)
+        }
+        Object.setPrototypeOf(fn, origProto)
+      } catch {
+        prototypeLies.push(`${label}:fake_cyclic_proto_trap`)
+      }
       // ECMAScript §10.1.2.1 OrdinarySetPrototypeOf cyclic __proto__ invariant:
       // Calling `Object.setPrototypeOf(fn, Object.create(fn))` on any genuine function MUST
       // throw `TypeError: Cyclic __proto__ value` because `SameValue(p, O)` matches `fn`.
       // On an ES6 `new Proxy(target, handler)`, `[[SetPrototypeOf]]` forwards to `target` while
       // `Object.create(proxy)` links to `proxy` (`SameValue(proxy, target) === false`), so it
       // succeeds without throwing (or triggers a custom `setPrototypeOf` trap)!
-      const origProto = Object.getPrototypeOf(fn)
       try {
         Object.setPrototypeOf(fn, Object.create(fn))
         prototypeLies.push(`${label}:es6_proxy_detected`)
@@ -137,6 +156,38 @@ export function collectLieDetectorProbe(): LieDetectorResult {
         'readPixels'
       )
     }
+    if (typeof WebGL2RenderingContext !== 'undefined') {
+      checkNativeFunction(
+        WebGL2RenderingContext.prototype.getParameter,
+        'WebGL2RenderingContext.getParameter',
+        'getParameter'
+      )
+    }
+    if (typeof HTMLMediaElement !== 'undefined') {
+      checkNativeFunction(
+        HTMLMediaElement.prototype.canPlayType,
+        'HTMLMediaElement.canPlayType',
+        'canPlayType'
+      )
+    }
+    if (typeof Document !== 'undefined' && typeof document !== 'undefined') {
+      checkNativeFunction(
+        Document.prototype.createElement,
+        'Document.createElement',
+        'createElement'
+      )
+      if (Object.prototype.hasOwnProperty.call(document, 'createElement')) {
+        prototypeLies.push('document.createElement:instance_property_override')
+      }
+    }
+    if (typeof window !== 'undefined') {
+      for (const dimProp of ['outerWidth', 'outerHeight', 'innerWidth', 'innerHeight'] as const) {
+        const wDesc = Object.getOwnPropertyDescriptor(window, dimProp)
+        if (wDesc && ('value' in wDesc || typeof wDesc.get !== 'function')) {
+          prototypeLies.push(`window.${dimProp}:replaceable_data_override`)
+        }
+      }
+    }
     if (typeof OfflineAudioContext !== 'undefined') {
       checkNativeFunction(
         OfflineAudioContext.prototype.startRendering,
@@ -175,11 +226,32 @@ export function collectLieDetectorProbe(): LieDetectorResult {
       ] as const
       for (const prop of navProps) {
         const desc = Object.getOwnPropertyDescriptor(Navigator.prototype, prop)
-        if (desc) {
-          if ('value' in desc || typeof desc.get !== 'function') {
-            prototypeLies.push(`Navigator.${prop}:data_descriptor_override`)
-          } else {
-            checkNativeFunction(desc.get, `Navigator.${prop}.get`, `get ${prop}`)
+        if (!desc) {
+          // Standard cross-browser WebIDL Navigator properties (excluding Chromium-only deviceMemory)
+          // exist on Navigator.prototype unless deleted (e.g. stealth `delete Navigator.prototype.webdriver`).
+          if (prop !== 'deviceMemory') {
+            prototypeLies.push(`Navigator.${prop}:descriptor_deleted`)
+          }
+        } else if ('value' in desc || typeof desc.get !== 'function') {
+          prototypeLies.push(`Navigator.${prop}:data_descriptor_override`)
+        } else {
+          checkNativeFunction(desc.get, `Navigator.${prop}.get`, `get ${prop}`)
+          // Getter Arity Probe (catches Apify fingerprint-injector `getterValue` proxy which returns
+          // spoofed value only when `args.length === 0` and falls back to native when `args.length > 0`).
+          if (
+            typeof navigator !== 'undefined' &&
+            prop !== 'plugins' &&
+            prop !== 'mimeTypes'
+          ) {
+            try {
+              const v0 = desc.get.call(navigator)
+              const v1 = (desc.get as unknown as (arg: number) => unknown).call(navigator, 1)
+              if (JSON.stringify(v0) !== JSON.stringify(v1)) {
+                prototypeLies.push(`Navigator.${prop}:getter_arity_lie`)
+              }
+            } catch {
+              // ignore
+            }
           }
         }
         if (typeof navigator !== 'undefined' && Object.prototype.hasOwnProperty.call(navigator, prop)) {
@@ -191,12 +263,12 @@ export function collectLieDetectorProbe(): LieDetectorResult {
       const scrProps = ['width', 'height', 'availWidth', 'availHeight', 'colorDepth', 'pixelDepth'] as const
       for (const prop of scrProps) {
         const desc = Object.getOwnPropertyDescriptor(Screen.prototype, prop)
-        if (desc) {
-          if ('value' in desc || typeof desc.get !== 'function') {
-            prototypeLies.push(`Screen.${prop}:data_descriptor_override`)
-          } else {
-            checkNativeFunction(desc.get, `Screen.${prop}.get`, `get ${prop}`)
-          }
+        if (!desc) {
+          prototypeLies.push(`Screen.${prop}:descriptor_deleted`)
+        } else if ('value' in desc || typeof desc.get !== 'function') {
+          prototypeLies.push(`Screen.${prop}:data_descriptor_override`)
+        } else {
+          checkNativeFunction(desc.get, `Screen.${prop}.get`, `get ${prop}`)
         }
         if (Object.prototype.hasOwnProperty.call(screen, prop)) {
           prototypeLies.push(`screen.${prop}:instance_property_override`)

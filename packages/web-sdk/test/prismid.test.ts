@@ -1,11 +1,15 @@
 import { spawn, type ChildProcess } from 'node:child_process'
 import crypto from 'node:crypto'
 import fs from 'node:fs'
+import { createRequire } from 'node:module'
 import net from 'node:net'
+import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { chromium } from 'playwright-core'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+
+const cjsRequire = createRequire(import.meta.url)
 import {
   collectAndHealStorageBeacon,
   collectAudioProbe,
@@ -677,6 +681,436 @@ describe('PrismID Web SDK (prismid-js) Unit & Cross-Language Suite', () => {
         }
       },
       35000
+    )
+
+    it.skipIf(!fs.existsSync(CHROME_MAC_PATH))(
+      'executes third-party Apify Bayesian dataset (500 real-world profiles) + FingerprintInjector + 14 Puppeteer-Stealth evasions in real Chrome',
+      async () => {
+        const { FingerprintGenerator } = cjsRequire('fingerprint-generator')
+        const { FingerprintInjector } = cjsRequire('fingerprint-injector')
+        const fg = new FingerprintGenerator()
+        const injector = new FingerprintInjector()
+
+        // =========================================================================
+        // PART 1: 500 REAL-WORLD BAYESIAN PROFILES FROM APIFY FINGERPRINT-GENERATOR
+        // =========================================================================
+        let genuineCount = 0
+        let genuineFalseRed = 0
+        let datasetBotAnomalyCount = 0
+        let datasetBotAnomalyCaught = 0
+
+        const cohortSpecs = [
+          { devices: ['desktop'], operatingSystems: ['windows'], count: 150 },
+          { devices: ['desktop'], operatingSystems: ['macos'], count: 150 },
+          { devices: ['desktop'], operatingSystems: ['linux'], count: 80 },
+          { devices: ['mobile'], operatingSystems: ['android'], count: 60 },
+          { devices: ['mobile'], operatingSystems: ['ios'], count: 60 },
+        ]
+
+        let idx = 0
+        for (const spec of cohortSpecs) {
+          for (let i = 0; i < spec.count; i++) {
+            idx++
+            const { fingerprint } = fg.getFingerprint({
+              devices: spec.devices,
+              operatingSystems: spec.operatingSystems,
+            })
+            const nav = fingerprint.navigator
+            const gpu = fingerprint.videoCard
+            const scr = fingerprint.screen
+
+            const ua = String(nav.userAgent || '')
+            const plat = String(nav.platform || '')
+            const renderer = String(gpu.renderer || '')
+            const vendor = String(gpu.vendor || '')
+            const uaLow = ua.toLowerCase()
+            const platLow = plat.toLowerCase()
+            const rendLow = renderer.toLowerCase()
+
+            // Derive correct JS engine signature for the real browser family
+            let mathSig: 'v8' | 'jsc' | 'spidermonkey' = 'v8'
+            if (uaLow.includes('firefox/') || uaLow.includes('fxios/')) {
+              mathSig = 'spidermonkey'
+            } else if (
+              platLow.includes('iphone') ||
+              platLow.includes('ipad') ||
+              (uaLow.includes('safari/') &&
+                !uaLow.includes('chrome/') &&
+                !uaLow.includes('chromium/') &&
+                !uaLow.includes('edg/'))
+            ) {
+              mathSig = 'jsc'
+            }
+
+            // Detect whether this raw Apify training sample is a scraped Linux bot anomaly
+            // (e.g. Linux platform claiming Windows/Mac UA or Windows claiming Intel Iris OpenGL Engine)
+            const isWinPlat = platLow.includes('win')
+            const isMacPlat = platLow.includes('mac')
+            const isIOSPlat = platLow.includes('iphone') || platLow.includes('ipad')
+            const isLinuxPlat = platLow.includes('linux') && !platLow.includes('android')
+            const claimsIOSUA = uaLow.includes('iphone') || uaLow.includes('ipad')
+            const claimsMacUA =
+              (uaLow.includes('macintosh') || uaLow.includes('mac os x')) && !claimsIOSUA
+            const claimsWinUA = uaLow.includes('windows nt')
+            const claimsLinuxDesktopUA =
+              uaLow.includes('x11; linux') || uaLow.includes('x11; ubuntu')
+            const claimsAndroidUA = uaLow.includes('android')
+
+            const hasOSContradiction =
+              (isWinPlat &&
+                (claimsMacUA || claimsIOSUA || claimsLinuxDesktopUA || claimsAndroidUA)) ||
+              (isMacPlat && (claimsWinUA || claimsLinuxDesktopUA || claimsAndroidUA)) ||
+              (isIOSPlat && (claimsWinUA || claimsLinuxDesktopUA || claimsAndroidUA)) ||
+              (isLinuxPlat && (claimsWinUA || claimsMacUA || claimsIOSUA)) ||
+              ((rendLow.includes('opengl engine') || rendLow.includes('angle metal renderer')) &&
+                (isWinPlat || isLinuxPlat || claimsWinUA || claimsLinuxDesktopUA)) ||
+              ((rendLow.includes('direct3d') || rendLow.includes('d3d11') || rendLow.includes('d3d9')) &&
+                (isMacPlat || isIOSPlat || isLinuxPlat))
+
+            const isVirtualGPU =
+              rendLow.includes('swiftshader') ||
+              rendLow.includes('basic render driver') ||
+              rendLow.includes('llvmpipe')
+
+            const subjectId = `apify_fp_${idx}`
+            const clientIp = `100.${64 + Math.floor(idx / 200)}.${(idx * 7) % 250}.${(idx % 200) + 10}`
+
+            const chRes = await fetch(`${baseUrl}/api/v1/risk/challenge`, {
+              method: 'POST',
+              headers: {
+                Authorization: `Bearer ${subjectId}`,
+                'X-Forwarded-For': clientIp,
+              },
+            })
+            const ch = (await chRes.json()) as {
+              nonce: string
+              render_seed: [number, number, number, number]
+              sample_points: Array<[number, number]>
+            }
+
+            const pts = ch.sample_points && ch.sample_points.length > 0 ? ch.sample_points : DEFAULT_SAMPLE_POINTS
+            const spotPixels = pts.map(([x, y]) =>
+              computeExpectedSpotPixelMath(x, y, ch.render_seed)
+            )
+            const staticHash = sha256Hex(`apify_webgl|${vendor}|${renderer}`).slice(0, 64)
+            const audioHash = sha256Hex(`apify_audio|${plat}|${renderer}`).slice(0, 64)
+            const canvasHash = sha256Hex(`apify_canvas|${plat}|${ua}`).slice(0, 64)
+            const fontsHash = sha256Hex(
+              `apify_fonts|${(fingerprint.fonts || []).join(',')}|${idx}`
+            ).slice(0, 64)
+            const beaconId = sha256Hex(`apify_bcn_${idx}`).slice(0, 32)
+
+            // Generate real ECDSA P-256 signature using Node WebCrypto
+            const kp = await crypto.webcrypto.subtle.generateKey(
+              { name: 'ECDSA', namedCurve: 'P-256' },
+              true,
+              ['sign', 'verify']
+            )
+            const rawPub = new Uint8Array(
+              await crypto.webcrypto.subtle.exportKey('raw', kp.publicKey)
+            )
+            const pubHex = Buffer.from(rawPub).toString('hex')
+            const msgBytes = new TextEncoder().encode(
+              `prismid-v2-sig|${ch.nonce}|${beaconId}|${staticHash}|${audioHash}`
+            )
+            const sigBytes = new Uint8Array(
+              await crypto.webcrypto.subtle.sign(
+                { name: 'ECDSA', hash: 'SHA-256' },
+                kp.privateKey,
+                msgBytes
+              )
+            )
+            const sigHex = Buffer.from(sigBytes).toString('hex')
+
+            const payload = {
+              v: 1,
+              nonce: ch.nonce,
+              beacon_id: beaconId,
+              device_key: {
+                alg: 'ecdsa-p256',
+                pub_key: pubHex,
+                signature: sigHex,
+              },
+              webgl: {
+                gpu_vendor: vendor,
+                gpu_renderer: renderer,
+                webgl_limits_vector:
+                  '16384|16384|16384,16384|16384|4096|1024|31|1,1|1,511|16|23,23,23,23|a1b2c3d4',
+                static_webgl_fp_hash: staticHash,
+                spot_pixels: spotPixels,
+                webgl_available: true,
+              },
+              audio_compressor_hash: audioHash,
+              audio_copy_hash: audioHash,
+              audio_silent_delta: 0,
+              system: {
+                fonts_bitmap_hash: fontsHash,
+                canvas_2d_hash: canvasHash,
+                canvas_control_rgba: [0, 0, 0, 0, 17, 136, 221, 255],
+                canvas_readback_delta: 0,
+                cpu_cores: Number(nav.hardwareConcurrency || 8),
+                memory_gb: Number(nav.deviceMemory || 8),
+                screen_spec: `${scr.width}x${scr.height}@${scr.devicePixelRatio || 1}`,
+                timezone: 'UTC',
+                platform: plat,
+                user_agent: ua,
+              },
+              lies: {
+                worker_unavailable: false,
+                worker_lie_detected: false,
+                worker_gpu_renderer: renderer,
+                worker_static_webgl_fp_hash: staticHash,
+                worker_cpu_cores: Number(nav.hardwareConcurrency || 8),
+                worker_platform: plat,
+                worker_user_agent: ua,
+                worker_timezone: 'UTC',
+                canvas_noise_injected: false,
+                webgl_noise_injected: false,
+                audio_noise_injected: false,
+                storage_healed: false,
+                math_engine_signature: mathSig,
+                math_constants_hash: 'dacb4db70a52c5ec6de100f2d0e68344',
+                prototype_lies: [],
+                automation_flags: [],
+              },
+              ts: Date.now(),
+            }
+
+            const sealed = await sealPayload(ch.nonce, JSON.stringify(payload))
+            const idRes = await fetch(`${baseUrl}/api/v1/risk/identify`, {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                Authorization: `Bearer ${subjectId}`,
+                'X-Forwarded-For': clientIp,
+              },
+              body: JSON.stringify({ c: ch.nonce, p: sealed }),
+            })
+            const vr = (await idRes.json()) as {
+              accepted: boolean
+              risk_status: string
+              spoof_trap_triggered: boolean
+            }
+            expect(vr.accepted).toBe(true)
+
+            if (hasOSContradiction) {
+              datasetBotAnomalyCount++
+              if (vr.spoof_trap_triggered && vr.risk_status === 'red') {
+                datasetBotAnomalyCaught++
+              }
+            } else if (!isVirtualGPU) {
+              genuineCount++
+              if (vr.risk_status === 'red' || vr.spoof_trap_triggered) {
+                genuineFalseRed++
+              }
+            }
+          }
+        }
+
+        expect(genuineCount).toBeGreaterThan(440)
+        expect(genuineFalseRed).toBe(0)
+        expect(datasetBotAnomalyCaught).toBe(datasetBotAnomalyCount)
+
+        // =========================================================================
+        // PART 2: REAL-CHROME APIFY FINGERPRINT-INJECTOR & 14 PUPPETEER-STEALTH EVASIONS
+        // =========================================================================
+        const browser = await chromium.launch({
+          executablePath: CHROME_MAC_PATH,
+          headless: true,
+          args: ['--enable-webgl', '--ignore-gpu-blocklist', '--use-gl=angle'],
+        })
+
+        try {
+          const evalContextAgainstServer = async (
+            ctx: Awaited<ReturnType<typeof browser.newContext>>,
+            subjectId: string,
+            clientIp: string
+          ) => {
+            try {
+              const page = await ctx.newPage()
+              await page.goto(baseUrl, { waitUntil: 'networkidle' })
+              return await page.evaluate(
+                async ({ subjectId, clientIp }) => {
+                  const { createPrismClient } = await new Function(
+                    'return import("/prismid.bundle.js")'
+                  )()
+                  const prism = createPrismClient({ baseUrl: '' })
+                  const chRes = await fetch('/api/v1/risk/challenge', {
+                    method: 'POST',
+                    headers: {
+                      Authorization: `Bearer ${subjectId}`,
+                      'X-Forwarded-For': clientIp,
+                    },
+                  })
+                  const ch = await chRes.json()
+                  const { request, payload } = await prism.collectAndSeal(ch)
+                  const idRes = await fetch('/api/v1/risk/identify', {
+                    method: 'POST',
+                    headers: {
+                      'Content-Type': 'application/json',
+                      Authorization: `Bearer ${subjectId}`,
+                      'X-Forwarded-For': clientIp,
+                    },
+                    body: JSON.stringify(request),
+                  })
+                  const verifyResult = await idRes.json()
+                  return { verifyResult, payload }
+                },
+                { subjectId, clientIp }
+              )
+            } finally {
+              await ctx.close()
+            }
+          }
+
+          // 2A. Apify FingerprintInjector: Cross-OS (Windows fingerprint injected on macOS Chrome)
+          {
+            const ctx = await browser.newContext()
+            const fpWin = fg.getFingerprint({
+              operatingSystems: ['windows'],
+              browsers: ['chrome'],
+            })
+            await injector.attachFingerprintToPlaywright(ctx, fpWin)
+            const res = await evalContextAgainstServer(ctx, 'apify_inj_win_on_mac', '198.19.1.10')
+            expect(res.verifyResult.spoof_trap_triggered).toBe(true)
+            expect(res.verifyResult.risk_status).toBe('red')
+          }
+
+          // 2B. Apify FingerprintInjector: Same-OS (macOS fingerprint + matching CPU cores on macOS Chrome)
+          {
+            const ctx = await browser.newContext()
+            const fpMac = fg.getFingerprint({
+              operatingSystems: ['macos'],
+              browsers: ['chrome'],
+            })
+            fpMac.fingerprint.navigator.hardwareConcurrency = os.cpus().length
+            await injector.attachFingerprintToPlaywright(ctx, fpMac)
+            const res = await evalContextAgainstServer(ctx, 'apify_inj_mac_same_os', '198.19.1.20')
+            expect(res.verifyResult.spoof_trap_triggered).toBe(true)
+            expect(res.verifyResult.risk_status).toBe('red')
+            expect(res.verifyResult.spoof_flags).toContain(
+              'prototype_lie:Function.toString:toString_proxy_getter'
+            )
+          }
+
+          // 2C. Apify FingerprintInjector: Safari fingerprint injected into V8 Chromium
+          {
+            const ctx = await browser.newContext()
+            const fpSafari = fg.getFingerprint({
+              operatingSystems: ['macos'],
+              browsers: ['safari'],
+            })
+            fpSafari.fingerprint.navigator.hardwareConcurrency = os.cpus().length
+            await injector.attachFingerprintToPlaywright(ctx, fpSafari)
+            const res = await evalContextAgainstServer(
+              ctx,
+              'apify_inj_safari_on_v8',
+              '198.19.1.30'
+            )
+            expect(res.verifyResult.spoof_trap_triggered).toBe(true)
+            expect(res.verifyResult.risk_status).toBe('red')
+            expect(res.verifyResult.spoof_flags).toContain(
+              'math_engine_ua_mismatch:v8_claiming_safari'
+            )
+          }
+
+          // 2D. All 14 Puppeteer-Extra-Plugin-Stealth Evasion Modules in Real Chrome
+          const stealthSpecs: Array<[string, (() => void) | undefined, Record<string, unknown> | undefined]> = [
+            [
+              'chrome.app',
+              () => {
+                ;(window as unknown as Record<string, unknown>).chrome = {}
+              },
+              undefined,
+            ],
+            [
+              'chrome.csi',
+              () => {
+                ;(window as unknown as Record<string, unknown>).chrome = {}
+              },
+              undefined,
+            ],
+            [
+              'chrome.loadTimes',
+              () => {
+                ;(window as unknown as Record<string, unknown>).chrome = {}
+              },
+              undefined,
+            ],
+            ['chrome.runtime', undefined, { runOnInsecureOrigins: true }],
+            ['iframe.contentWindow', undefined, undefined],
+            ['media.codecs', undefined, undefined],
+            ['navigator.hardwareConcurrency', undefined, undefined],
+            ['navigator.languages', undefined, undefined],
+            ['navigator.permissions', undefined, undefined],
+            [
+              'navigator.plugins',
+              () => {
+                Object.defineProperty(Navigator.prototype, 'plugins', {
+                  get: () => [],
+                  configurable: true,
+                })
+              },
+              undefined,
+            ],
+            ['navigator.vendor', undefined, undefined],
+            ['navigator.webdriver', undefined, undefined],
+            ['webgl.vendor', undefined, undefined],
+            [
+              'window.outerdimensions',
+              () => {
+                Object.defineProperty(window, 'outerWidth', {
+                  get: () => 0,
+                  set(v) {
+                    Object.defineProperty(window, 'outerWidth', {
+                      value: v,
+                      writable: true,
+                      enumerable: true,
+                      configurable: true,
+                    })
+                  },
+                  configurable: true,
+                })
+              },
+              undefined,
+            ],
+          ]
+
+          let stealthCaught = 0
+          for (let sIdx = 0; sIdx < stealthSpecs.length; sIdx++) {
+            const [evasionName, prepFn, opts] = stealthSpecs[sIdx]
+            const ctx = await browser.newContext()
+            if (prepFn) {
+              await ctx.addInitScript(prepFn)
+            }
+            const EvasionFactory = cjsRequire(
+              `puppeteer-extra-plugin-stealth/evasions/${evasionName}`
+            )
+            const evasion = EvasionFactory(opts)
+            const fakePage = {
+              evaluateOnNewDocument: async (fn: (...args: unknown[]) => unknown, ...args: unknown[]) => {
+                await ctx.addInitScript(fn, ...args)
+              },
+              _client: null,
+            }
+            if (typeof evasion.onPageCreated === 'function') {
+              await evasion.onPageCreated(fakePage)
+            }
+            const res = await evalContextAgainstServer(
+              ctx,
+              `stealth_${evasionName.replace(/\./g, '_')}`,
+              `198.19.2.${10 + sIdx}`
+            )
+            expect(res.verifyResult.spoof_trap_triggered).toBe(true)
+            expect(res.verifyResult.risk_status).toBe('red')
+            stealthCaught++
+          }
+          expect(stealthCaught).toBe(14)
+        } finally {
+          await browser.close()
+        }
+      },
+      60000
     )
   })
 })
