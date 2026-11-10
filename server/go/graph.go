@@ -1,6 +1,7 @@
 package prismid
 
 import (
+	"fmt"
 	"math"
 	"sort"
 	"strings"
@@ -16,18 +17,21 @@ const (
 	RiskStatusRed     = "red"
 )
 
-// Default velocity windows, edge TTLs, burst thresholds, and graph capacity bounds.
+// Default velocity windows, edge TTLs, spoof decay thresholds, burst thresholds, and graph capacity bounds.
 const (
-	DefaultGPUBurstWindow        = 25 * time.Minute
-	DefaultWebProfileWindow      = 2 * time.Hour
-	DefaultSameNetFarmingWindow  = 6 * time.Hour
-	DefaultSpoofEdgeTTL          = 24 * time.Hour
-	DefaultSoftEdgeTTL           = 7 * 24 * time.Hour
-	DefaultCleanBeaconBurstCount = 3
-	DefaultMaxGraphSubjects      = 50000
-	MaxSlicesPerSubject          = 16
-	MaxSubjectsPerSlice          = 256
-	MaxComponentSize             = 512
+	DefaultGPUBurstWindow                = 25 * time.Minute
+	DefaultWebProfileWindow              = 2 * time.Hour
+	DefaultSameNetFarmingWindow          = 6 * time.Hour
+	DefaultSpoofEdgeTTL                  = 24 * time.Hour
+	DefaultSoftEdgeTTL                   = 7 * 24 * time.Hour
+	DefaultMinCleanStreakInterval        = 1 * time.Hour
+	DefaultCleanObservationsToClearSpoof = 3
+	HistoricalSpoofLogOdds               = 1.5
+	DefaultCleanBeaconBurstCount         = 3
+	DefaultMaxGraphSubjects              = 50000
+	MaxSlicesPerSubject                  = 16
+	MaxSubjectsPerSlice                  = 256
+	MaxComponentSize                     = 512
 )
 
 // GraphSubject represents an account/user node in the orthogonal slice risk graph.
@@ -40,9 +44,14 @@ type GraphSubject struct {
 type GraphEdge struct {
 	SubjectID        string    `json:"subject_id"`
 	SubjectCreatedAt time.Time `json:"subject_created_at"`
+	ObservedAt       time.Time `json:"observed_at,omitempty"`
 	SliceID          string    `json:"slice_id"`
 	Confidence       float64   `json:"confidence"`
 	SpoofTraphit     bool      `json:"spoof_trap_hit,omitempty"`
+	SpoofedAt        time.Time `json:"spoofed_at,omitempty"`
+	LastCleanAt      time.Time `json:"last_clean_at,omitempty"`
+	CleanStreak      int       `json:"clean_streak,omitempty"`
+	HistoricalSpoof  bool      `json:"historical_spoof,omitempty"`
 	HasBeacon        bool      `json:"has_beacon,omitempty"`
 	BeaconSliceID    string    `json:"beacon_slice_id,omitempty"`
 	NativeSliceID    string    `json:"native_slice_id,omitempty"`
@@ -55,6 +64,8 @@ type RiskEvidence struct {
 	Category    string  `json:"category"`
 	Description string  `json:"description"`
 	LogOdds     float64 `json:"log_odds"`
+	ObservedAt  string  `json:"observed_at,omitempty"`
+	Historical  bool    `json:"historical,omitempty"`
 }
 
 // ComponentSnapshot describes the connected component, calibrated log-odds score,
@@ -97,6 +108,8 @@ type RiskGraph struct {
 	mu                 sync.RWMutex
 	minConf            float64
 	maxSubjects        int
+	nowFunc            func() time.Time
+	lastObservedAt     time.Time
 	subjectOrder       []string
 	subjectEdges       map[string]map[string]GraphEdge
 	sliceEdges         map[string]map[string]GraphEdge
@@ -107,12 +120,19 @@ type RiskGraph struct {
 
 // NewRiskGraph creates a standalone thread-safe, deduplicated, capacity-bounded risk graph.
 func NewRiskGraph(minConfidence float64) *RiskGraph {
+	return NewRiskGraphWithClock(minConfidence, nil)
+}
+
+// NewRiskGraphWithClock creates a RiskGraph using an explicit clock for edge TTL and spoof decay.
+// When nowFunc is nil, the graph uses the latest timestamp passed into RecordVerification.
+func NewRiskGraphWithClock(minConfidence float64, nowFunc func() time.Time) *RiskGraph {
 	if minConfidence <= 0 {
 		minConfidence = AuthoritativeConfidenceThreshold
 	}
 	return &RiskGraph{
 		minConf:            minConfidence,
 		maxSubjects:        DefaultMaxGraphSubjects,
+		nowFunc:            nowFunc,
 		subjectOrder:       make([]string, 0, 256),
 		subjectEdges:       make(map[string]map[string]GraphEdge),
 		sliceEdges:         make(map[string]map[string]GraphEdge),
@@ -121,9 +141,73 @@ func NewRiskGraph(minConfidence float64) *RiskGraph {
 	}
 }
 
+func edgeObservedAt(e GraphEdge) time.Time {
+	if !e.ObservedAt.IsZero() {
+		return e.ObservedAt
+	}
+	return e.SubjectCreatedAt
+}
+
+func (g *RiskGraph) referenceNowLocked() time.Time {
+	if g.nowFunc != nil {
+		return g.nowFunc().UTC()
+	}
+	return g.lastObservedAt
+}
+
+func normalizeEdgeAtTime(edge GraphEdge, refNow time.Time) (GraphEdge, bool) {
+	obsAt := edgeObservedAt(edge)
+	if !isPerDeviceHardSlice(edge.SliceID) && !refNow.IsZero() && !obsAt.IsZero() && refNow.Sub(obsAt) > DefaultSoftEdgeTTL {
+		return edge, false
+	}
+	if edge.SpoofTraphit {
+		spTime := edge.SpoofedAt
+		if spTime.IsZero() {
+			spTime = obsAt
+		}
+		if edge.CleanStreak >= DefaultCleanObservationsToClearSpoof ||
+			(!refNow.IsZero() && !spTime.IsZero() && refNow.Sub(spTime) > DefaultSpoofEdgeTTL) {
+			edge.SpoofTraphit = false
+			edge.HistoricalSpoof = true
+		}
+	}
+	return edge, true
+}
+
+func (g *RiskGraph) pruneSubjectEdgesLocked(subjectID string, refNow time.Time) {
+	subjMap, ok := g.subjectEdges[subjectID]
+	if !ok || len(subjMap) == 0 {
+		return
+	}
+	sliceIDs := make([]string, 0, len(subjMap))
+	for sl := range subjMap {
+		sliceIDs = append(sliceIDs, sl)
+	}
+	for _, sl := range sliceIDs {
+		edge := subjMap[sl]
+		updated, alive := normalizeEdgeAtTime(edge, refNow)
+		if !alive {
+			delete(subjMap, sl)
+			if smap, exists := g.sliceEdges[sl]; exists {
+				delete(smap, subjectID)
+				if len(smap) == 0 {
+					delete(g.sliceEdges, sl)
+				}
+			}
+			continue
+		}
+		if updated.SpoofTraphit != edge.SpoofTraphit || updated.HistoricalSpoof != edge.HistoricalSpoof {
+			subjMap[sl] = updated
+			if smap, exists := g.sliceEdges[sl]; exists {
+				smap[subjectID] = updated
+			}
+		}
+	}
+}
+
 // RecordVerification records or updates a subject's orthogonal slices from a VerifyResult
 // and returns the updated ComponentSnapshot for that subject.
-func (g *RiskGraph) RecordVerification(subjectID string, subjectCreatedAt time.Time, res *VerifyResult) ComponentSnapshot {
+func (g *RiskGraph) RecordVerification(subjectID string, observedAt time.Time, res *VerifyResult) ComponentSnapshot {
 	subjectID = strings.TrimSpace(subjectID)
 	if res != nil && res.DeviceKeyRecoveryRequired {
 		// Recovery cannot overwrite authoritative history or link a claimed identity.
@@ -131,11 +215,23 @@ func (g *RiskGraph) RecordVerification(subjectID string, subjectCreatedAt time.T
 		snap.DeviceKeyRecoveryRequired = true
 		return snap
 	}
-	if subjectCreatedAt.IsZero() {
-		subjectCreatedAt = time.Now().UTC()
+	if observedAt.IsZero() {
+		if g.nowFunc != nil {
+			observedAt = g.nowFunc().UTC()
+		} else {
+			observedAt = time.Now().UTC()
+		}
 	}
 
 	g.mu.Lock()
+	if observedAt.After(g.lastObservedAt) {
+		g.lastObservedAt = observedAt
+	}
+	refNow := g.referenceNowLocked()
+	if observedAt.After(refNow) {
+		refNow = observedAt
+	}
+
 	if res != nil && res.Accepted && subjectID != "" {
 		if _, exists := g.subjectEdges[subjectID]; !exists {
 			if g.maxSubjects > 0 && len(g.subjectEdges) >= g.maxSubjects && len(g.subjectOrder) > 0 {
@@ -146,10 +242,58 @@ func (g *RiskGraph) RecordVerification(subjectID string, subjectCreatedAt time.T
 			g.subjectEdges[subjectID] = make(map[string]GraphEdge)
 		}
 
+		// Prune expired soft edges and expire past-TTL spoof states before applying the new observation.
+		g.pruneSubjectEdgesLocked(subjectID, refNow)
+
+		// Determine earliest subject creation timestamp across any existing edges of this subject.
+		subjectCreated := observedAt
+		for _, prev := range g.subjectEdges[subjectID] {
+			if !prev.SubjectCreatedAt.IsZero() && prev.SubjectCreatedAt.Before(subjectCreated) {
+				subjectCreated = prev.SubjectCreatedAt
+			}
+		}
+
 		hasBeacon := strings.TrimSpace(res.BeaconSliceID) != ""
 		var nativeSliceID string
 		if res.IsNative && strings.HasPrefix(res.ExactSliceID, "d_nat_") {
 			nativeSliceID = res.ExactSliceID
+		}
+
+		// Anti-Wash Spoof Decay (DeepSeek v1.0 & v1.0.1 P1 #2):
+		// A clean observation can advance CleanStreak on a previously spoofed edge ONLY when:
+		//   1) It presents the exact same strongest per-device hard anchor recorded on that spoofed edge
+		//      (DeviceKeySliceID if bound, else NativeSliceID, else BeaconSliceID — preventing cross-device washing), AND
+		//   2) At least DefaultMinCleanStreakInterval (1h) of server-observed time has elapsed since the spoof
+		//      (and since the previous counted clean step — preventing rapid 3-request scripted washing).
+		if !res.SpoofTrapTriggered && res.Confidence >= g.minConf {
+			existingKeys := make([]string, 0, len(g.subjectEdges[subjectID]))
+			for sl := range g.subjectEdges[subjectID] {
+				existingKeys = append(existingKeys, sl)
+			}
+			for _, sl := range existingKeys {
+				prev := g.subjectEdges[subjectID][sl]
+				if prev.SpoofTraphit && sharesSameHardAnchorForDecay(prev, res, nativeSliceID) {
+					baseTime := prev.SpoofedAt
+					if baseTime.IsZero() {
+						baseTime = edgeObservedAt(prev)
+					}
+					if prev.LastCleanAt.After(baseTime) {
+						baseTime = prev.LastCleanAt
+					}
+					if baseTime.IsZero() || observedAt.Sub(baseTime) >= DefaultMinCleanStreakInterval {
+						prev.CleanStreak++
+						prev.LastCleanAt = observedAt
+						if prev.CleanStreak >= DefaultCleanObservationsToClearSpoof {
+							prev.SpoofTraphit = false
+							prev.HistoricalSpoof = true
+						}
+						g.subjectEdges[subjectID][sl] = prev
+						if smap, exists := g.sliceEdges[sl]; exists {
+							smap[subjectID] = prev
+						}
+					}
+				}
+			}
 		}
 
 		slices := make([]string, 0, 7)
@@ -165,7 +309,8 @@ func (g *RiskGraph) RecordVerification(subjectID string, subjectCreatedAt time.T
 			}
 			edge := GraphEdge{
 				SubjectID:        subjectID,
-				SubjectCreatedAt: subjectCreatedAt,
+				SubjectCreatedAt: subjectCreated,
+				ObservedAt:       observedAt,
 				SliceID:          sliceID,
 				Confidence:       res.Confidence,
 				SpoofTraphit:     res.SpoofTrapTriggered,
@@ -174,15 +319,46 @@ func (g *RiskGraph) RecordVerification(subjectID string, subjectCreatedAt time.T
 				NativeSliceID:    nativeSliceID,
 				DeviceKeySliceID: res.DeviceKeySliceID,
 			}
+			if res.SpoofTrapTriggered {
+				edge.SpoofedAt = observedAt
+				edge.LastCleanAt = time.Time{}
+				edge.CleanStreak = 0
+				edge.HistoricalSpoof = false
+			}
 			subjMap := g.subjectEdges[subjectID]
 			if prev, ok := subjMap[sliceID]; ok {
 				if !prev.SubjectCreatedAt.IsZero() && prev.SubjectCreatedAt.Before(edge.SubjectCreatedAt) {
 					edge.SubjectCreatedAt = prev.SubjectCreatedAt
 				}
-				if prev.SpoofTraphit {
-					edge.SpoofTraphit = true
+				if !prev.ObservedAt.IsZero() && prev.ObservedAt.After(edge.ObservedAt) {
+					edge.ObservedAt = prev.ObservedAt
 				}
-				if prev.Confidence > edge.Confidence {
+				if !res.SpoofTrapTriggered {
+					if prev.SpoofTraphit {
+						edge.SpoofTraphit = true
+						edge.SpoofedAt = prev.SpoofedAt
+						edge.LastCleanAt = prev.LastCleanAt
+						edge.CleanStreak = prev.CleanStreak
+						edge.HistoricalSpoof = prev.HistoricalSpoof
+						// Preserve the originating spoof anchor so another device sharing a soft slice cannot hijack decay:
+						if prev.DeviceKeySliceID != "" {
+							edge.DeviceKeySliceID = prev.DeviceKeySliceID
+						}
+						if prev.NativeSliceID != "" {
+							edge.NativeSliceID = prev.NativeSliceID
+						}
+						if prev.BeaconSliceID != "" {
+							edge.BeaconSliceID = prev.BeaconSliceID
+							edge.HasBeacon = true
+						}
+					} else if prev.HistoricalSpoof {
+						edge.HistoricalSpoof = true
+						edge.SpoofedAt = prev.SpoofedAt
+						edge.LastCleanAt = prev.LastCleanAt
+						edge.CleanStreak = prev.CleanStreak
+					}
+				}
+				if prev.Confidence > edge.Confidence && !edge.SpoofTraphit {
 					edge.Confidence = prev.Confidence
 				}
 			} else if len(subjMap) >= MaxSlicesPerSubject {
@@ -241,10 +417,11 @@ func (g *RiskGraph) RecordVerification(subjectID string, subjectCreatedAt time.T
 					if sid == earliestSID {
 						continue
 					}
-					if evictSID == "" || e.SubjectCreatedAt.Before(oldestNonEarliest) ||
-						(e.SubjectCreatedAt.Equal(oldestNonEarliest) && sid < evictSID) {
+					obsTime := edgeObservedAt(e)
+					if evictSID == "" || obsTime.Before(oldestNonEarliest) ||
+						(obsTime.Equal(oldestNonEarliest) && sid < evictSID) {
 						evictSID = sid
-						oldestNonEarliest = e.SubjectCreatedAt
+						oldestNonEarliest = obsTime
 					}
 				}
 				if evictSID != "" {
@@ -283,17 +460,104 @@ func (g *RiskGraph) EvaluateSubject(subjectID string) ComponentSnapshot {
 	return snap
 }
 
-// RemoveSubject deletes all graph observations for a subject (supporting GDPR/CCPA erasure requests).
-func (g *RiskGraph) RemoveSubject(subjectID string) bool {
+func sharesSameHardAnchorForDecay(prev GraphEdge, res *VerifyResult, nativeSliceID string) bool {
+	if res == nil {
+		return false
+	}
+	if prev.DeviceKeySliceID != "" {
+		return res.DeviceKeySliceID != "" && res.DeviceKeySliceID == prev.DeviceKeySliceID
+	}
+	if prev.NativeSliceID != "" {
+		return nativeSliceID != "" && nativeSliceID == prev.NativeSliceID
+	}
+	if prev.BeaconSliceID != "" {
+		return res.BeaconSliceID != "" && res.BeaconSliceID == prev.BeaconSliceID
+	}
+	return false
+}
+
+// SubjectOwnsBeaconExclusively verifies that beaconSliceID was previously recorded on subjectID
+// AND is not shared with any other subject in the graph (enforcing strict 1:1 ownership before TOFU rebinding).
+func (g *RiskGraph) SubjectOwnsBeaconExclusively(subjectID, beaconSliceID string) bool {
+	subjectID = strings.TrimSpace(subjectID)
+	beaconSliceID = strings.TrimSpace(beaconSliceID)
+	if subjectID == "" || !strings.HasPrefix(beaconSliceID, "d_bcn_") {
+		return false
+	}
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	subjMap, ok := g.subjectEdges[subjectID]
+	if !ok {
+		return false
+	}
+	if _, hasBeacon := subjMap[beaconSliceID]; !hasBeacon {
+		return false
+	}
+	smap, exists := g.sliceEdges[beaconSliceID]
+	if !exists || len(smap) != 1 {
+		return false
+	}
+	_, soleOwner := smap[subjectID]
+	return soleOwner
+}
+
+// ClearSubjectSpoofAfterStepUp transitions active spoof edges on subjectID to HistoricalSpoof=true
+// following server-verified step-up authentication (e.g. passkey, OTP, or CAPTCHA), allowing
+// immediate legitimate recovery without weakening automatic client-side decay against scripted washing.
+func (g *RiskGraph) ClearSubjectSpoofAfterStepUp(subjectID string, clearedAt time.Time) bool {
 	subjectID = strings.TrimSpace(subjectID)
 	if subjectID == "" {
 		return false
 	}
+	if clearedAt.IsZero() {
+		clearedAt = time.Now().UTC()
+	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	if _, exists := g.subjectEdges[subjectID]; !exists {
+	subjMap, ok := g.subjectEdges[subjectID]
+	if !ok {
 		return false
 	}
+	cleared := false
+	for sl, edge := range subjMap {
+		if edge.SpoofTraphit {
+			edge.SpoofTraphit = false
+			edge.HistoricalSpoof = true
+			edge.CleanStreak = DefaultCleanObservationsToClearSpoof
+			edge.LastCleanAt = clearedAt
+			subjMap[sl] = edge
+			if smap, exists := g.sliceEdges[sl]; exists {
+				smap[subjectID] = edge
+			}
+			cleared = true
+		}
+	}
+	return cleared
+}
+
+// RemoveSubjectAndCollectBeacons deletes all graph observations for subjectID and returns any
+// d_bcn_* beacon slice IDs that belonged exclusively to subjectID so the caller can also purge
+// TOFU key bindings from ChallengeStore for complete GDPR/CCPA erasure.
+func (g *RiskGraph) RemoveSubjectAndCollectBeacons(subjectID string) (bool, []string) {
+	subjectID = strings.TrimSpace(subjectID)
+	if subjectID == "" {
+		return false, nil
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	subjMap, exists := g.subjectEdges[subjectID]
+	if !exists {
+		return false, nil
+	}
+	var exclusiveBeacons []string
+	for sl := range subjMap {
+		if strings.HasPrefix(sl, "d_bcn_") {
+			if smap, ok := g.sliceEdges[sl]; !ok || len(smap) <= 1 {
+				exclusiveBeacons = append(exclusiveBeacons, sl)
+			}
+		}
+	}
+	sort.Strings(exclusiveBeacons)
 	g.removeSubjectLocked(subjectID)
 	for i, sid := range g.subjectOrder {
 		if sid == subjectID {
@@ -301,7 +565,13 @@ func (g *RiskGraph) RemoveSubject(subjectID string) bool {
 			break
 		}
 	}
-	return true
+	return true, exclusiveBeacons
+}
+
+// RemoveSubject deletes all graph observations for a subject (supporting GDPR/CCPA erasure requests).
+func (g *RiskGraph) RemoveSubject(subjectID string) bool {
+	removed, _ := g.RemoveSubjectAndCollectBeacons(subjectID)
+	return removed
 }
 
 func (g *RiskGraph) removeSubjectLocked(subjectID string) {
@@ -352,6 +622,7 @@ func (g *RiskGraph) collectLocalSubgraphEdgesLocked(targetSubjectID string) ([]G
 	if _, ok := g.subjectEdges[targetSubjectID]; !ok {
 		return nil, false
 	}
+	refNow := g.referenceNowLocked()
 	visited := map[string]bool{targetSubjectID: true}
 	queue := []string{targetSubjectID}
 	processedHard := make(map[string]bool)
@@ -375,8 +646,8 @@ func (g *RiskGraph) collectLocalSubgraphEdgesLocked(targetSubjectID string) ([]G
 	for head := 0; head < len(queue); head++ {
 		sid := queue[head]
 		for _, slice := range sortedSlices(sid) {
-			edge := g.subjectEdges[sid][slice]
-			if edge.Confidence < g.minConf {
+			edge, alive := normalizeEdgeAtTime(g.subjectEdges[sid][slice], refNow)
+			if !alive || edge.Confidence < g.minConf {
 				continue
 			}
 			hard := isPerDeviceHardSlice(slice)
@@ -387,8 +658,8 @@ func (g *RiskGraph) collectLocalSubgraphEdgesLocked(targetSubjectID string) ([]G
 				processedHard[slice] = true
 			}
 			for _, neighbor := range sortedNeighbors(slice) {
-				next := g.sliceEdges[slice][neighbor]
-				if visited[neighbor] || next.Confidence < g.minConf ||
+				next, nextAlive := normalizeEdgeAtTime(g.sliceEdges[slice][neighbor], refNow)
+				if !nextAlive || visited[neighbor] || next.Confidence < g.minConf ||
 					!shouldMergeStatelessOrSpoofed(slice, edge, next) {
 					continue
 				}
@@ -403,7 +674,10 @@ func (g *RiskGraph) collectLocalSubgraphEdgesLocked(targetSubjectID string) ([]G
 	}
 	// Collect bounded velocity-window neighbors on d_gpusys_* (6h) and d_web_* (25m) for targetSubjectID:
 	for _, slice := range sortedSlices(targetSubjectID) {
-		targetEdge := g.subjectEdges[targetSubjectID][slice]
+		targetEdge, targetAlive := normalizeEdgeAtTime(g.subjectEdges[targetSubjectID][slice], refNow)
+		if !targetAlive {
+			continue
+		}
 		var window time.Duration
 		if strings.HasPrefix(slice, "d_gpusys_") {
 			window = DefaultSameNetFarmingWindow
@@ -417,11 +691,11 @@ func (g *RiskGraph) collectLocalSubgraphEdgesLocked(targetSubjectID string) ([]G
 			if visited[neighbor] {
 				continue
 			}
-			next := g.sliceEdges[slice][neighbor]
-			if next.Confidence < g.minConf {
+			next, nextAlive := normalizeEdgeAtTime(g.sliceEdges[slice][neighbor], refNow)
+			if !nextAlive || next.Confidence < g.minConf {
 				continue
 			}
-			dt := next.SubjectCreatedAt.Sub(targetEdge.SubjectCreatedAt)
+			dt := edgeObservedAt(next).Sub(edgeObservedAt(targetEdge))
 			if dt < 0 {
 				dt = -dt
 			}
@@ -440,7 +714,11 @@ func (g *RiskGraph) collectLocalSubgraphEdgesLocked(targetSubjectID string) ([]G
 		if g.incompleteSubjects[sid] {
 			truncated = true
 		}
-		for slice, edge := range g.subjectEdges[sid] {
+		for slice, rawEdge := range g.subjectEdges[sid] {
+			edge, alive := normalizeEdgeAtTime(rawEdge, refNow)
+			if !alive {
+				continue
+			}
 			if isPerDeviceHardSlice(slice) && g.incompleteSlices[slice] {
 				truncated = true
 			}
@@ -471,15 +749,19 @@ func isPerDeviceHardSlice(slice string) bool {
 		strings.HasPrefix(slice, "d_bcn_")
 }
 
+func hasActiveSpoof(e GraphEdge) bool {
+	return e.SpoofTraphit && e.CleanStreak == 0
+}
+
 func hasDifferentCleanNativeAnchors(a, b GraphEdge) bool {
-	if a.SpoofTraphit || b.SpoofTraphit {
+	if hasActiveSpoof(a) || hasActiveSpoof(b) {
 		return false
 	}
 	return a.NativeSliceID != "" && b.NativeSliceID != "" && a.NativeSliceID != b.NativeSliceID
 }
 
 func hasDifferentCleanBeacons(a, b GraphEdge) bool {
-	if a.SpoofTraphit || b.SpoofTraphit {
+	if hasActiveSpoof(a) || hasActiveSpoof(b) {
 		return false
 	}
 	if a.BeaconSliceID != "" && b.BeaconSliceID != "" {
@@ -504,15 +786,16 @@ func sharesHardAnchorOnEdge(a, b GraphEdge) bool {
 // shouldMergeStatelessOrSpoofed determines whether two observations `a` and `b`
 // on a soft slice should merge into the same identity connected component.
 //
-// P0 Invariant (DeepSeek v0.5 Review):
-//   - A spoofed observation (SpoofTraphit=true) NEVER unconditionally merges across a model-wide
+// P0 Invariant (DeepSeek v0.5 & v1.0 Review):
+//   - A spoofed observation (hasActiveSpoof=true) NEVER unconditionally merges across a model-wide
 //     slice (d_gpu_* / d_web_*), which would allow one privacy-extension user or griefing attacker
 //     to poison all clean users of the same laptop model.
-//   - Instead, a spoofed observation on a soft slice merges ONLY when:
+//   - Instead, an actively spoofed observation on a soft slice merges ONLY when:
 //     1) The two observations share a hard anchor (d_bcn_*, d_key_*, d_nat_*), OR
-//     2) They share the same /24 subnet + GPU/OS (d_gpusys_*) within DefaultGPUBurstWindow (25m), OR
-//     3) Both observations are stateless (no storage beacon) within DefaultGPUBurstWindow (25m);
-//     AND their time delta is within DefaultSpoofEdgeTTL (24h).
+//     2) Both observations are actively spoofing on the same GPU/Web/Subnet slice within 24h, OR
+//     3) They share the same /24 subnet + GPU/OS (d_gpusys_*) within DefaultGPUBurstWindow (25m), OR
+//     4) Both observations are stateless (no storage beacon) within DefaultGPUBurstWindow (25m);
+//     AND their observation-time delta is within DefaultSpoofEdgeTTL (24h).
 func shouldMergeStatelessOrSpoofed(slice string, a, b GraphEdge) bool {
 	if isPerDeviceHardSlice(slice) {
 		return true
@@ -521,16 +804,16 @@ func shouldMergeStatelessOrSpoofed(slice string, a, b GraphEdge) bool {
 		return false
 	}
 
-	dt := a.SubjectCreatedAt.Sub(b.SubjectCreatedAt)
+	dt := edgeObservedAt(a).Sub(edgeObservedAt(b))
 	if dt < 0 {
 		dt = -dt
 	}
-	// Soft-slice edges expire after DefaultSoftEdgeTTL (7 days) to prevent permanent slice poisoning:
+	// Soft-slice edges expire after DefaultSoftEdgeTTL (7 days from observation time):
 	if dt > DefaultSoftEdgeTTL {
 		return false
 	}
 
-	if a.SpoofTraphit || b.SpoofTraphit {
+	if hasActiveSpoof(a) || hasActiveSpoof(b) {
 		// Spoofed soft-slice edges expire after DefaultSpoofEdgeTTL (24 hours):
 		if dt > DefaultSpoofEdgeTTL {
 			return false
@@ -538,7 +821,7 @@ func shouldMergeStatelessOrSpoofed(slice string, a, b GraphEdge) bool {
 		if sharesHardAnchorOnEdge(a, b) {
 			return true
 		}
-		if a.SpoofTraphit && b.SpoofTraphit &&
+		if hasActiveSpoof(a) && hasActiveSpoof(b) &&
 			(strings.HasPrefix(slice, "d_gpu_") || strings.HasPrefix(slice, "d_web_") || strings.HasPrefix(slice, "d_gpusys_")) {
 			return true
 		}
@@ -573,15 +856,16 @@ func shouldMergeStatelessOrSpoofed(slice string, a, b GraphEdge) bool {
 }
 
 // countDistinctSubjectsInWindow counts how many distinct non-native-conflicting subjects on `obs`
-// have observations within `window` of `refTime`. Because `obs` is canonical-sorted, this is
-// 100% deterministic and order-invariant (fixing GPT R1).
+// have observations within `window` of `refEdge` (by edge observation timestamp). Because `obs` is
+// canonical-sorted, this is 100% deterministic and order-invariant (fixing GPT R1).
 func countDistinctSubjectsInWindow(obs []GraphEdge, refEdge GraphEdge, window time.Duration) int {
 	seen := make(map[string]struct{}, len(obs))
+	refObs := edgeObservedAt(refEdge)
 	for _, o := range obs {
 		if hasDifferentCleanNativeAnchors(refEdge, o) {
 			continue
 		}
-		dt := o.SubjectCreatedAt.Sub(refEdge.SubjectCreatedAt)
+		dt := edgeObservedAt(o).Sub(refObs)
 		if dt < 0 {
 			dt = -dt
 		}
@@ -636,6 +920,13 @@ func EvaluateSubjectComponent(edges []GraphEdge, targetSubjectID string, minConf
 		return empty
 	}
 
+	var maxObsTime time.Time
+	for _, e := range edges {
+		if t := edgeObservedAt(e); t.After(maxObsTime) {
+			maxObsTime = t
+		}
+	}
+
 	// Canonical-sort a copy of input edges by (SubjectCreatedAt, SubjectID, SliceID) so that
 	// any permutation of input edges produces the exact same output (GPT R1 fix).
 	sortedEdges := make([]GraphEdge, 0, len(edges))
@@ -650,13 +941,21 @@ func EvaluateSubjectComponent(edges []GraphEdge, targetSubjectID string, minConf
 		}
 		e.SubjectID = sid
 		e.SliceID = slice
-		sortedEdges = append(sortedEdges, e)
+		norm, alive := normalizeEdgeAtTime(e, maxObsTime)
+		if !alive {
+			continue
+		}
+		sortedEdges = append(sortedEdges, norm)
 	}
 	sortGraphEdgesCanonical(sortedEdges)
 
 	parent := make(map[string]string)
 	createdAt := make(map[string]time.Time)
-	spoofed := make(map[string]bool)
+	spoofedActive := make(map[string]bool)
+	spoofedCooldown := make(map[string]bool)
+	historicalDecayed := make(map[string]bool)
+	latestSpoofedAt := make(map[string]time.Time)
+	minCleanStreak := make(map[string]int)
 	sliceObs := make(map[string][]GraphEdge)
 	subjectSlices := make(map[string]map[string]struct{})
 	subjectEdgeBySlice := make(map[string]map[string]GraphEdge)
@@ -697,9 +996,6 @@ func EvaluateSubjectComponent(edges []GraphEdge, targetSubjectID string, minConf
 		if prev, ok := createdAt[sid]; !ok || (!e.SubjectCreatedAt.IsZero() && e.SubjectCreatedAt.Before(prev)) {
 			createdAt[sid] = e.SubjectCreatedAt
 		}
-		if e.SpoofTraphit {
-			spoofed[sid] = true
-		}
 		if subjectEdgeBySlice[sid] == nil {
 			subjectEdgeBySlice[sid] = make(map[string]GraphEdge)
 		}
@@ -707,14 +1003,31 @@ func EvaluateSubjectComponent(edges []GraphEdge, targetSubjectID string, minConf
 			if !prevEdge.SubjectCreatedAt.IsZero() && prevEdge.SubjectCreatedAt.Before(e.SubjectCreatedAt) {
 				e.SubjectCreatedAt = prevEdge.SubjectCreatedAt
 			}
-			if prevEdge.SpoofTraphit {
-				e.SpoofTraphit = true
+			if !prevEdge.ObservedAt.IsZero() && prevEdge.ObservedAt.After(e.ObservedAt) {
+				e.ObservedAt = prevEdge.ObservedAt
 			}
-			subjectEdgeBySlice[sid][slice] = e
-		} else {
-			subjectEdgeBySlice[sid][slice] = e
-			sliceObs[slice] = append(sliceObs[slice], e)
+			if prevEdge.SpoofTraphit && !e.SpoofTraphit {
+				e.SpoofTraphit = true
+				e.CleanStreak = prevEdge.CleanStreak
+				if e.SpoofedAt.IsZero() || prevEdge.SpoofedAt.After(e.SpoofedAt) {
+					e.SpoofedAt = prevEdge.SpoofedAt
+				}
+			} else if prevEdge.SpoofTraphit && e.SpoofTraphit {
+				if prevEdge.CleanStreak < e.CleanStreak {
+					e.CleanStreak = prevEdge.CleanStreak
+				}
+				if prevEdge.SpoofedAt.After(e.SpoofedAt) {
+					e.SpoofedAt = prevEdge.SpoofedAt
+				}
+			}
+			if prevEdge.HistoricalSpoof {
+				e.HistoricalSpoof = true
+				if e.SpoofedAt.IsZero() {
+					e.SpoofedAt = prevEdge.SpoofedAt
+				}
+			}
 		}
+		subjectEdgeBySlice[sid][slice] = e
 
 		if subjectSlices[sid] == nil {
 			subjectSlices[sid] = make(map[string]struct{})
@@ -728,10 +1041,42 @@ func EvaluateSubjectComponent(edges []GraphEdge, targetSubjectID string, minConf
 		return empty
 	}
 
+	// Build deduplicated sliceObs and per-subject spoof state deterministically
+	subjectIDs := make([]string, 0, len(subjectEdgeBySlice))
+	for sid := range subjectEdgeBySlice {
+		subjectIDs = append(subjectIDs, sid)
+	}
+	sort.Strings(subjectIDs)
+	for _, sid := range subjectIDs {
+		for slice, e := range subjectEdgeBySlice[sid] {
+			sliceObs[slice] = append(sliceObs[slice], e)
+			spAt := e.SpoofedAt
+			if spAt.IsZero() && (e.SpoofTraphit || e.HistoricalSpoof) {
+				spAt = edgeObservedAt(e)
+			}
+			if !spAt.IsZero() && spAt.After(latestSpoofedAt[sid]) {
+				latestSpoofedAt[sid] = spAt
+			}
+			if e.SpoofTraphit {
+				if e.CleanStreak == 0 {
+					spoofedActive[sid] = true
+				} else {
+					spoofedCooldown[sid] = true
+					if cur, seen := minCleanStreak[sid]; !seen || e.CleanStreak < cur {
+						minCleanStreak[sid] = e.CleanStreak
+					}
+				}
+			} else if e.HistoricalSpoof {
+				historicalDecayed[sid] = true
+			}
+		}
+	}
+
 	// Collect all slice keys in sorted order for deterministic processing
 	sliceKeys := make([]string, 0, len(sliceObs))
 	for slice := range sliceObs {
 		sliceKeys = append(sliceKeys, slice)
+		sortGraphEdgesCanonical(sliceObs[slice])
 	}
 	sort.Strings(sliceKeys)
 
@@ -752,13 +1097,22 @@ func EvaluateSubjectComponent(edges []GraphEdge, targetSubjectID string, minConf
 			continue
 		}
 
-		// For soft slices: evaluate bounded sliding-window pairs (obsList is canonical-sorted by SubjectCreatedAt)
+		// For soft slices: sort by edgeObservedAt and evaluate bounded sliding-window pairs
 		// using shouldMergeStatelessOrSpoofed so spoofed observations NEVER poison unrelated clean users across d_gpu_*/d_web_*.
-		for i := 0; i < len(obsList); i++ {
-			a := obsList[i]
-			for j := i + 1; j < len(obsList); j++ {
-				b := obsList[j]
-				if b.SubjectCreatedAt.Sub(a.SubjectCreatedAt) > DefaultSoftEdgeTTL {
+		obsByTime := make([]GraphEdge, len(obsList))
+		copy(obsByTime, obsList)
+		sort.Slice(obsByTime, func(i, j int) bool {
+			ti, tj := edgeObservedAt(obsByTime[i]), edgeObservedAt(obsByTime[j])
+			if !ti.Equal(tj) {
+				return ti.Before(tj)
+			}
+			return obsByTime[i].SubjectID < obsByTime[j].SubjectID
+		})
+		for i := 0; i < len(obsByTime); i++ {
+			a := obsByTime[i]
+			for j := i + 1; j < len(obsByTime); j++ {
+				b := obsByTime[j]
+				if edgeObservedAt(b).Sub(edgeObservedAt(a)) > DefaultSoftEdgeTTL {
 					break
 				}
 				if a.SubjectID != b.SubjectID && shouldMergeStatelessOrSpoofed(slice, a, b) {
@@ -771,13 +1125,27 @@ func EvaluateSubjectComponent(edges []GraphEdge, targetSubjectID string, minConf
 	targetRoot := find(targetSubjectID)
 	var members []string
 	sliceSet := make(map[string]struct{})
-	componentSpoofed := false
+	componentSpoofedActive := false
+	componentSpoofedCooldown := false
+	var compLatestSpoofAt time.Time
+	compMinCleanStreak := 0
 
 	for sid := range parent {
 		if find(sid) == targetRoot {
 			members = append(members, sid)
-			if spoofed[sid] {
-				componentSpoofed = true
+			if spoofedActive[sid] {
+				componentSpoofedActive = true
+				if latestSpoofedAt[sid].After(compLatestSpoofAt) {
+					compLatestSpoofAt = latestSpoofedAt[sid]
+				}
+			} else if spoofedCooldown[sid] {
+				componentSpoofedCooldown = true
+				if latestSpoofedAt[sid].After(compLatestSpoofAt) {
+					compLatestSpoofAt = latestSpoofedAt[sid]
+				}
+				if compMinCleanStreak == 0 || (minCleanStreak[sid] > 0 && minCleanStreak[sid] < compMinCleanStreak) {
+					compMinCleanStreak = minCleanStreak[sid]
+				}
 			}
 			for sl := range subjectSlices[sid] {
 				sliceSet[sl] = struct{}{}
@@ -843,11 +1211,16 @@ func EvaluateSubjectComponent(edges []GraphEdge, targetSubjectID string, minConf
 				activeSharedSlices[targetGPU] = true
 			}
 			cat, desc, w := sliceEvidenceWeight(slice)
+			obsStr := ""
+			if t := edgeObservedAt(targetEdge); !t.IsZero() {
+				obsStr = t.UTC().Format(time.RFC3339)
+			}
 			evidenceChain = append(evidenceChain, RiskEvidence{
 				SliceID:     slice,
 				Category:    cat + "_velocity_burst",
 				Description: desc + " (clean-beacon velocity burst >= 3 accounts; queued for step-up review)",
 				LogOdds:     w,
+				ObservedAt:  obsStr,
 			})
 			logOdds += w
 		}
@@ -859,14 +1232,6 @@ func EvaluateSubjectComponent(edges []GraphEdge, targetSubjectID string, minConf
 		allSlices = append(allSlices, sl)
 		if activeSharedSlices[sl] {
 			sharedSlices = append(sharedSlices, sl)
-			cat, desc, w := sliceEvidenceWeight(sl)
-			evidenceChain = append(evidenceChain, RiskEvidence{
-				SliceID:     sl,
-				Category:    cat,
-				Description: desc,
-				LogOdds:     w,
-			})
-			logOdds += w
 		}
 	}
 	sort.Strings(allSlices)
@@ -874,15 +1239,76 @@ func EvaluateSubjectComponent(edges []GraphEdge, targetSubjectID string, minConf
 	if sharedSlices == nil {
 		sharedSlices = []string{}
 	}
+	for _, sl := range sharedSlices {
+		// Avoid duplicate evidence entry if already added as *_velocity_burst above:
+		alreadyBurst := false
+		for _, ev := range evidenceChain {
+			if ev.SliceID == sl {
+				alreadyBurst = true
+				break
+			}
+		}
+		if alreadyBurst {
+			continue
+		}
+		cat, desc, w := sliceEvidenceWeight(sl)
+		obsStr := ""
+		if te, ok := subjectEdgeBySlice[targetSubjectID][sl]; ok {
+			if t := edgeObservedAt(te); !t.IsZero() {
+				obsStr = t.UTC().Format(time.RFC3339)
+			}
+		}
+		evidenceChain = append(evidenceChain, RiskEvidence{
+			SliceID:     sl,
+			Category:    cat,
+			Description: desc,
+			LogOdds:     w,
+			ObservedAt:  obsStr,
+		})
+		logOdds += w
+	}
 
-	if componentSpoofed {
+	compSpoofTimeStr := ""
+	if !compLatestSpoofAt.IsZero() {
+		compSpoofTimeStr = compLatestSpoofAt.UTC().Format(time.RFC3339)
+	}
+	if componentSpoofedActive {
 		evidenceChain = append(evidenceChain, RiskEvidence{
 			SliceID:     "spoof_trap",
 			Category:    "active_tampering_detected",
-			Description: "Active client tampering, cross-thread Worker mismatch, raw noise injection, or device-key TOFU violation",
+			Description: "Active client tampering, cross-thread Worker mismatch, or raw noise injection on current observation",
 			LogOdds:     5.5,
+			ObservedAt:  compSpoofTimeStr,
+			Historical:  false,
 		})
 		logOdds += 5.5
+	} else if componentSpoofedCooldown {
+		evidenceChain = append(evidenceChain, RiskEvidence{
+			SliceID:  "spoof_trap",
+			Category: "historical_tampering_cooldown",
+			Description: fmt.Sprintf(
+				"Prior tampering signal cooling down (%d/%d subsequent clean observations before full recovery)",
+				compMinCleanStreak, DefaultCleanObservationsToClearSpoof,
+			),
+			LogOdds:    2.0,
+			ObservedAt: compSpoofTimeStr,
+			Historical: true,
+		})
+		logOdds += 2.0
+	} else if historicalDecayed[targetSubjectID] {
+		decayedTimeStr := ""
+		if !latestSpoofedAt[targetSubjectID].IsZero() {
+			decayedTimeStr = latestSpoofedAt[targetSubjectID].UTC().Format(time.RFC3339)
+		}
+		evidenceChain = append(evidenceChain, RiskEvidence{
+			SliceID:     "spoof_trap",
+			Category:    "historical_tampering_decayed",
+			Description: "Historical tampering signal decayed from active block; retained as residual risk factor",
+			LogOdds:     HistoricalSpoofLogOdds,
+			ObservedAt:  decayedTimeStr,
+			Historical:  true,
+		})
+		logOdds += HistoricalSpoofLogOdds
 	}
 
 	earliest := members[0]
@@ -908,7 +1334,7 @@ func EvaluateSubjectComponent(edges []GraphEdge, targetSubjectID string, minConf
 	}
 
 	if len(members) > 1 {
-		if spoofed[targetSubjectID] {
+		if spoofedActive[targetSubjectID] {
 			status = RiskStatusRed
 		} else if targetHasBeacon && !sharesHardWithMember {
 			// P0 Fix (DeepSeek v0.5 Review): A clean user with its own distinct beacon who was
@@ -916,16 +1342,24 @@ func EvaluateSubjectComponent(edges []GraphEdge, targetSubjectID string, minConf
 			// due to a spoofed neighbor is capped at yellow + RiskPending=true (never red).
 			status = RiskStatusYellow
 			riskPending = true
-		} else if componentSpoofed {
+		} else if componentSpoofedActive {
 			status = RiskStatusRed
 		} else if targetSubjectID == earliest {
 			status = RiskStatusYellow
+			if componentSpoofedCooldown {
+				riskPending = true
+			}
 		} else {
 			status = RiskStatusRed
 		}
-	} else if componentSpoofed {
-		// Single account with active spoofing/tampering trap triggered
+	} else if componentSpoofedActive {
+		// Single account with active spoofing/tampering trap triggered on current observation
 		status = RiskStatusRed
+	} else if componentSpoofedCooldown {
+		// Single account recovering from a prior tampering observation via clean visits:
+		// Downgraded from red -> yellow + RiskPending=true until 3 clean visits or 24h TTL expiry.
+		status = RiskStatusYellow
+		riskPending = true
 	} else if burstSuspicion {
 		// Clean-beacon velocity burst on shared hardware/network slice:
 		// Elevate to yellow + RiskPending=true for step-up verification; NEVER mark red!

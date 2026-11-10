@@ -32,6 +32,8 @@ const (
 	ErrCodeShaderPixelMismatch   = "SHADER_SPOT_PIXEL_MATH_MISMATCH"
 	ErrCodeGPURegisterViolation  = "GPU_REGISTER_LAW_VIOLATION"
 	ErrCodeIncompleteHardwareSig = "INCOMPLETE_HARDWARE_SIGNALS"
+	ErrCodeRebindForbidden       = "REBIND_FORBIDDEN"
+	ErrCodeRebindInvalidKeyProof = "REBIND_INVALID_KEY_PROOF"
 )
 
 // AEADKeyDomainPrefix is the canonical salt prefix used to derive the 256-bit AES-GCM key
@@ -135,6 +137,7 @@ type SystemProbeData struct {
 // and prototype tampering indicators.
 type LieProbeData struct {
 	WorkerUnavailable       bool     `json:"worker_unavailable"`
+	WorkerWebGLAvailable    *bool    `json:"worker_webgl_available,omitempty"`
 	WorkerLieDetected       bool     `json:"worker_lie_detected"`
 	WorkerGPURenderer       string   `json:"worker_gpu_renderer,omitempty"`
 	WorkerStaticWebGLFpHash string   `json:"worker_static_webgl_fp_hash,omitempty"`
@@ -167,10 +170,11 @@ type NativeHardwareAnchor struct {
 
 // VerifyResult contains the verified orthogonal spectral slice IDs and forensic flags.
 type VerifyResult struct {
-	Accepted                  bool          `json:"accepted"`
-	Confidence                float64       `json:"confidence"`
-	DeviceKeySliceID          string        `json:"device_key_slice_id,omitempty"`
-	DeviceKeyBound            bool          `json:"device_key_bound,omitempty"`
+	Accepted         bool    `json:"accepted"`
+	Confidence       float64 `json:"confidence"`
+	DeviceKeySliceID string  `json:"device_key_slice_id,omitempty"`
+	DeviceKeyBound   bool    `json:"device_key_bound,omitempty"`
+	// Deprecated: legacy JSON alias mirroring DeviceKeyBound; proves ECDSA P-256 key possession, not hardware silicon attestation.
 	DeviceKeyAttested         bool          `json:"device_key_attested,omitempty"`
 	DeviceKeyRecoveryRequired bool          `json:"device_key_recovery_required,omitempty"`
 	RiskPending               bool          `json:"risk_pending,omitempty"`
@@ -218,10 +222,50 @@ type ChallengeStore interface {
 }
 
 // DeviceKeyBindingStore is an optional extension of ChallengeStore that enforces
-// Trust-On-First-Use (TOFU) binding between a storage beacon (d_bcn_*) and an attested
-// ECDSA P-256 public key (d_key_*), preventing stolen beacon replay from headless scripts.
+// Trust-On-First-Use (TOFU) binding between a storage beacon (d_bcn_*) and an ECDSA P-256
+// public key (d_key_*), preventing stolen beacon replay from headless scripts.
 type DeviceKeyBindingStore interface {
 	CheckOrBindBeaconDeviceKey(ctx context.Context, beaconSliceID, deviceKeySliceID string) (bool, error)
+}
+
+// DeviceKeyRebindStore is an optional extension of DeviceKeyBindingStore that supports
+// audited step-up-authenticated rebinding or clearing of a beacon's ECDSA P-256 device key
+// after legitimate IndexedDB loss or profile migration (DeepSeek v1.0 P2 #4).
+type DeviceKeyRebindStore interface {
+	RebindBeaconDeviceKey(ctx context.Context, beaconSliceID, newDeviceKeySliceID string) (previousDeviceKeySliceID string, err error)
+	ClearBeaconDeviceKey(ctx context.Context, beaconSliceID string) (previousDeviceKeySliceID string, err error)
+}
+
+// KeyRebindRequest carries a challenge-bound ECDSA P-256 proof-of-possession for rebinding
+// a subject's exclusively owned storage beacon to a replacement device key after step-up auth.
+type KeyRebindRequest struct {
+	ChallengeNonce string          `json:"challenge_nonce"`
+	SubjectID      string          `json:"subject_id,omitempty"`
+	BeaconID       string          `json:"beacon_id"`
+	DeviceKey      *DeviceKeyProof `json:"device_key"`
+	StepUpToken    string          `json:"step_up_token,omitempty"`
+}
+
+// KeyRebindResult is the sanitized response returned on successful device-key rebinding.
+// Previous device-key slice IDs are intentionally omitted to prevent cross-account oracle leaks.
+type KeyRebindResult struct {
+	AuditID          string `json:"audit_id"`
+	SubjectID        string `json:"subject_id"`
+	BeaconSliceID    string `json:"beacon_slice_id"`
+	DeviceKeySliceID string `json:"device_key_slice_id"`
+	Rebound          bool   `json:"rebound"`
+}
+
+// KeyRebindAuditEvent is a structured security audit record emitted for every allowed or denied rebind attempt.
+type KeyRebindAuditEvent struct {
+	AuditID             string    `json:"audit_id"`
+	Timestamp           time.Time `json:"timestamp"`
+	SubjectID           string    `json:"subject_id"`
+	BeaconSliceID       string    `json:"beacon_slice_id,omitempty"`
+	NewDeviceKeySliceID string    `json:"new_device_key_slice_id,omitempty"`
+	PreviousKeyPresent  bool      `json:"previous_key_present"`
+	ClientIP            string    `json:"client_ip,omitempty"`
+	Outcome             string    `json:"outcome"`
 }
 
 // Config configures the PrismID Verifier engine.
@@ -233,13 +277,16 @@ type Config struct {
 	SubnetWindow             time.Duration
 	RejectOnGPULawViolation  bool
 	NowFunc                  func() time.Time
+	OnKeyRebindAudit         func(KeyRebindAuditEvent)
 }
 
 // Verifier implements the PrismID Challenge-Response, AEAD opening, consistency checks,
 // and orthogonal spectral slice derivation engine.
 type Verifier struct {
-	cfg   Config
-	store ChallengeStore
+	cfg          Config
+	store        ChallengeStore
+	auditMu      sync.Mutex
+	rebindAudits []KeyRebindAuditEvent
 }
 
 // NewVerifier creates a new PrismID Verifier with safe defaults.
@@ -423,19 +470,30 @@ func (v *Verifier) VerifyAndDerive(ctx context.Context, req IdentifyRequest, cli
 			effectiveTimezone = wTZ
 			spoofFlags = appendUniqueFlag(spoofFlags, "worker_timezone_mismatch")
 		}
-		// Server-side telemetry (DeepSeek v0.5 P2): if optional worker_* fields are all omitted while
-		// WorkerUnavailable=false, record "worker_telemetry_missing" in PrivacySignals without
-		// falsely marking minimal/legacy payloads as active spoofing (spoofTrapTriggered=false).
-		// However, if a client provides partial worker_* fields while selectively blanking out
-		// WorkerStaticWebGLFpHash or WorkerUserAgent, flag selective stripping!
+		// Server-side telemetry (DeepSeek v0.5 P2 & v1.0 P1 #2):
+		//   - If optional worker_* fields are all omitted while WorkerUnavailable=false, record
+		//     "worker_telemetry_missing" in PrivacySignals without marking active spoofing.
+		//   - If WorkerGlobalScope runs normally (UA/Platform/Cores present) while OffscreenCanvas
+		//     WebGL context creation is unavailable (e.g. Safari < 17 or GPU blocklist), wHash is
+		//     legitimately empty; record non-penalizing "worker_webgl_unavailable" unless the client
+		//     explicitly asserts WorkerWebGLAvailable=true while stripping the hash.
 		allWorkerEmpty := wHash == "" && wRenderer == "" && wPlat == "" && wUA == "" && payload.Lies.WorkerCPUCores == 0
 		if payload.NativeAnchor == nil {
 			if allWorkerEmpty {
 				privacySignals = appendUniqueFlag(privacySignals, "worker_telemetry_missing")
-			} else if (wHash == "" && (payload.WebGL.WebGLAvailable == nil || *payload.WebGL.WebGLAvailable)) ||
-				(wUA == "" && strings.TrimSpace(payload.System.UserAgent) != "") {
-				workerLie = true
-				spoofFlags = appendUniqueFlag(spoofFlags, "worker_partial_telemetry_stripped")
+			} else {
+				if wUA == "" && strings.TrimSpace(payload.System.UserAgent) != "" {
+					workerLie = true
+					spoofFlags = appendUniqueFlag(spoofFlags, "worker_partial_telemetry_stripped")
+				}
+				if wHash == "" && (payload.WebGL.WebGLAvailable == nil || *payload.WebGL.WebGLAvailable) {
+					if payload.Lies.WorkerWebGLAvailable != nil && *payload.Lies.WorkerWebGLAvailable {
+						workerLie = true
+						spoofFlags = appendUniqueFlag(spoofFlags, "worker_partial_telemetry_stripped")
+					} else {
+						privacySignals = appendUniqueFlag(privacySignals, "worker_webgl_unavailable")
+					}
+				}
 			}
 		}
 		if workerLie {
@@ -444,9 +502,9 @@ func (v *Verifier) VerifyAndDerive(ctx context.Context, req IdentifyRequest, cli
 		}
 	}
 
-	// Server-side raw measurement inference for Canvas 2D (DeepSeek #2):
-	// Even if a silent attacker sets payload.Lies.CanvasNoiseInjected=false, the server
-	// independently verifies raw control-pixel RGBA values and dual-readback delta.
+	// Server-side consistency checks on client-reported Canvas 2D telemetry:
+	// Raises the bar against unmodified SDK + browser extensions or naive boolean flipping,
+	// though a fully custom client can synthesize consistent control values (see Threat Model).
 	canvasNoiseInferred := payload.Lies.CanvasNoiseInjected || payload.System.CanvasReadbackDelta != 0
 	if len(payload.System.CanvasControlRGBA) > 0 {
 		c := payload.System.CanvasControlRGBA
@@ -466,9 +524,8 @@ func (v *Verifier) VerifyAndDerive(ctx context.Context, req IdentifyRequest, cli
 		spoofTrapTriggered = true
 	}
 
-	// Server-side raw measurement inference for WebAudio (DeepSeek #2):
-	// Even if a silent attacker sets payload.Lies.AudioNoiseInjected=false, the server
-	// independently compares raw getChannelData vs copyFromChannel hashes and silent-tail delta.
+	// Server-side consistency checks on client-reported WebAudio telemetry:
+	// Compares getChannelData vs copyFromChannel hashes and silent-tail delta to catch audio farbling extensions.
 	audioNoiseInferred := payload.Lies.AudioNoiseInjected || payload.AudioSilentDelta != 0
 	if copyHash := strings.TrimSpace(payload.AudioCopyHash); copyHash != "" &&
 		!strings.EqualFold(copyHash, strings.TrimSpace(payload.AudioCompressorHash)) {
@@ -732,6 +789,33 @@ func (v *Verifier) VerifyAndDerive(ctx context.Context, req IdentifyRequest, cli
 // It accepts uncompressed SEC1 P-256 public keys (65 bytes: 0x04 || X[32] || Y[32]) and either
 // IEEE P1363 64-byte (r || s) signatures (WebCrypto standard) or ASN.1 DER signatures.
 func VerifyECDSAP256DeviceKey(proof *DeviceKeyProof, nonce, beaconID, staticWebGLHash, audioHash string) (bool, string) {
+	transcript := strings.Join([]string{
+		"prismid-v2-sig",
+		strings.TrimSpace(nonce),
+		strings.ToLower(strings.TrimSpace(beaconID)),
+		strings.ToLower(strings.TrimSpace(staticWebGLHash)),
+		strings.ToLower(strings.TrimSpace(audioHash)),
+	}, "|")
+	return verifyECDSAP256Transcript(proof, transcript)
+}
+
+// VerifyECDSAP256RebindProof verifies a domain-separated ECDSA P-256 proof-of-possession signature
+// over "prismid-v2-rebind|<nonce>|<subject_id>|<beacon_id>" so a caller cannot rebind a beacon
+// without holding the corresponding replacement private key.
+func VerifyECDSAP256RebindProof(proof *DeviceKeyProof, nonce, subjectID, beaconID string) (bool, string) {
+	if strings.TrimSpace(nonce) == "" || strings.TrimSpace(subjectID) == "" || strings.TrimSpace(beaconID) == "" {
+		return false, ""
+	}
+	transcript := strings.Join([]string{
+		"prismid-v2-rebind",
+		strings.TrimSpace(nonce),
+		strings.TrimSpace(subjectID),
+		strings.ToLower(strings.TrimSpace(beaconID)),
+	}, "|")
+	return verifyECDSAP256Transcript(proof, transcript)
+}
+
+func verifyECDSAP256Transcript(proof *DeviceKeyProof, transcript string) (bool, string) {
 	if proof == nil {
 		return false, ""
 	}
@@ -756,15 +840,7 @@ func VerifyECDSAP256DeviceKey(proof *DeviceKeyProof, nonce, beaconID, staticWebG
 		return false, ""
 	}
 
-	transcript := strings.Join([]string{
-		"prismid-v2-sig",
-		strings.TrimSpace(nonce),
-		strings.ToLower(strings.TrimSpace(beaconID)),
-		strings.ToLower(strings.TrimSpace(staticWebGLHash)),
-		strings.ToLower(strings.TrimSpace(audioHash)),
-	}, "|")
 	digest := sha256.Sum256([]byte(transcript))
-
 	valid := false
 	if len(sigRaw) == 64 {
 		r := new(big.Int).SetBytes(sigRaw[:32])
@@ -1137,9 +1213,224 @@ func (m *MemoryChallengeStore) CheckOrBindBeaconDeviceKey(_ context.Context, bea
 		}
 		return true, nil
 	}
-	// Beacon was previously bound to an attested ECDSA P-256 key:
+	// Beacon was previously bound to an ECDSA P-256 key:
 	if deviceKeySliceID == "" || deviceKeySliceID != boundKey {
 		return false, nil
 	}
 	return true, nil
+}
+
+// RebindBeaconDeviceKey atomically replaces the ECDSA P-256 device key slice bound to beaconSliceID
+// after an application-level step-up authentication (e.g. passkey, OTP, or email magic link).
+func (m *MemoryChallengeStore) RebindBeaconDeviceKey(_ context.Context, beaconSliceID, newDeviceKeySliceID string) (string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if beaconSliceID == "" || newDeviceKeySliceID == "" {
+		return "", errors.New("beacon_slice_id and new_device_key_slice_id are required")
+	}
+	prev := m.beaconToKey[beaconSliceID]
+	if _, exists := m.beaconToKey[beaconSliceID]; !exists && len(m.beaconToKey) >= 32768 {
+		for k := range m.beaconToKey {
+			delete(m.beaconToKey, k)
+			break
+		}
+	}
+	m.beaconToKey[beaconSliceID] = newDeviceKeySliceID
+	return prev, nil
+}
+
+// ClearBeaconDeviceKey removes any existing TOFU device-key binding for beaconSliceID so that the
+// user's next clean verification with a newly generated IndexedDB key re-binds via TOFU.
+func (m *MemoryChallengeStore) ClearBeaconDeviceKey(_ context.Context, beaconSliceID string) (string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if beaconSliceID == "" {
+		return "", errors.New("beacon_slice_id is required")
+	}
+	prev := m.beaconToKey[beaconSliceID]
+	delete(m.beaconToKey, beaconSliceID)
+	return prev, nil
+}
+
+func (v *Verifier) normalizeBeaconSliceInput(beaconOrSlice string) (string, error) {
+	trimmed := strings.TrimSpace(beaconOrSlice)
+	if strings.HasPrefix(trimmed, "d_bcn_") && len(trimmed) > len("d_bcn_") {
+		return trimmed, nil
+	}
+	if low := strings.ToLower(trimmed); isValidHexBeacon(low) {
+		return "d_bcn_" + v.hmacHex32("bcn|"+low), nil
+	}
+	return "", errors.New("invalid beacon identifier: expected d_bcn_* slice ID or 32-char hex beacon_id")
+}
+
+// RebindDeviceKey updates the TOFU binding for a storage beacon to a new d_key_* slice ID
+// following out-of-band step-up authentication (DeepSeek v1.0 P2 #4).
+func (v *Verifier) RebindDeviceKey(ctx context.Context, beaconOrSlice, newDeviceKeySliceID string) (string, error) {
+	bcnSlice, err := v.normalizeBeaconSliceInput(beaconOrSlice)
+	if err != nil {
+		return "", err
+	}
+	keySlice := strings.TrimSpace(newDeviceKeySliceID)
+	if !strings.HasPrefix(keySlice, "d_key_") || len(keySlice) <= len("d_key_") {
+		return "", errors.New("invalid new_device_key_slice_id: expected d_key_* slice ID")
+	}
+	rs, ok := v.store.(DeviceKeyRebindStore)
+	if !ok {
+		return "", errors.New("configured ChallengeStore does not implement DeviceKeyRebindStore")
+	}
+	return rs.RebindBeaconDeviceKey(ctx, bcnSlice, keySlice)
+}
+
+// ClearDeviceKeyBinding clears the TOFU device-key binding for a storage beacon so the next
+// verification presenting a valid ECDSA P-256 signature establishes a fresh binding.
+func (v *Verifier) ClearDeviceKeyBinding(ctx context.Context, beaconOrSlice string) (string, error) {
+	bcnSlice, err := v.normalizeBeaconSliceInput(beaconOrSlice)
+	if err != nil {
+		return "", err
+	}
+	rs, ok := v.store.(DeviceKeyRebindStore)
+	if !ok {
+		return "", errors.New("configured ChallengeStore does not implement DeviceKeyRebindStore")
+	}
+	return rs.ClearBeaconDeviceKey(ctx, bcnSlice)
+}
+
+func (v *Verifier) appendRebindAudit(ev KeyRebindAuditEvent) KeyRebindAuditEvent {
+	var idBytes [8]byte
+	_, _ = rand.Read(idBytes[:])
+	ev.AuditID = "aud_" + hex.EncodeToString(idBytes[:])
+	ev.Timestamp = v.cfg.NowFunc().UTC()
+
+	v.auditMu.Lock()
+	if len(v.rebindAudits) >= 4096 {
+		copy(v.rebindAudits, v.rebindAudits[1:])
+		v.rebindAudits[len(v.rebindAudits)-1] = ev
+	} else {
+		v.rebindAudits = append(v.rebindAudits, ev)
+	}
+	v.auditMu.Unlock()
+
+	if v.cfg.OnKeyRebindAudit != nil {
+		v.cfg.OnKeyRebindAudit(ev)
+	}
+	return ev
+}
+
+// RecordDeniedRebindAudit records a failed/forbidden key-rebind attempt in the verifier's audit log.
+func (v *Verifier) RecordDeniedRebindAudit(subjectID, beaconSliceID, clientIP, outcome string) KeyRebindAuditEvent {
+	return v.appendRebindAudit(KeyRebindAuditEvent{
+		SubjectID:     strings.TrimSpace(subjectID),
+		BeaconSliceID: strings.TrimSpace(beaconSliceID),
+		ClientIP:      strings.TrimSpace(clientIP),
+		Outcome:       outcome,
+	})
+}
+
+// RebindAuditEvents returns a snapshot copy of recorded key-rebind audit events.
+func (v *Verifier) RebindAuditEvents() []KeyRebindAuditEvent {
+	v.auditMu.Lock()
+	defer v.auditMu.Unlock()
+	out := make([]KeyRebindAuditEvent, len(v.rebindAudits))
+	copy(out, v.rebindAudits)
+	return out
+}
+
+// DeriveBeaconSliceID computes the canonical HMAC-SHA256 d_bcn_* slice ID from a raw 32-char hex beacon_id.
+func (v *Verifier) DeriveBeaconSliceID(beaconID string) (string, error) {
+	low := strings.ToLower(strings.TrimSpace(beaconID))
+	if !isValidHexBeacon(low) {
+		return "", errors.New("invalid beacon_id: expected 32-character hex string")
+	}
+	return "d_bcn_" + v.hmacHex32("bcn|"+low), nil
+}
+
+// RebindDeviceKeyWithProof executes an audited, ownership-verified, challenge-signed TOFU key rebind:
+//  1. Verifies raw 32-hex beacon_id and checks exclusive ownership via ownerCheck BEFORE consuming any nonce.
+//  2. Atomically consumes the single-use challenge_nonce.
+//  3. Verifies the replacement ECDSA P-256 private key's signature over "prismid-v2-rebind|<nonce>|<subject_id>|<beacon_id>".
+//  4. Server-side derives d_key_* and updates the beacon's TOFU binding without exposing previous key slices.
+func (v *Verifier) RebindDeviceKeyWithProof(
+	ctx context.Context,
+	req KeyRebindRequest,
+	ownerCheck func(subjectID, beaconSliceID string) bool,
+	clientIP string,
+) (*KeyRebindResult, error) {
+	subjectID := strings.TrimSpace(req.SubjectID)
+	if subjectID == "" {
+		v.RecordDeniedRebindAudit("", "", clientIP, "denied_missing_subject")
+		return nil, &VerificationError{Code: ErrCodeRebindForbidden, Detail: "subject_id is required"}
+	}
+	bcnLow := strings.ToLower(strings.TrimSpace(req.BeaconID))
+	if !isValidHexBeacon(bcnLow) {
+		v.RecordDeniedRebindAudit(subjectID, "", clientIP, "denied_invalid_beacon")
+		return nil, &VerificationError{Code: ErrCodeRebindInvalidKeyProof, Detail: "beacon_id must be a 32-character hex string"}
+	}
+	beaconSliceID := "d_bcn_" + v.hmacHex32("bcn|"+bcnLow)
+
+	if ownerCheck != nil && !ownerCheck(subjectID, beaconSliceID) {
+		v.RecordDeniedRebindAudit(subjectID, beaconSliceID, clientIP, "denied_not_owner")
+		return nil, &VerificationError{Code: ErrCodeRebindForbidden, Detail: "beacon is not exclusively owned by authenticated subject"}
+	}
+
+	nonce := strings.TrimSpace(req.ChallengeNonce)
+	if nonce == "" {
+		v.RecordDeniedRebindAudit(subjectID, beaconSliceID, clientIP, "denied_invalid_nonce")
+		return nil, &VerificationError{Code: ErrCodeChallengeInvalid, Detail: "challenge_nonce is required"}
+	}
+	ch, err := v.store.ConsumeChallenge(ctx, nonce)
+	if err != nil || ch == nil || v.cfg.NowFunc().UnixMilli() > ch.ExpiresAt {
+		v.RecordDeniedRebindAudit(subjectID, beaconSliceID, clientIP, "denied_invalid_nonce")
+		return nil, &VerificationError{Code: ErrCodeChallengeInvalid, Detail: "challenge_nonce invalid, expired, or already replayed"}
+	}
+
+	okSig, pubKeyHex := VerifyECDSAP256RebindProof(req.DeviceKey, nonce, subjectID, bcnLow)
+	if !okSig || pubKeyHex == "" {
+		v.RecordDeniedRebindAudit(subjectID, beaconSliceID, clientIP, "denied_invalid_pop")
+		return nil, &VerificationError{Code: ErrCodeRebindInvalidKeyProof, Detail: "invalid ECDSA P-256 proof-of-possession over rebind transcript"}
+	}
+
+	newKeySliceID := "d_key_" + v.hmacHex32("key|"+pubKeyHex)
+	rs, ok := v.store.(DeviceKeyRebindStore)
+	if !ok {
+		return nil, errors.New("configured ChallengeStore does not implement DeviceKeyRebindStore")
+	}
+	prevKey, err := rs.RebindBeaconDeviceKey(ctx, beaconSliceID, newKeySliceID)
+	if err != nil {
+		return nil, err
+	}
+
+	aud := v.appendRebindAudit(KeyRebindAuditEvent{
+		SubjectID:           subjectID,
+		BeaconSliceID:       beaconSliceID,
+		NewDeviceKeySliceID: newKeySliceID,
+		PreviousKeyPresent:  prevKey != "",
+		ClientIP:            strings.TrimSpace(clientIP),
+		Outcome:             "rebound",
+	})
+	return &KeyRebindResult{
+		AuditID:          aud.AuditID,
+		SubjectID:        subjectID,
+		BeaconSliceID:    beaconSliceID,
+		DeviceKeySliceID: newKeySliceID,
+		Rebound:          true,
+	}, nil
+}
+
+// ForgetBeacons clears stored TOFU device-key bindings for the given d_bcn_* slices
+// to support complete GDPR/CCPA subject erasure alongside RiskGraph.RemoveSubjectAndCollectBeacons.
+func (v *Verifier) ForgetBeacons(ctx context.Context, beaconSliceIDs ...string) int {
+	rs, ok := v.store.(DeviceKeyRebindStore)
+	if !ok {
+		return 0
+	}
+	purged := 0
+	for _, bcn := range beaconSliceIDs {
+		bcn = strings.TrimSpace(bcn)
+		if strings.HasPrefix(bcn, "d_bcn_") {
+			if prev, err := rs.ClearBeaconDeviceKey(ctx, bcn); err == nil && prev != "" {
+				purged++
+			}
+		}
+	}
+	return purged
 }

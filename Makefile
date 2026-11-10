@@ -5,7 +5,7 @@ all: test build
 test: test-go test-rust test-web
 
 test-go:
-	cd server/go && go test -v ./...
+	cd server/go && go test -v -race ./...
 
 bench:
 	cd server/go && go run ./cmd/prismid-bench

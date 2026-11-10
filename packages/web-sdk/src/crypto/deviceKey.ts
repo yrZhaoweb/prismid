@@ -159,6 +159,54 @@ export function buildDeviceKeyTranscript(params: {
   ].join('|')
 }
 
+export function buildRebindKeyTranscript(params: {
+  nonce: string
+  subjectId: string
+  beaconId: string
+}): string {
+  return [
+    'prismid-v2-rebind',
+    params.nonce.trim(),
+    params.subjectId.trim(),
+    params.beaconId.trim().toLowerCase(),
+  ].join('|')
+}
+
+export async function signRebindWithDeviceKey(params: {
+  nonce: string
+  subjectId: string
+  beaconId: string
+}): Promise<DeviceKeyProof | undefined> {
+  const subtle = getSubtleCrypto()
+  if (!subtle) {
+    return undefined
+  }
+  const rec = await getOrCreateDeviceKeyRecord()
+  if (!rec) {
+    return undefined
+  }
+  try {
+    const transcript = buildRebindKeyTranscript(params)
+    const msgBytes = new TextEncoder().encode(transcript)
+    const sigBuf = await subtle.sign(
+      { name: 'ECDSA', hash: { name: 'SHA-256' } },
+      rec.privateKey,
+      msgBytes
+    )
+    const sigHex = bytesToHex(new Uint8Array(sigBuf))
+    if (sigHex.length !== 128) {
+      return undefined
+    }
+    return {
+      alg: 'ecdsa-p256',
+      pub_key: rec.pubKeyHex,
+      signature: sigHex,
+    }
+  } catch {
+    return undefined
+  }
+}
+
 export async function signChallengeWithDeviceKey(params: {
   nonce: string
   beaconId: string

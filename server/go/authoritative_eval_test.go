@@ -121,6 +121,7 @@ func selectZipfHardware(idx int) zipfHardwareModel {
 
 func buildZipfPayload(ch *Challenge, hw zipfHardwareModel, beaconID string, fontVariant int) ProbePayload {
 	p := buildValidPayload(ch)
+	workerGLOK := true
 	p.BeaconID = beaconID
 	p.WebGL.GPUVendor = hw.vendor
 	p.WebGL.GPURenderer = hw.renderer
@@ -134,6 +135,7 @@ func buildZipfPayload(ch *Challenge, hw zipfHardwareModel, beaconID string, font
 	p.System.ScreenSpec = hw.screen
 	p.System.FontsBitmapHash = fmt.Sprintf("font_subset_%s_%d", hw.platform, fontVariant)
 	p.System.CanvasControlRGBA = []int{0, 0, 0, 0, 17, 136, 221, 255}
+	p.Lies.WorkerWebGLAvailable = &workerGLOK
 	p.Lies.WorkerGPURenderer = hw.renderer
 	p.Lies.WorkerStaticWebGLFpHash = hw.staticGLHash
 	p.Lies.WorkerCPUCores = hw.cpuCores
@@ -143,13 +145,16 @@ func buildZipfPayload(ch *Challenge, hw zipfHardwareModel, beaconID string, font
 	return p
 }
 
-// TestAuthoritativeEvaluation_AmIUniqueZipfAndFPScannerMatrix executes an independent,
-// academic-grade evaluation following:
+// TestSyntheticZipfPopulationAndAdversarialRuleMatrix executes a synthetic rule-regression
+// evaluation modeled after:
 //   - Laperdrix et al. "AmIUnique" (IEEE S&P) Zipfian hardware market-share distribution
 //     where top laptop/PC models collide heavily across cities, office Wi-Fi, and CGNAT.
 //   - Vastel et al. "FP-Scanner / FP-Stalker" (IEEE S&P / USENIX Security) adversarial
-//     tampering taxonomy + out-of-scope boundary quantification.
-func TestAuthoritativeEvaluation_AmIUniqueZipfAndFPScannerMatrix(t *testing.T) {
+//     tampering taxonomy + honest boundary & recovery quantification.
+//
+// Note: These 2,050 vectors are synthetic protocol payloads testing server-side inference
+// and graph invariants; real Chromium + third-party stealth/Apify E2E tests live in packages/web-sdk/test/.
+func TestSyntheticZipfPopulationAndAdversarialRuleMatrix(t *testing.T) {
 	ctx := context.Background()
 	v := NewVerifier(Config{
 		HMACSecret:               []byte("authoritative-eval-secret-key-32b"),
@@ -160,14 +165,12 @@ func TestAuthoritativeEvaluation_AmIUniqueZipfAndFPScannerMatrix(t *testing.T) {
 	graph := NewRiskGraph(AuthoritativeConfidenceThreshold)
 	t0 := time.Date(2026, 11, 11, 0, 0, 0, 0, time.UTC)
 
-	sharedKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatalf("GenerateKey: %v", err)
-	}
-	pubBytes := elliptic.Marshal(elliptic.P256(), sharedKey.PublicKey.X, sharedKey.PublicKey.Y)
-	pubB64 := base64.RawURLEncoding.EncodeToString(pubBytes)
-
-	signWithKey := func(p *ProbePayload) {
+	signWithFreshKey := func(p *ProbePayload) {
+		k, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		if err != nil {
+			t.Fatalf("GenerateKey: %v", err)
+		}
+		kb := elliptic.Marshal(elliptic.P256(), k.PublicKey.X, k.PublicKey.Y)
 		msg := strings.Join([]string{
 			"prismid-v2-sig",
 			p.Nonce,
@@ -176,13 +179,13 @@ func TestAuthoritativeEvaluation_AmIUniqueZipfAndFPScannerMatrix(t *testing.T) {
 			strings.ToLower(p.AudioCompressorHash),
 		}, "|")
 		digest := sha256.Sum256([]byte(msg))
-		r, s, _ := ecdsa.Sign(rand.Reader, sharedKey, digest[:])
+		r, s, _ := ecdsa.Sign(rand.Reader, k, digest[:])
 		var rawSig [64]byte
 		r.FillBytes(rawSig[:32])
 		s.FillBytes(rawSig[32:64])
 		p.DeviceKey = &DeviceKeyProof{
 			Alg:       "ecdsa-p256",
-			PubKey:    pubB64,
+			PubKey:    base64.RawURLEncoding.EncodeToString(kb),
 			Signature: base64.RawURLEncoding.EncodeToString(rawSig[:]),
 		}
 	}
@@ -194,8 +197,9 @@ func TestAuthoritativeEvaluation_AmIUniqueZipfAndFPScannerMatrix(t *testing.T) {
 	benignFalseRed := 0
 	benignStepUpYellow := 0
 
-	// B-Cohort 1 (700 users): Zipfian hardware distribution across cities, including
-	// Masked Worker Renderer ("WebKit WebGL" / "Mozilla") on 100 Safari/Firefox users.
+	// B-Cohort 1 (700 users): Zipfian hardware distribution across cities, including:
+	//   - Masked Worker Renderer ("WebKit WebGL" / "Mozilla") on Safari/Firefox privacy users
+	//   - Safari 16 / GPU-blocklisted Worker where Worker runs but OffscreenCanvas WebGL is unavailable
 	b1FalseRed := 0
 	for i := 0; i < 700; i++ {
 		hw := selectZipfHardware(i)
@@ -206,6 +210,12 @@ func TestAuthoritativeEvaluation_AmIUniqueZipfAndFPScannerMatrix(t *testing.T) {
 		if i%7 == 0 {
 			// Simulate Safari / Firefox privacy mode masking WEBGL_debug_renderer_info in Worker
 			p.Lies.WorkerGPURenderer = "WebKit WebGL"
+		} else if i%11 == 0 {
+			// Simulate Safari 16: Worker runs (UA/Platform/Cores present) while OffscreenCanvas WebGL is unavailable
+			workerGLFalse := false
+			p.Lies.WorkerWebGLAvailable = &workerGLFalse
+			p.Lies.WorkerGPURenderer = ""
+			p.Lies.WorkerStaticWebGLFpHash = ""
 		}
 		res, err := v.VerifyAndDerive(ctx, IdentifyRequest{
 			ChallengeNonce: ch.Nonce,
@@ -297,19 +307,34 @@ func TestAuthoritativeEvaluation_AmIUniqueZipfAndFPScannerMatrix(t *testing.T) {
 		ip := fmt.Sprintf("198.51.%d.90", i+50)
 		bcn := fmt.Sprintf("b450000000000000000000000000%04x", i)
 		uid := fmt.Sprintf("idb_keyloss_user_%d", i)
-		// First visit binds ECDSA key
+		// First visit binds a unique per-device ECDSA P-256 key (must be green with members=1!)
 		ch1, _ := v.IssueChallenge(ctx, ip)
 		p1 := buildZipfPayload(ch1, selectZipfHardware(i), bcn, 5500+i)
-		signWithKey(&p1)
+		signWithFreshKey(&p1)
 		res1, _ := v.VerifyAndDerive(ctx, IdentifyRequest{ChallengeNonce: ch1.Nonce, SealedPayload: sealProbePayload(t, ch1.Nonce, p1)}, ip)
-		graph.RecordVerification(uid, t0.Add(100*time.Hour), res1)
-		// Second visit loses IndexedDB key (e.g. storage pressure / 150ms timeout)
+		snap1 := graph.RecordVerification(uid, t0.Add(100*time.Hour), res1)
+		if snap1.RiskStatus != RiskStatusGreen || len(snap1.ComponentSubjects) != 1 {
+			t.Fatalf("B4 user %d Visit 1 expected green with members=1, got %+v", i, snap1)
+		}
+		// Second visit loses IndexedDB key (e.g. storage pressure / 350ms timeout) -> recovery required, NOT red!
 		ch2, _ := v.IssueChallenge(ctx, ip)
 		p2 := buildZipfPayload(ch2, selectZipfHardware(i), bcn, 5500+i)
 		res2, _ := v.VerifyAndDerive(ctx, IdentifyRequest{ChallengeNonce: ch2.Nonce, SealedPayload: sealProbePayload(t, ch2.Nonce, p2)}, ip)
 		snap2 := graph.RecordVerification(uid, t0.Add(101*time.Hour), res2)
+		if !res2.DeviceKeyRecoveryRequired || snap2.RiskStatus != RiskStatusUnknown || !snap2.RiskPending {
+			t.Fatalf("B4 user %d Visit 2 expected recovery required (unknown+pending), got res=%+v snap=%+v", i, res2, snap2)
+		}
+		// Step-up rebind clears lost key and Visit 3 binds replacement key -> green again!
+		if _, err := v.ClearDeviceKeyBinding(ctx, res1.BeaconSliceID); err != nil {
+			t.Fatalf("B4 ClearDeviceKeyBinding: %v", err)
+		}
+		ch3, _ := v.IssueChallenge(ctx, ip)
+		p3 := buildZipfPayload(ch3, selectZipfHardware(i), bcn, 5500+i)
+		signWithFreshKey(&p3)
+		res3, _ := v.VerifyAndDerive(ctx, IdentifyRequest{ChallengeNonce: ch3.Nonce, SealedPayload: sealProbePayload(t, ch3.Nonce, p3)}, ip)
+		snap3 := graph.RecordVerification(uid, t0.Add(102*time.Hour), res3)
 		benignTotal++
-		if snap2.RiskStatus == RiskStatusRed || res2.SpoofTrapTriggered {
+		if snap2.RiskStatus == RiskStatusRed || res2.SpoofTrapTriggered || snap3.RiskStatus != RiskStatusGreen {
 			b4FalseRed++
 			benignFalseRed++
 		}
@@ -467,9 +492,12 @@ func TestAuthoritativeEvaluation_AmIUniqueZipfAndFPScannerMatrix(t *testing.T) {
 		bcn := fmt.Sprintf("a700000000000000000000000000%04x", i)
 		ch1, _ := v.IssueChallenge(ctx, fmt.Sprintf("101.10.%d.10", i+1))
 		p1 := buildZipfPayload(ch1, hw, bcn, 12000+i)
-		signWithKey(&p1)
+		signWithFreshKey(&p1)
 		res1, _ := v.VerifyAndDerive(ctx, IdentifyRequest{ChallengeNonce: ch1.Nonce, SealedPayload: sealProbePayload(t, ch1.Nonce, p1)}, fmt.Sprintf("101.10.%d.10", i+1))
-		graph.RecordVerification(fmt.Sprintf("a7_victim_%d", i), t0.Add(800*time.Hour), res1)
+		snap1 := graph.RecordVerification(fmt.Sprintf("a7_victim_%d", i), t0.Add(800*time.Hour), res1)
+		if snap1.RiskStatus != RiskStatusGreen {
+			t.Fatalf("A7 victim %d expected green on Visit 1, got %+v", i, snap1)
+		}
 
 		// Attacker replays stolen beacon_id without the victim's non-extractable private key
 		ch2, _ := v.IssueChallenge(ctx, fmt.Sprintf("102.20.%d.99", i+1))
@@ -488,46 +516,40 @@ func TestAuthoritativeEvaluation_AmIUniqueZipfAndFPScannerMatrix(t *testing.T) {
 	// ============================================================================
 
 	// Boundary 1 (50 cases): Single-Account Brave Farbling / CanvasBlocker Privacy Users
-	// Because Brave / CanvasBlocker mutates raw pixel bytes in getImageData, PrismID's raw
-	// control-pixel check flags canvas_noise_injected=true (Red). We measure this explicitly
-	// so integrators know to route single-account noise-only hits to step-up review rather than auto-ban.
+	// Visit 1 with active Canvas noise triggers canvas_noise_injected=true (Red), and disabling
+	// Shields across 3 clean visits fully decays the account back to Green (DeepSeek v1.0 P1 #1).
 	braveSingleFlaggedRed := 0
+	braveSingleRecoveredGreen := 0
 	for i := 0; i < 50; i++ {
 		hw := selectZipfHardware(i)
-		ch, _ := v.IssueChallenge(ctx, fmt.Sprintf("131.10.%d.10", i+1))
-		p := buildZipfPayload(ch, hw, fmt.Sprintf("b900000000000000000000000000%04x", i), 13000+i)
+		ip := fmt.Sprintf("131.10.%d.10", i+1)
+		bcn := fmt.Sprintf("b900000000000000000000000000%04x", i)
+		uid := fmt.Sprintf("brave_single_%d", i)
+		ch, _ := v.IssueChallenge(ctx, ip)
+		p := buildZipfPayload(ch, hw, bcn, 13000+i)
+		p.System.Canvas2DHash = fmt.Sprintf("brave_farbled_canvas_%d", i)
 		p.System.CanvasControlRGBA = []int{0, 0, 1, 0, 17, 136, 221, 255} // Brave 1-LSB farbling in control zone
-		res, _ := v.VerifyAndDerive(ctx, IdentifyRequest{ChallengeNonce: ch.Nonce, SealedPayload: sealProbePayload(t, ch.Nonce, p)}, fmt.Sprintf("131.10.%d.10", i+1))
-		snap := graph.RecordVerification(fmt.Sprintf("brave_single_%d", i), t0.Add(900*time.Hour), res)
+		res, _ := v.VerifyAndDerive(ctx, IdentifyRequest{ChallengeNonce: ch.Nonce, SealedPayload: sealProbePayload(t, ch.Nonce, p)}, ip)
+		snap := graph.RecordVerification(uid, t0.Add(900*time.Hour), res)
 		if snap.RiskStatus == RiskStatusRed {
 			braveSingleFlaggedRed++
+		}
+		// User disables Shields for this site and makes 3 clean visits spaced >= 1h apart -> must decay back to Green!
+		var postCleanSnap ComponentSnapshot
+		for cleanVisit := 1; cleanVisit <= 3; cleanVisit++ {
+			chClean, _ := v.IssueChallenge(ctx, ip)
+			pClean := buildZipfPayload(chClean, hw, bcn, 13000+i)
+			resClean, _ := v.VerifyAndDerive(ctx, IdentifyRequest{ChallengeNonce: chClean.Nonce, SealedPayload: sealProbePayload(t, chClean.Nonce, pClean)}, ip)
+			postCleanSnap = graph.RecordVerification(uid, t0.Add(900*time.Hour+time.Duration(cleanVisit)*65*time.Minute), resClean)
+		}
+		if postCleanSnap.RiskStatus == RiskStatusGreen && !postCleanSnap.RiskPending {
+			braveSingleRecoveredGreen++
 		}
 	}
 
 	// Boundary 2 (50 cases): Out-of-Browser Pure CPU Protocol Synthesis (ComputeAllExpectedSpotPixels)
 	// - First 25 cases: 1st account per synthesized hardware + clean /24 IP + fresh ECDSA keypair -> evade (FNR on 1st account = 100%)
 	// - Next 25 cases: 2nd+ accounts on same /24 subnet within 6h -> caught by velocity burst (Yellow+Pending)
-	signWithFreshKey := func(p *ProbePayload) {
-		k, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-		kb := elliptic.Marshal(elliptic.P256(), k.PublicKey.X, k.PublicKey.Y)
-		msg := strings.Join([]string{
-			"prismid-v2-sig",
-			p.Nonce,
-			strings.ToLower(p.BeaconID),
-			strings.ToLower(p.WebGL.StaticWebGLFpHash),
-			strings.ToLower(p.AudioCompressorHash),
-		}, "|")
-		digest := sha256.Sum256([]byte(msg))
-		r, s, _ := ecdsa.Sign(rand.Reader, k, digest[:])
-		var rawSig [64]byte
-		r.FillBytes(rawSig[:32])
-		s.FillBytes(rawSig[32:64])
-		p.DeviceKey = &DeviceKeyProof{
-			Alg:       "ecdsa-p256",
-			PubKey:    base64.RawURLEncoding.EncodeToString(kb),
-			Signature: base64.RawURLEncoding.EncodeToString(rawSig[:]),
-		}
-	}
 	cpuSynthFirstVisitEvaded := 0
 	cpuSynthBurstCaught := 0
 	for i := 0; i < 25; i++ {
@@ -564,23 +586,23 @@ func TestAuthoritativeEvaluation_AmIUniqueZipfAndFPScannerMatrix(t *testing.T) {
 	}
 
 	t.Logf("================================================================================")
-	t.Logf("AUTHORITATIVE EVALUATION REPORT (AmIUnique Zipf Population + FP-Scanner Matrix)")
+	t.Logf("SYNTHETIC ZIPF POPULATION & ADVERSARIAL RULE REGRESSION REPORT (2,050 Vectors)")
 	t.Logf("================================================================================")
-	t.Logf("[Benign B1] 700 Zipf Multi-City Users (Top-5 GPUs = 85%% share + Masked Worker) : FalseRed=%d/700 (FPR=%.2f%%)", b1FalseRed, float64(b1FalseRed)/7.0)
-	t.Logf("[Benign B2] 150 Same-Office /24 Colleagues (50 pairs + 10x5 bursts)            : FalseRed=%d/150 (FPR=%.2f%%, StepUpYellow=%d/50)", b2FalseRed, float64(b2FalseRed)/1.5, b2StepUp)
-	t.Logf("[Benign B3] 100 High-Density Mobile CGNAT /24 Users (25 per /24)               : FalseRed=%d/100 (FPR=%.2f%%)", b3FalseRed, float64(b3FalseRed))
-	t.Logf("[Benign B4]  50 Cookie-Wiped / Safari ITP (30) + IDB Key-Loss Recovery (20)    : FalseRed=%d/50  (FPR=%.2f%%)", b4FalseRed, float64(b4FalseRed)*2.0)
+	t.Logf("[Benign B1] 700 Zipf Multi-City Users (Top-5 GPUs + Safari 16 Worker Fallback)  : FalseRed=%d/700 (FPR=%.2f%%)", b1FalseRed, float64(b1FalseRed)/7.0)
+	t.Logf("[Benign B2] 150 Same-Office /24 Colleagues (50 pairs + 10x5 bursts)             : FalseRed=%d/150 (FPR=%.2f%%, StepUpYellow=%d/50)", b2FalseRed, float64(b2FalseRed)/1.5, b2StepUp)
+	t.Logf("[Benign B3] 100 High-Density Mobile CGNAT /24 Users (25 per /24)                : FalseRed=%d/100 (FPR=%.2f%%)", b3FalseRed, float64(b3FalseRed))
+	t.Logf("[Benign B4]  50 Cookie-Wiped / Safari ITP (30) + IDB Key-Loss & Rebind (20)     : FalseRed=%d/50  (FPR=%.2f%%)", b4FalseRed, float64(b4FalseRed)*2.0)
 	t.Logf("--------------------------------------------------------------------------------")
-	t.Logf("[Attack A1] 150 5-Silo Storage Wiping + /24 IP Rotation                        : Caught=%d/150 (FNR=%.2f%%)", a1Caught, float64(150-a1Caught)/1.5)
-	t.Logf("[Attack A2] 150 Silent Anti-Detect (lies=false + Raw Noise + /24 Proxy Link)   : Caught=%d/150 (FNR=%.2f%%)", a2Caught, float64(150-a2Caught)/1.5)
-	t.Logf("[Attack A3] 150 Prototype Data-Descriptor ({value}) & ES6 Proxy Hooks          : Caught=%d/150 (FNR=%.2f%%)", a3Caught, float64(150-a3Caught)/1.5)
-	t.Logf("[Attack A4] 150 Worker Cross-Thread Lie & Partial Worker Telemetry Stripping   : Caught=%d/150 (FNR=%.2f%%)", a4Caught, float64(150-a4Caught)/1.5)
-	t.Logf("[Attack A5] 150 Cross-OS UA vs Platform & Linux Mesa on macOS Laws             : Caught=%d/150 (FNR=%.2f%%)", a5Caught, float64(150-a5Caught)/1.5)
-	t.Logf("[Attack A6] 100 WebDriver / CDP Automation Bots (navigator.webdriver / $cdc_)  : Caught=%d/100 (FNR=%.2f%%)", a6Caught, float64(100-a6Caught))
-	t.Logf("[Attack A7] 100 Stolen Beacon Replay without Non-Extractable ECDSA P-256 Key   : Caught=%d/100 (FNR=%.2f%%)", a7Caught, float64(100-a7Caught))
+	t.Logf("[Attack A1] 150 5-Silo Storage Wiping + /24 IP Rotation                         : Caught=%d/150 (FNR=%.2f%%)", a1Caught, float64(150-a1Caught)/1.5)
+	t.Logf("[Attack A2] 150 Silent Anti-Detect (lies=false + Raw Noise + /24 Proxy Link)    : Caught=%d/150 (FNR=%.2f%%)", a2Caught, float64(150-a2Caught)/1.5)
+	t.Logf("[Attack A3] 150 Prototype Data-Descriptor ({value}) & ES6 Proxy Hooks           : Caught=%d/150 (FNR=%.2f%%)", a3Caught, float64(150-a3Caught)/1.5)
+	t.Logf("[Attack A4] 150 Worker Cross-Thread Lie & Partial Worker Telemetry Stripping    : Caught=%d/150 (FNR=%.2f%%)", a4Caught, float64(150-a4Caught)/1.5)
+	t.Logf("[Attack A5] 150 Cross-OS UA vs Platform & Linux Mesa on macOS Laws              : Caught=%d/150 (FNR=%.2f%%)", a5Caught, float64(150-a5Caught)/1.5)
+	t.Logf("[Attack A6] 100 WebDriver / CDP Automation Bots (navigator.webdriver / $cdc_)   : Caught=%d/100 (FNR=%.2f%%)", a6Caught, float64(100-a6Caught))
+	t.Logf("[Attack A7] 100 Stolen Beacon Replay without Non-Extractable ECDSA P-256 Key    : Caught=%d/100 (FNR=%.2f%%)", a7Caught, float64(100-a7Caught))
 	t.Logf("--------------------------------------------------------------------------------")
-	t.Logf("[Boundary 1] 50 Single-Account Brave Farbling / CanvasBlocker Users            : FlaggedRed=%d/50 (100%% raw noise hit; requires step-up policy)", braveSingleFlaggedRed)
-	t.Logf("[Boundary 2] 50 Out-of-Browser Pure CPU Math Synthesis (25 1st-visit / 25 burst): 1stVisitEvaded=%d/25 (100%%), SameSubnetBurstCaught=%d/15 (100%%)", cpuSynthFirstVisitEvaded, cpuSynthBurstCaught)
+	t.Logf("[Boundary 1] 50 Single-Account Brave Users (Visit 1 Red -> 3 Clean Visits Green): FlaggedRed=%d/50, RecoveredGreen=%d/50", braveSingleFlaggedRed, braveSingleRecoveredGreen)
+	t.Logf("[Boundary 2] 50 Out-of-Browser Pure CPU Math Synthesis (25 1st-visit / 25 burst): 1stVisitEvaded=%d/25, SameSubnetBurstCaught=%d/15", cpuSynthFirstVisitEvaded, cpuSynthBurstCaught)
 	t.Logf("================================================================================")
 
 	if benignFalseRed != 0 {
@@ -588,6 +610,9 @@ func TestAuthoritativeEvaluation_AmIUniqueZipfAndFPScannerMatrix(t *testing.T) {
 	}
 	if inScopeAttackCaught != inScopeAttackTotal {
 		t.Fatalf("expected %d/%d in-browser attacks caught, got %d", inScopeAttackTotal, inScopeAttackTotal, inScopeAttackCaught)
+	}
+	if braveSingleFlaggedRed != 50 || braveSingleRecoveredGreen != 50 {
+		t.Fatalf("expected 50/50 Brave single-account recovery after 3 clean visits, got red=%d recovered=%d", braveSingleFlaggedRed, braveSingleRecoveredGreen)
 	}
 	if cpuSynthFirstVisitEvaded != 25 || cpuSynthBurstCaught != 15 {
 		t.Fatalf("unexpected boundary results: cpuSynthFirstVisitEvaded=%d, cpuSynthBurstCaught=%d", cpuSynthFirstVisitEvaded, cpuSynthBurstCaught)

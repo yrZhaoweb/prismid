@@ -26,7 +26,12 @@ import {
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const GO_SERVER_DIR = path.resolve(__dirname, '../../../server/go')
-const CHROME_MAC_PATH = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
+const CHROME_EXECUTABLE_PATH =
+  process.env.CHROME_PATH ||
+  process.env.GOOGLE_CHROME_BIN ||
+  '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
+const REQUIRE_CHROME_E2E =
+  process.env.CI === 'true' || process.env.PRISMID_REQUIRE_CHROME === '1'
 
 async function allocateFreeLocalPort(): Promise<number> {
   return new Promise((resolve, reject) => {
@@ -41,6 +46,12 @@ async function allocateFreeLocalPort(): Promise<number> {
 }
 
 describe('PrismID Web SDK (prismid-js) Unit & Cross-Language Suite', () => {
+  it('0. enforces real Chrome availability when running in CI or PRISMID_REQUIRE_CHROME=1', () => {
+    if (REQUIRE_CHROME_E2E) {
+      expect(fs.existsSync(CHROME_EXECUTABLE_PATH)).toBe(true)
+    }
+  })
+
   it('1. sha256Hex matches Node native crypto SHA-256 across empty, ASCII, and UTF-8 inputs', () => {
     for (const input of ['', 'abc', 'prismid-v1-aead:nonce123', '棱镜 PrismID 🚀 2026']) {
       const expected = crypto.createHash('sha256').update(input, 'utf8').digest('hex')
@@ -304,11 +315,11 @@ describe('PrismID Web SDK (prismid-js) Unit & Cross-Language Suite', () => {
       expect(desktopRes?.gpu_audio_slice_id).toBe(webRes?.gpu_audio_slice_id)
     })
 
-    it.skipIf(!fs.existsSync(CHROME_MAC_PATH))(
+    it.skipIf(!fs.existsSync(CHROME_EXECUTABLE_PATH))(
       'shares one committed key across pages and handles storage loss without poisoning history',
       async () => {
         const browser = await chromium.launch({
-          executablePath: CHROME_MAC_PATH,
+          executablePath: CHROME_EXECUTABLE_PATH,
           headless: true,
           args: ['--enable-webgl', '--ignore-gpu-blocklist', '--use-gl=angle'],
         })
@@ -354,11 +365,11 @@ describe('PrismID Web SDK (prismid-js) Unit & Cross-Language Suite', () => {
       25000
     )
 
-    it.skipIf(!fs.existsSync(CHROME_MAC_PATH))(
+    it.skipIf(!fs.existsSync(CHROME_EXECUTABLE_PATH))(
       'executes real Chrome GPU WebGL fragment shader, inline Blob Worker + OffscreenCanvas, OfflineAudioContext & TextMetrics against Go server',
       async () => {
         const browser = await chromium.launch({
-          executablePath: CHROME_MAC_PATH,
+          executablePath: CHROME_EXECUTABLE_PATH,
           headless: true,
           args: ['--enable-webgl', '--ignore-gpu-blocklist', '--use-gl=angle'],
         })
@@ -468,11 +479,11 @@ describe('PrismID Web SDK (prismid-js) Unit & Cross-Language Suite', () => {
       25000
     )
 
-    it.skipIf(!fs.existsSync(CHROME_MAC_PATH))(
+    it.skipIf(!fs.existsSync(CHROME_EXECUTABLE_PATH))(
       'executes authoritative FP-Scanner / AmIUnique real-Chrome multi-profile FPR & FNR matrix',
       async () => {
         const browser = await chromium.launch({
-          executablePath: CHROME_MAC_PATH,
+          executablePath: CHROME_EXECUTABLE_PATH,
           headless: true,
           args: ['--enable-webgl', '--ignore-gpu-blocklist', '--use-gl=angle'],
         })
@@ -683,7 +694,7 @@ describe('PrismID Web SDK (prismid-js) Unit & Cross-Language Suite', () => {
       35000
     )
 
-    it.skipIf(!fs.existsSync(CHROME_MAC_PATH))(
+    it.skipIf(!fs.existsSync(CHROME_EXECUTABLE_PATH))(
       'executes third-party Apify Bayesian dataset (500 real-world profiles) + FingerprintInjector + 14 Puppeteer-Stealth evasions in real Chrome',
       async () => {
         const { FingerprintGenerator } = cjsRequire('fingerprint-generator')
@@ -694,8 +705,19 @@ describe('PrismID Web SDK (prismid-js) Unit & Cross-Language Suite', () => {
         // =========================================================================
         // PART 1: 500 REAL-WORLD BAYESIAN PROFILES FROM APIFY FINGERPRINT-GENERATOR
         // =========================================================================
+        // Seed Math.random deterministically during Bayesian sampling (DeepSeek v1.0 P1 #3)
+        // so release/CI test runs are 100% reproducible with zero random flakiness.
+        let prngState = 0x50524953 >>> 0
+        const seededRandom = (): number => {
+          prngState = (prngState + 0x6d2b79f5) >>> 0
+          let t = Math.imul(prngState ^ (prngState >>> 15), 1 | prngState)
+          t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t
+          return ((t ^ (t >>> 14)) >>> 0) / 4294967296
+        }
+
         let genuineCount = 0
         let genuineFalseRed = 0
+        let virtualGpuDemotedCount = 0
         let datasetBotAnomalyCount = 0
         let datasetBotAnomalyCaught = 0
 
@@ -707,14 +729,38 @@ describe('PrismID Web SDK (prismid-js) Unit & Cross-Language Suite', () => {
           { devices: ['mobile'], operatingSystems: ['ios'], count: 60 },
         ]
 
+        const virtualGpuSubstrings = [
+          'swiftshader',
+          'llvmpipe',
+          'softpipe',
+          'lavapipe',
+          'mesa offscreen',
+          'software rasterizer',
+          'microsoft basic render driver',
+          'vmware',
+          'svga3d',
+          'virtualbox',
+          'vboxvideo',
+          'parallels',
+          'qemu',
+          'virtio',
+        ]
+
         let idx = 0
         for (const spec of cohortSpecs) {
           for (let i = 0; i < spec.count; i++) {
             idx++
-            const { fingerprint } = fg.getFingerprint({
-              devices: spec.devices,
-              operatingSystems: spec.operatingSystems,
-            })
+            const origRandom = Math.random
+            let fingerprint: ReturnType<typeof fg.getFingerprint>['fingerprint']
+            try {
+              Math.random = seededRandom
+              fingerprint = fg.getFingerprint({
+                devices: spec.devices,
+                operatingSystems: spec.operatingSystems,
+              }).fingerprint
+            } finally {
+              Math.random = origRandom
+            }
             const nav = fingerprint.navigator
             const gpu = fingerprint.videoCard
             const scr = fingerprint.screen
@@ -725,7 +771,9 @@ describe('PrismID Web SDK (prismid-js) Unit & Cross-Language Suite', () => {
             const vendor = String(gpu.vendor || '')
             const uaLow = ua.toLowerCase()
             const platLow = plat.toLowerCase()
-            const rendLow = renderer.toLowerCase()
+            const rendLow = renderer.trim().toLowerCase()
+            const vendLow = vendor.trim().toLowerCase()
+            const combinedGpuLow = `${vendLow} ${rendLow}`
 
             // Derive correct JS engine signature for the real browser family
             let mathSig: 'v8' | 'jsc' | 'spidermonkey' = 'v8'
@@ -735,15 +783,18 @@ describe('PrismID Web SDK (prismid-js) Unit & Cross-Language Suite', () => {
               platLow.includes('iphone') ||
               platLow.includes('ipad') ||
               (uaLow.includes('safari/') &&
+                uaLow.includes('version/') &&
                 !uaLow.includes('chrome/') &&
+                !uaLow.includes('crios/') &&
                 !uaLow.includes('chromium/') &&
-                !uaLow.includes('edg/'))
+                !uaLow.includes('edg/') &&
+                !uaLow.includes('opr/') &&
+                !uaLow.includes('android'))
             ) {
               mathSig = 'jsc'
             }
 
-            // Detect whether this raw Apify training sample is a scraped Linux bot anomaly
-            // (e.g. Linux platform claiming Windows/Mac UA or Windows claiming Intel Iris OpenGL Engine)
+            // Mirror server/go/gpu_laws.go physical hardware/OS pairing laws & virtual GPU demotion:
             const isWinPlat = platLow.includes('win')
             const isMacPlat = platLow.includes('mac')
             const isIOSPlat = platLow.includes('iphone') || platLow.includes('ipad')
@@ -756,21 +807,47 @@ describe('PrismID Web SDK (prismid-js) Unit & Cross-Language Suite', () => {
               uaLow.includes('x11; linux') || uaLow.includes('x11; ubuntu')
             const claimsAndroidUA = uaLow.includes('android')
 
+            const isAppleOnlyDriver =
+              rendLow.includes('apple m1') ||
+              rendLow.includes('apple m2') ||
+              rendLow.includes('apple m3') ||
+              rendLow.includes('apple m4') ||
+              rendLow.includes('apple m5') ||
+              rendLow.includes('apple gpu') ||
+              rendLow.includes('angle metal renderer') ||
+              rendLow.includes('opengl engine')
+
             const hasOSContradiction =
               (isWinPlat &&
                 (claimsMacUA || claimsIOSUA || claimsLinuxDesktopUA || claimsAndroidUA)) ||
               (isMacPlat && (claimsWinUA || claimsLinuxDesktopUA || claimsAndroidUA)) ||
               (isIOSPlat && (claimsWinUA || claimsLinuxDesktopUA || claimsAndroidUA)) ||
               (isLinuxPlat && (claimsWinUA || claimsMacUA || claimsIOSUA)) ||
-              ((rendLow.includes('opengl engine') || rendLow.includes('angle metal renderer')) &&
-                (isWinPlat || isLinuxPlat || claimsWinUA || claimsLinuxDesktopUA)) ||
+              (isAppleOnlyDriver &&
+                (isWinPlat ||
+                  isLinuxPlat ||
+                  claimsWinUA ||
+                  claimsLinuxDesktopUA ||
+                  claimsAndroidUA)) ||
               ((rendLow.includes('direct3d') || rendLow.includes('d3d11') || rendLow.includes('d3d9')) &&
-                (isMacPlat || isIOSPlat || isLinuxPlat))
+                (isMacPlat ||
+                  isIOSPlat ||
+                  isLinuxPlat ||
+                  claimsLinuxDesktopUA ||
+                  claimsAndroidUA)) ||
+              (vendLow.includes('apple') &&
+                (rendLow.includes('nvidia') ||
+                  rendLow.includes('radeon') ||
+                  rendLow.includes('geforce'))) ||
+              (isMacPlat &&
+                (rendLow.includes('mesa') ||
+                  rendLow.includes('/pcie/sse2') ||
+                  rendLow.includes('x11')))
 
             const isVirtualGPU =
-              rendLow.includes('swiftshader') ||
-              rendLow.includes('basic render driver') ||
-              rendLow.includes('llvmpipe')
+              rendLow === '' ||
+              rendLow === 'chromium' ||
+              virtualGpuSubstrings.some((kw) => combinedGpuLow.includes(kw))
 
             const subjectId = `apify_fp_${idx}`
             const clientIp = `100.${64 + Math.floor(idx / 200)}.${(idx * 7) % 250}.${(idx % 200) + 10}`
@@ -888,17 +965,25 @@ describe('PrismID Web SDK (prismid-js) Unit & Cross-Language Suite', () => {
             })
             const vr = (await idRes.json()) as {
               accepted: boolean
+              confidence: number
               risk_status: string
+              risk_pending: boolean
               spoof_trap_triggered: boolean
             }
             expect(vr.accepted).toBe(true)
 
-            if (hasOSContradiction) {
+            if (isVirtualGPU) {
+              // Virtual/software GPUs are demoted to Confidence=0.30 (< 0.60 graph threshold) -> unknown + pending
+              virtualGpuDemotedCount++
+              expect(vr.confidence).toBe(0.3)
+              expect(vr.risk_status).toBe('unknown')
+              expect(vr.risk_pending).toBe(true)
+            } else if (hasOSContradiction) {
               datasetBotAnomalyCount++
               if (vr.spoof_trap_triggered && vr.risk_status === 'red') {
                 datasetBotAnomalyCaught++
               }
-            } else if (!isVirtualGPU) {
+            } else {
               genuineCount++
               if (vr.risk_status === 'red' || vr.spoof_trap_triggered) {
                 genuineFalseRed++
@@ -907,6 +992,7 @@ describe('PrismID Web SDK (prismid-js) Unit & Cross-Language Suite', () => {
           }
         }
 
+        expect(genuineCount + virtualGpuDemotedCount + datasetBotAnomalyCount).toBe(500)
         expect(genuineCount).toBeGreaterThan(440)
         expect(genuineFalseRed).toBe(0)
         expect(datasetBotAnomalyCaught).toBe(datasetBotAnomalyCount)
@@ -915,7 +1001,7 @@ describe('PrismID Web SDK (prismid-js) Unit & Cross-Language Suite', () => {
         // PART 2: REAL-CHROME APIFY FINGERPRINT-INJECTOR & 14 PUPPETEER-STEALTH EVASIONS
         // =========================================================================
         const browser = await chromium.launch({
-          executablePath: CHROME_MAC_PATH,
+          executablePath: CHROME_EXECUTABLE_PATH,
           headless: true,
           args: ['--enable-webgl', '--ignore-gpu-blocklist', '--use-gl=angle'],
         })

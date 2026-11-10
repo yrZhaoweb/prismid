@@ -1,5 +1,5 @@
 /**
- * PrismID Web & WebView SDK (`prismid-js` v1.0.0)
+ * PrismID Web & WebView SDK (`prismid-js` v1.0.1)
  *
  * Provides 3-line integration for Browser Web apps and Tauri Desktop WebViews:
  *   1. Requests a 60s single-use challenge (`nonce` + `render_seed` [s0,s1,s2,s3])
@@ -21,7 +21,9 @@ import {
 } from './crypto/aead.js'
 import {
   buildDeviceKeyTranscript,
+  buildRebindKeyTranscript,
   signChallengeWithDeviceKey,
+  signRebindWithDeviceKey,
   type DeviceKeyProof,
 } from './crypto/deviceKey.js'
 import { collectAudioProbe, collectAudioProbeWithTrap } from './probes/audio.js'
@@ -39,6 +41,7 @@ export {
   AEAD_KEY_DOMAIN_PREFIX,
   aes256GcmEncryptPureTS,
   buildDeviceKeyTranscript,
+  buildRebindKeyTranscript,
   collectAndHealStorageBeacon,
   collectAudioProbe,
   collectFontsAndCanvasProbe,
@@ -52,6 +55,7 @@ export {
   sha256Bytes,
   sha256Hex,
   signChallengeWithDeviceKey,
+  signRebindWithDeviceKey,
   toBase64RawURL,
   type DeviceKeyProof,
   type StorageBeaconResult,
@@ -84,11 +88,16 @@ export interface IdentifyWireRequest {
 }
 
 export interface RiskEvidenceItem {
-  category: string
   slice_id?: string
-  rule_name: string
-  log_odds_delta: number
+  category?: string
   description: string
+  log_odds?: number
+  observed_at?: string
+  historical?: boolean
+  /** @deprecated Legacy v1.0.0 type compatibility alias for `category`. */
+  rule_name?: string
+  /** @deprecated Legacy v1.0.0 type compatibility alias for `log_odds`. */
+  log_odds_delta?: number
 }
 
 export interface IdentifyResponse {
@@ -98,6 +107,8 @@ export interface IdentifyResponse {
   confidence?: number
   exact_slice_id?: string
   device_key_slice_id?: string
+  device_key_bound?: boolean
+  /** @deprecated Legacy alias mirroring `device_key_bound`; proves ECDSA P-256 key possession, not hardware silicon attestation. */
   device_key_attested?: boolean
   device_key_recovery_required?: boolean
   keychain_slice_id?: string
@@ -155,6 +166,7 @@ export interface ProbePayload {
   }
   lies: {
     worker_unavailable: boolean
+    worker_webgl_available?: boolean
     worker_lie_detected: boolean
     worker_gpu_renderer?: string
     worker_static_webgl_fp_hash?: string
@@ -471,6 +483,7 @@ export function createPrismClient(options: PrismClientOptions = {}): PrismClient
       },
       lies: {
         worker_unavailable: workerLie.worker_unavailable,
+        worker_webgl_available: workerLie.worker_webgl_available,
         worker_lie_detected: workerLie.worker_lie_detected,
         worker_gpu_renderer: workerLie.worker_gpu_renderer,
         worker_static_webgl_fp_hash: workerLie.worker_static_webgl_fp_hash,

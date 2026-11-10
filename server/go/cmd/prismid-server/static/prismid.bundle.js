@@ -508,6 +508,41 @@ export function buildDeviceKeyTranscript(params) {
         params.audioCompressorHash.trim().toLowerCase(),
     ].join('|');
 }
+export function buildRebindKeyTranscript(params) {
+    return [
+        'prismid-v2-rebind',
+        params.nonce.trim(),
+        params.subjectId.trim(),
+        params.beaconId.trim().toLowerCase(),
+    ].join('|');
+}
+export async function signRebindWithDeviceKey(params) {
+    const subtle = getSubtleCrypto();
+    if (!subtle) {
+        return undefined;
+    }
+    const rec = await getOrCreateDeviceKeyRecord();
+    if (!rec) {
+        return undefined;
+    }
+    try {
+        const transcript = buildRebindKeyTranscript(params);
+        const msgBytes = new TextEncoder().encode(transcript);
+        const sigBuf = await subtle.sign({ name: 'ECDSA', hash: { name: 'SHA-256' } }, rec.privateKey, msgBytes);
+        const sigHex = bytesToHex(new Uint8Array(sigBuf));
+        if (sigHex.length !== 128) {
+            return undefined;
+        }
+        return {
+            alg: 'ecdsa-p256',
+            pub_key: rec.pubKeyHex,
+            signature: sigHex,
+        };
+    }
+    catch {
+        return undefined;
+    }
+}
 export async function signChallengeWithDeviceKey(params) {
     const subtle = getSubtleCrypto();
     if (!subtle) {
@@ -1257,6 +1292,7 @@ export function collectWebGLProbe(renderSeed, samplePoints = DEFAULT_SAMPLE_POIN
 export async function collectWorkerLieProbe(mainThread, timeoutMs = 300) {
     const emptyUnavailable = {
         worker_unavailable: true,
+        worker_webgl_available: false,
         worker_lie_detected: false,
         worker_gpu_renderer: '',
         worker_static_webgl_fp_hash: '',
@@ -1284,6 +1320,7 @@ export async function collectWorkerLieProbe(mainThread, timeoutMs = 300) {
         } catch (_) {}
         var renderer = '';
         var pixelsArray = null;
+        var webglOk = false;
 
         if (typeof OffscreenCanvas !== 'undefined') {
           var oc = new OffscreenCanvas(64, 64);
@@ -1318,11 +1355,12 @@ export async function collectWorkerLieProbe(mainThread, timeoutMs = 300) {
               var px = new Uint8Array(64 * 64 * 4);
               gl.readPixels(0, 0, 64, 64, gl.RGBA, gl.UNSIGNED_BYTE, px);
               pixelsArray = px.buffer;
+              webglOk = true;
             }
           }
         }
         self.postMessage(
-          { ok: true, ua: ua, plat: plat, cores: cores, tz: tz, renderer: renderer, pixelsBuffer: pixelsArray },
+          { ok: true, webglOk: webglOk, ua: ua, plat: plat, cores: cores, tz: tz, renderer: renderer, pixelsBuffer: pixelsArray },
           pixelsArray ? [pixelsArray] : []
         );
       } catch (e) {
@@ -1413,6 +1451,7 @@ export async function collectWorkerLieProbe(mainThread, timeoutMs = 300) {
                 }
                 finish({
                     worker_unavailable: false,
+                    worker_webgl_available: Boolean(data.webglOk) && workerFpHash.length > 0,
                     worker_lie_detected: lieDetected,
                     worker_gpu_renderer: workerRenderer,
                     worker_static_webgl_fp_hash: workerFpHash,
@@ -2142,7 +2181,7 @@ export function collectLieDetectorProbe() {
 
 // --- index.js ---
 /**
- * PrismID Web & WebView SDK (`prismid-js` v1.0.0)
+ * PrismID Web & WebView SDK (`prismid-js` v1.0.1)
  *
  * Provides 3-line integration for Browser Web apps and Tauri Desktop WebViews:
  *   1. Requests a 60s single-use challenge (`nonce` + `render_seed` [s0,s1,s2,s3])
@@ -2390,6 +2429,7 @@ export function createPrismClient(options = {}) {
             },
             lies: {
                 worker_unavailable: workerLie.worker_unavailable,
+                worker_webgl_available: workerLie.worker_webgl_available,
                 worker_lie_detected: workerLie.worker_lie_detected,
                 worker_gpu_renderer: workerLie.worker_gpu_renderer,
                 worker_static_webgl_fp_hash: workerLie.worker_static_webgl_fp_hash,

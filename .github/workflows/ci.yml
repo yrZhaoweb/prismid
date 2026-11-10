@@ -1,0 +1,80 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+
+jobs:
+  go-engine:
+    name: Go Verifier & Risk Graph (-race)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+          cache: false
+      - name: Check gofmt
+        working-directory: server/go
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "Unformatted Go files:"
+            echo "$unformatted"
+            exit 1
+          fi
+      - name: Run go vet
+        working-directory: server/go
+        run: go vet ./...
+      - name: Run go test -race
+        working-directory: server/go
+        run: go test -v -race ./...
+
+  rust-native:
+    name: Rust Native Hardware Anchor (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run cargo test
+        working-directory: crates/prismid-native
+        run: cargo test
+
+  web-sdk:
+    name: Web SDK Typecheck, Build & E2E (macOS Chrome WebGL)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+          cache: false
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "pnpm"
+      - uses: browser-actions/setup-chrome@v1
+        id: setup-chrome
+      - name: Install workspace dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Typecheck & build prismid-js
+        working-directory: packages/web-sdk
+        run: |
+          pnpm typecheck
+          pnpm build
+      - name: Run unit & Chrome E2E tests
+        working-directory: packages/web-sdk
+        env:
+          CHROME_PATH: ${{ steps.setup-chrome.outputs.chrome-path }}
+          PRISMID_REQUIRE_CHROME: "1"
+        run: pnpm test

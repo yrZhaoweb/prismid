@@ -26,6 +26,7 @@ export interface WorkerComparisonInput {
 
 export interface WorkerLieProbeResult {
   worker_unavailable: boolean
+  worker_webgl_available: boolean
   worker_lie_detected: boolean
   worker_gpu_renderer: string
   worker_static_webgl_fp_hash: string
@@ -41,6 +42,7 @@ export async function collectWorkerLieProbe(
 ): Promise<WorkerLieProbeResult> {
   const emptyUnavailable: WorkerLieProbeResult = {
     worker_unavailable: true,
+    worker_webgl_available: false,
     worker_lie_detected: false,
     worker_gpu_renderer: '',
     worker_static_webgl_fp_hash: '',
@@ -72,6 +74,7 @@ export async function collectWorkerLieProbe(
         } catch (_) {}
         var renderer = '';
         var pixelsArray = null;
+        var webglOk = false;
 
         if (typeof OffscreenCanvas !== 'undefined') {
           var oc = new OffscreenCanvas(64, 64);
@@ -106,11 +109,12 @@ export async function collectWorkerLieProbe(
               var px = new Uint8Array(64 * 64 * 4);
               gl.readPixels(0, 0, 64, 64, gl.RGBA, gl.UNSIGNED_BYTE, px);
               pixelsArray = px.buffer;
+              webglOk = true;
             }
           }
         }
         self.postMessage(
-          { ok: true, ua: ua, plat: plat, cores: cores, tz: tz, renderer: renderer, pixelsBuffer: pixelsArray },
+          { ok: true, webglOk: webglOk, ua: ua, plat: plat, cores: cores, tz: tz, renderer: renderer, pixelsBuffer: pixelsArray },
           pixelsArray ? [pixelsArray] : []
         );
       } catch (e) {
@@ -213,6 +217,7 @@ export async function collectWorkerLieProbe(
 
         finish({
           worker_unavailable: false,
+          worker_webgl_available: Boolean(data.webglOk) && workerFpHash.length > 0,
           worker_lie_detected: lieDetected,
           worker_gpu_renderer: workerRenderer,
           worker_static_webgl_fp_hash: workerFpHash,
