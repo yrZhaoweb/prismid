@@ -175,6 +175,7 @@ func newHTTPHandler(verifier *prismid.Verifier, riskGraph *prismid.RiskGraph, se
 				"accepted":                     res.Accepted,
 				"confidence":                   res.Confidence,
 				"device_key_slice_id":          res.DeviceKeySliceID,
+				"device_key_bound":             res.DeviceKeyBound,
 				"device_key_attested":          res.DeviceKeyAttested,
 				"device_key_recovery_required": res.DeviceKeyRecoveryRequired,
 				"exact_slice_id":               res.ExactSliceID,

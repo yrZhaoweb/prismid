@@ -164,5 +164,28 @@ func VerifyGPURegisterLaws(payload *ProbePayload) []string {
 		}
 	}
 
+	// Law 6: System.Platform vs System.UserAgent OS family cross-consistency.
+	if platformLower != "" && uaLower != "" {
+		isWinPlat := strings.Contains(platformLower, "win")
+		isMacPlat := strings.Contains(platformLower, "mac")
+		isLinuxPlat := strings.Contains(platformLower, "linux") && !strings.Contains(platformLower, "android")
+
+		claimsWinUA := strings.Contains(uaLower, "windows nt")
+		claimsMacUA := strings.Contains(uaLower, "macintosh") || strings.Contains(uaLower, "mac os x")
+		claimsLinuxDesktopUA := strings.Contains(uaLower, "x11; linux") || strings.Contains(uaLower, "x11; ubuntu")
+
+		if (isWinPlat && (claimsMacUA || claimsLinuxDesktopUA)) ||
+			(isMacPlat && (claimsWinUA || claimsLinuxDesktopUA)) ||
+			(isLinuxPlat && (claimsWinUA || claimsMacUA)) {
+			violations = append(violations, "gpu_register_law_violation:platform_ua_os_mismatch")
+		}
+	}
+
+	// Law 7: Linux OpenGL/Mesa driver strings claimed on macOS.
+	if strings.Contains(platformLower, "mac") &&
+		(strings.Contains(rendererLower, "mesa") || strings.Contains(rendererLower, "/pcie/sse2") || strings.Contains(rendererLower, "x11")) {
+		violations = append(violations, "gpu_register_law_violation:linux_gpu_driver_on_macos")
+	}
+
 	return violations
 }

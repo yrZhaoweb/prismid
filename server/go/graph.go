@@ -206,7 +206,9 @@ func (g *RiskGraph) RecordVerification(subjectID string, subjectCreatedAt time.T
 					}
 				}
 				if evictSlice != "" {
-					g.markEvidenceLossLocked(subjectID, evictSlice)
+					if isPerDeviceHardSlice(evictSlice) {
+						g.markEvidenceLossLocked(subjectID, evictSlice)
+					}
 					delete(subjMap, evictSlice)
 					if smap, ok := g.sliceEdges[evictSlice]; ok {
 						delete(smap, subjectID)
@@ -246,7 +248,9 @@ func (g *RiskGraph) RecordVerification(subjectID string, subjectCreatedAt time.T
 					}
 				}
 				if evictSID != "" {
-					g.markEvidenceLossLocked(evictSID, sliceID)
+					if isPerDeviceHardSlice(sliceID) {
+						g.markEvidenceLossLocked(evictSID, sliceID)
+					}
 					delete(smap, evictSID)
 					if emap, ok := g.subjectEdges[evictSID]; ok {
 						delete(emap, sliceID)
@@ -397,16 +401,38 @@ func (g *RiskGraph) collectLocalSubgraphEdgesLocked(targetSubjectID string) ([]G
 			}
 		}
 	}
+	// Collect bounded velocity-window neighbors on d_gpusys_* (6h) and d_web_* (25m) for targetSubjectID:
 	for _, slice := range sortedSlices(targetSubjectID) {
+		targetEdge := g.subjectEdges[targetSubjectID][slice]
+		var window time.Duration
+		if strings.HasPrefix(slice, "d_gpusys_") {
+			window = DefaultSameNetFarmingWindow
+		} else if strings.HasPrefix(slice, "d_web_") && targetEdge.DeviceKeySliceID == "" {
+			window = DefaultGPUBurstWindow
+		} else {
+			continue
+		}
+		velAdded := 0
 		for _, neighbor := range sortedNeighbors(slice) {
-			if visited[neighbor] || g.sliceEdges[slice][neighbor].Confidence < g.minConf {
+			if visited[neighbor] {
 				continue
 			}
-			if len(visited) >= MaxComponentSize {
-				truncated = true
+			next := g.sliceEdges[slice][neighbor]
+			if next.Confidence < g.minConf {
 				continue
+			}
+			dt := next.SubjectCreatedAt.Sub(targetEdge.SubjectCreatedAt)
+			if dt < 0 {
+				dt = -dt
+			}
+			if dt > window {
+				continue
+			}
+			if len(visited) >= MaxComponentSize || velAdded >= DefaultCleanBeaconBurstCount*2 {
+				break
 			}
 			visited[neighbor] = true
+			velAdded++
 		}
 	}
 	out := make([]GraphEdge, 0, len(visited)*4)
@@ -415,7 +441,7 @@ func (g *RiskGraph) collectLocalSubgraphEdgesLocked(targetSubjectID string) ([]G
 			truncated = true
 		}
 		for slice, edge := range g.subjectEdges[sid] {
-			if g.incompleteSlices[slice] {
+			if isPerDeviceHardSlice(slice) && g.incompleteSlices[slice] {
 				truncated = true
 			}
 			out = append(out, edge)
@@ -510,6 +536,10 @@ func shouldMergeStatelessOrSpoofed(slice string, a, b GraphEdge) bool {
 			return false
 		}
 		if sharesHardAnchorOnEdge(a, b) {
+			return true
+		}
+		if a.SpoofTraphit && b.SpoofTraphit &&
+			(strings.HasPrefix(slice, "d_gpu_") || strings.HasPrefix(slice, "d_web_") || strings.HasPrefix(slice, "d_gpusys_")) {
 			return true
 		}
 		if strings.HasPrefix(slice, "d_gpusys_") && dt <= DefaultGPUBurstWindow {
@@ -714,15 +744,10 @@ func EvaluateSubjectComponent(edges []GraphEdge, targetSubjectID string, minConf
 		if isPerDeviceHardSlice(slice) {
 			// Linear O(N) union across all observations sharing this per-device hard anchor:
 			firstSID := obsList[0].SubjectID
-			linked := false
 			for k := 1; k < len(obsList); k++ {
 				if obsList[k].SubjectID != firstSID {
 					union(firstSID, obsList[k].SubjectID)
-					linked = true
 				}
-			}
-			if linked {
-				activeSharedSlices[slice] = true
 			}
 			continue
 		}
@@ -738,11 +763,6 @@ func EvaluateSubjectComponent(edges []GraphEdge, targetSubjectID string, minConf
 				}
 				if a.SubjectID != b.SubjectID && shouldMergeStatelessOrSpoofed(slice, a, b) {
 					union(a.SubjectID, b.SubjectID)
-					if !strings.HasPrefix(slice, "d_gpusys_") {
-						activeSharedSlices[slice] = true
-					} else if gpuSlice := findSubjectPrefixSlice(subjectSlices[a.SubjectID], "d_gpu_"); gpuSlice != "" {
-						activeSharedSlices[gpuSlice] = true
-					}
 				}
 			}
 		}
@@ -761,6 +781,23 @@ func EvaluateSubjectComponent(edges []GraphEdge, targetSubjectID string, minConf
 			}
 			for sl := range subjectSlices[sid] {
 				sliceSet[sl] = struct{}{}
+			}
+		}
+	}
+
+	// Mark activeSharedSlices ONLY for slices shared by >= 2 members inside targetRoot's component:
+	for _, slice := range sliceKeys {
+		inTargetComp := 0
+		for _, e := range sliceObs[slice] {
+			if find(e.SubjectID) == targetRoot {
+				inTargetComp++
+			}
+		}
+		if inTargetComp >= 2 {
+			if !strings.HasPrefix(slice, "d_gpusys_") {
+				activeSharedSlices[slice] = true
+			} else if gpuSlice := findSubjectPrefixSlice(subjectSlices[targetSubjectID], "d_gpu_"); gpuSlice != "" {
+				activeSharedSlices[gpuSlice] = true
 			}
 		}
 	}
@@ -792,7 +829,7 @@ func EvaluateSubjectComponent(edges []GraphEdge, targetSubjectID string, minConf
 		var window time.Duration
 		if strings.HasPrefix(slice, "d_gpusys_") {
 			window = DefaultSameNetFarmingWindow
-		} else if strings.HasPrefix(slice, "d_web_") {
+		} else if strings.HasPrefix(slice, "d_web_") && targetEdge.DeviceKeySliceID == "" {
 			window = DefaultGPUBurstWindow
 		} else {
 			continue

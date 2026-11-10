@@ -463,5 +463,220 @@ describe('PrismID Web SDK (prismid-js) Unit & Cross-Language Suite', () => {
       },
       25000
     )
+
+    it.skipIf(!fs.existsSync(CHROME_MAC_PATH))(
+      'executes authoritative FP-Scanner / AmIUnique real-Chrome multi-profile FPR & FNR matrix',
+      async () => {
+        const browser = await chromium.launch({
+          executablePath: CHROME_MAC_PATH,
+          headless: true,
+          args: ['--enable-webgl', '--ignore-gpu-blocklist', '--use-gl=angle'],
+        })
+        try {
+          const runProfile = async (
+            subjectId: string,
+            clientIp: string,
+            setupFn?: () => void | Promise<void>,
+            mutatePayloadFn?: (payload: Record<string, unknown>, arg?: unknown) => void,
+            mutateArg?: unknown
+          ) => {
+            const context = await browser.newContext()
+            try {
+              const page = await context.newPage()
+              await page.goto(baseUrl, { waitUntil: 'networkidle' })
+              if (setupFn) {
+                await page.evaluate(setupFn)
+              }
+              return await page.evaluate(
+                async ({ subjectId, clientIp, mutateStr, mutateArg }) => {
+                  const { createPrismClient, sealPayload } = await new Function(
+                    'return import("/prismid.bundle.js")'
+                  )()
+                  const prism = createPrismClient({ baseUrl: '' })
+                  const chRes = await fetch('/api/v1/risk/challenge', {
+                    method: 'POST',
+                    headers: {
+                      Authorization: `Bearer ${subjectId}`,
+                      'X-Forwarded-For': clientIp,
+                    },
+                  })
+                  const ch = await chRes.json()
+                  const { request, payload } = await prism.collectAndSeal(ch)
+                  let wireReq = request
+                  if (mutateStr) {
+                    const fn = new Function('payload', 'arg', mutateStr)
+                    fn(payload, mutateArg)
+                    const p = await sealPayload(ch.nonce, JSON.stringify(payload))
+                    wireReq = { c: ch.nonce, p }
+                  }
+                  const idRes = await fetch('/api/v1/risk/identify', {
+                    method: 'POST',
+                    headers: {
+                      'Content-Type': 'application/json',
+                      Authorization: `Bearer ${subjectId}`,
+                      'X-Forwarded-For': clientIp,
+                    },
+                    body: JSON.stringify(wireReq),
+                  })
+                  const verifyResult = await idRes.json()
+                  return { verifyResult, payload }
+                },
+                {
+                  subjectId,
+                  clientIp,
+                  mutateStr: mutatePayloadFn
+                    ? `(${mutatePayloadFn.toString()})(payload, arg)`
+                    : '',
+                  mutateArg: mutateArg ?? null,
+                }
+              )
+            } finally {
+              await context.close()
+            }
+          }
+
+          // =========================================================================
+          // PART 1: REAL-CHROME BENIGN PROFILES (FPR = 0% Verification)
+          // =========================================================================
+
+          // B1: Clean Chrome Profile #1
+          const b1 = await runProfile('real_chrome_benign_1', '198.51.100.11')
+          expect(b1.verifyResult.accepted).toBe(true)
+          expect(b1.verifyResult.device_key_bound).toBe(true)
+          expect(b1.verifyResult.spoof_trap_triggered).toBe(false)
+          expect(b1.verifyResult.risk_status).toBe('green')
+          expect(b1.verifyResult.component_snapshot.component_subjects).toEqual([
+            'real_chrome_benign_1',
+          ])
+
+          // B2: Independent Chrome Profile #2 on the EXACT SAME physical MacBook GPU (different /24 IP)
+          const b2 = await runProfile('real_chrome_benign_2', '203.0.113.22')
+          expect(b2.verifyResult.gpu_audio_slice_id).toBe(b1.verifyResult.gpu_audio_slice_id)
+          expect(b2.verifyResult.spoof_trap_triggered).toBe(false)
+          expect(b2.verifyResult.risk_status).toBe('green')
+          expect(b2.verifyResult.component_snapshot.component_subjects).toEqual([
+            'real_chrome_benign_2',
+          ])
+
+          // B3: Independent Chrome Profile #3 on the SAME office /24 Wi-Fi & same physical GPU as B1
+          const b3 = await runProfile('real_chrome_benign_3', '198.51.100.12')
+          expect(b3.verifyResult.gpu_audio_slice_id).toBe(b1.verifyResult.gpu_audio_slice_id)
+          expect(b3.verifyResult.sys_net_slice_id).toBe(b1.verifyResult.sys_net_slice_id)
+          expect(b3.verifyResult.spoof_trap_triggered).toBe(false)
+          expect(b3.verifyResult.risk_status).toBe('green')
+          expect(b3.verifyResult.component_snapshot.component_subjects).toEqual([
+            'real_chrome_benign_3',
+          ])
+
+          // B4: Browser that masks WEBGL_debug_renderer_info inside Web Worker ("WebKit WebGL")
+          const b4 = await runProfile(
+            'real_chrome_benign_4_masked_worker',
+            '192.0.2.44',
+            undefined,
+            (payload: any) => {
+              payload.lies.worker_gpu_renderer = 'WebKit WebGL'
+            }
+          )
+          expect(b4.verifyResult.spoof_trap_triggered).toBe(false)
+          expect(b4.verifyResult.risk_status).toBe('green')
+
+          // =========================================================================
+          // PART 2: REAL-CHROME ADVERSARIAL PROFILES (FP-Scanner / Stealth FNR Test)
+          // =========================================================================
+
+          // A1: Object.defineProperty(Navigator.prototype, 'userAgent', { value: ... }) data-descriptor override
+          const a1 = await runProfile('real_chrome_atk_1_data_desc', '198.18.0.10', () => {
+            Object.defineProperty(Navigator.prototype, 'userAgent', {
+              value:
+                'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/130.0.0.0 Safari/537.36',
+              configurable: true,
+            })
+          })
+          expect(a1.verifyResult.spoof_trap_triggered).toBe(true)
+          expect(a1.verifyResult.risk_status).toBe('red')
+          expect(a1.verifyResult.spoof_flags).toContain(
+            'prototype_lie:Navigator.userAgent:data_descriptor_override'
+          )
+
+          // A2: Stealth ES6 Proxy wrapping WebGLRenderingContext.prototype.getParameter
+          const a2 = await runProfile('real_chrome_atk_2_es6_proxy', '198.18.0.20', () => {
+            const origGetParam = WebGLRenderingContext.prototype.getParameter
+            const proxyGetParam = new Proxy(origGetParam, {
+              apply(target, thisArg, args) {
+                return Reflect.apply(target, thisArg, args)
+              },
+            })
+            WebGLRenderingContext.prototype.getParameter = proxyGetParam
+          })
+          expect(a2.verifyResult.spoof_trap_triggered).toBe(true)
+          expect(a2.verifyResult.risk_status).toBe('red')
+          expect(
+            a2.verifyResult.spoof_flags.some((f: string) =>
+              f.includes('WebGLRenderingContext.getParameter:es6_proxy_detected')
+            )
+          ).toBe(true)
+
+          // A3: ChromeDriver / Selenium CDP injection ($cdc_asdjflasutopfhvcZLmcfl_ on document)
+          const a3 = await runProfile('real_chrome_atk_3_cdp_bot', '198.18.0.30', () => {
+            ;(document as unknown as Record<string, unknown>).$cdc_asdjflasutopfhvcZLmcfl_ = true
+          })
+          expect(a3.verifyResult.spoof_trap_triggered).toBe(true)
+          expect(a3.verifyResult.risk_status).toBe('red')
+          expect(a3.verifyResult.spoof_flags).toContain(
+            'automation:document:$cdc_asdjflasutopfhvcZLmcfl_'
+          )
+
+          // A4: Cross-OS User-Agent vs Platform contradiction (claiming Windows NT on MacIntel)
+          const a4 = await runProfile(
+            'real_chrome_atk_4_ua_os_mismatch',
+            '198.18.0.40',
+            undefined,
+            (payload: any) => {
+              payload.system.user_agent =
+                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/130.0.0.0 Safari/537.36'
+              payload.lies.worker_user_agent = payload.system.user_agent
+            }
+          )
+          expect(a4.verifyResult.spoof_trap_triggered).toBe(true)
+          expect(a4.verifyResult.risk_status).toBe('red')
+          expect(a4.verifyResult.spoof_flags).toContain(
+            'gpu_register_law_violation:platform_ua_os_mismatch'
+          )
+
+          // A5: Stolen beacon_id from B1 replayed without B1's non-extractable private key
+          const a5 = await runProfile(
+            'real_chrome_atk_5_stolen_beacon',
+            '198.18.0.50',
+            undefined,
+            (payload: any, stolenBeaconId: any) => {
+              payload.beacon_id = stolenBeaconId
+              delete payload.device_key
+            },
+            b1.payload.beacon_id
+          )
+          expect(a5.verifyResult.device_key_recovery_required).toBe(true)
+          expect(a5.verifyResult.risk_pending).toBe(true)
+          expect(a5.verifyResult.confidence).toBe(0.3)
+
+          // And verify B1..B4 are STILL green after all 5 real-Chrome attacks on the same physical GPU!
+          for (const id of [
+            'real_chrome_benign_1',
+            'real_chrome_benign_2',
+            'real_chrome_benign_3',
+            'real_chrome_benign_4_masked_worker',
+          ]) {
+            const expRes = await fetch(
+              `${baseUrl}/api/v1/risk/explain?subject_id=${encodeURIComponent(id)}`
+            )
+            const snap = await expRes.json()
+            expect(snap.risk_status).toBe('green')
+            expect(snap.component_subjects).toEqual([id])
+          }
+        } finally {
+          await browser.close()
+        }
+      },
+      35000
+    )
   })
 })

@@ -172,10 +172,17 @@ export async function collectWorkerLieProbe(
             ? sha256Hex(new Uint8Array(data.pixelsBuffer))
             : ''
 
+        const isGenericMaskedRenderer = (r: string): boolean => {
+          const low = r.trim().toLowerCase()
+          return low === '' || low === 'webkit webgl' || low === 'mozilla' || low === 'webgl' || low === 'unknown'
+        }
+
         let lieDetected = false
         if (
           workerRenderer &&
           mainThread.gpuRenderer &&
+          !isGenericMaskedRenderer(workerRenderer) &&
+          !isGenericMaskedRenderer(mainThread.gpuRenderer) &&
           workerRenderer.toLowerCase() !== mainThread.gpuRenderer.toLowerCase()
         ) {
           lieDetected = true

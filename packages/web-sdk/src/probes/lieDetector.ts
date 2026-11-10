@@ -72,8 +72,12 @@ export function collectLieDetectorProbe(): LieDetectorResult {
       if ('prototype' in fn) {
         prototypeLies.push(`${label}:has_prototype_property`)
       }
-      // Check expected function `.name` (e.g. `'get userAgent'` for native getters)
-      if (expectedName && fn.name !== expectedName) {
+      // Check expected function `.name` (e.g. `'get userAgent'` or `'userAgent'` for native getters)
+      if (
+        expectedName &&
+        fn.name !== expectedName &&
+        fn.name !== expectedName.replace(/^get /, '')
+      ) {
         prototypeLies.push(`${label}:unexpected_name_${fn.name || 'empty'}`)
       }
       // ECMAScript §10.1.2.1 OrdinarySetPrototypeOf cyclic __proto__ invariant:
@@ -171,8 +175,12 @@ export function collectLieDetectorProbe(): LieDetectorResult {
       ] as const
       for (const prop of navProps) {
         const desc = Object.getOwnPropertyDescriptor(Navigator.prototype, prop)
-        if (desc && desc.get) {
-          checkNativeFunction(desc.get, `Navigator.${prop}.get`, `get ${prop}`)
+        if (desc) {
+          if ('value' in desc || typeof desc.get !== 'function') {
+            prototypeLies.push(`Navigator.${prop}:data_descriptor_override`)
+          } else {
+            checkNativeFunction(desc.get, `Navigator.${prop}.get`, `get ${prop}`)
+          }
         }
         if (typeof navigator !== 'undefined' && Object.prototype.hasOwnProperty.call(navigator, prop)) {
           prototypeLies.push(`navigator.${prop}:instance_property_override`)
@@ -183,8 +191,12 @@ export function collectLieDetectorProbe(): LieDetectorResult {
       const scrProps = ['width', 'height', 'availWidth', 'availHeight', 'colorDepth', 'pixelDepth'] as const
       for (const prop of scrProps) {
         const desc = Object.getOwnPropertyDescriptor(Screen.prototype, prop)
-        if (desc && desc.get) {
-          checkNativeFunction(desc.get, `Screen.${prop}.get`, `get ${prop}`)
+        if (desc) {
+          if ('value' in desc || typeof desc.get !== 'function') {
+            prototypeLies.push(`Screen.${prop}:data_descriptor_override`)
+          } else {
+            checkNativeFunction(desc.get, `Screen.${prop}.get`, `get ${prop}`)
+          }
         }
         if (Object.prototype.hasOwnProperty.call(screen, prop)) {
           prototypeLies.push(`screen.${prop}:instance_property_override`)

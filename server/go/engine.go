@@ -392,11 +392,15 @@ func (v *Verifier) VerifyAndDerive(ctx context.Context, req IdentifyRequest, cli
 		privacySignals = appendUniqueFlag(privacySignals, "worker_unavailable")
 	} else {
 		workerLie := payload.Lies.WorkerLieDetected
-		if wRenderer := strings.TrimSpace(payload.Lies.WorkerGPURenderer); wRenderer != "" && !strings.EqualFold(wRenderer, effectiveGPURenderer) {
+		wRenderer := strings.TrimSpace(payload.Lies.WorkerGPURenderer)
+		if wRenderer != "" && !isGenericMaskedWebGLRenderer(wRenderer) &&
+			!isGenericMaskedWebGLRenderer(effectiveGPURenderer) &&
+			!strings.EqualFold(wRenderer, effectiveGPURenderer) {
 			workerLie = true
 			effectiveGPURenderer = wRenderer
 		}
-		if wHash := strings.TrimSpace(payload.Lies.WorkerStaticWebGLFpHash); wHash != "" && !strings.EqualFold(wHash, effectiveStaticWebGLHash) {
+		wHash := strings.TrimSpace(payload.Lies.WorkerStaticWebGLFpHash)
+		if wHash != "" && !strings.EqualFold(wHash, effectiveStaticWebGLHash) {
 			workerLie = true
 			// Override hooked main-thread WebGL hash with unhooked Worker OffscreenCanvas hash
 			effectiveStaticWebGLHash = wHash
@@ -405,11 +409,13 @@ func (v *Verifier) VerifyAndDerive(ctx context.Context, req IdentifyRequest, cli
 			workerLie = true
 			effectiveCPUCores = payload.Lies.WorkerCPUCores
 		}
-		if wPlat := strings.TrimSpace(payload.Lies.WorkerPlatform); wPlat != "" && effectivePlatform != "" && !strings.EqualFold(wPlat, effectivePlatform) {
+		wPlat := strings.TrimSpace(payload.Lies.WorkerPlatform)
+		if wPlat != "" && effectivePlatform != "" && !strings.EqualFold(wPlat, effectivePlatform) {
 			workerLie = true
 			effectivePlatform = wPlat
 		}
-		if wUA := strings.TrimSpace(payload.Lies.WorkerUserAgent); wUA != "" && strings.TrimSpace(payload.System.UserAgent) != "" && wUA != strings.TrimSpace(payload.System.UserAgent) {
+		wUA := strings.TrimSpace(payload.Lies.WorkerUserAgent)
+		if wUA != "" && strings.TrimSpace(payload.System.UserAgent) != "" && wUA != strings.TrimSpace(payload.System.UserAgent) {
 			workerLie = true
 		}
 		if wTZ := strings.TrimSpace(payload.Lies.WorkerTimezone); wTZ != "" && effectiveTimezone != "" && wTZ != effectiveTimezone {
@@ -417,16 +423,20 @@ func (v *Verifier) VerifyAndDerive(ctx context.Context, req IdentifyRequest, cli
 			effectiveTimezone = wTZ
 			spoofFlags = appendUniqueFlag(spoofFlags, "worker_timezone_mismatch")
 		}
-		// Server-side telemetry (DeepSeek v0.5 P2): if optional worker_* fields are omitted while
+		// Server-side telemetry (DeepSeek v0.5 P2): if optional worker_* fields are all omitted while
 		// WorkerUnavailable=false, record "worker_telemetry_missing" in PrivacySignals without
 		// falsely marking minimal/legacy payloads as active spoofing (spoofTrapTriggered=false).
-		if payload.NativeAnchor == nil &&
-			strings.TrimSpace(payload.Lies.WorkerStaticWebGLFpHash) == "" &&
-			strings.TrimSpace(payload.Lies.WorkerGPURenderer) == "" &&
-			strings.TrimSpace(payload.Lies.WorkerPlatform) == "" &&
-			strings.TrimSpace(payload.Lies.WorkerUserAgent) == "" &&
-			payload.Lies.WorkerCPUCores == 0 {
-			privacySignals = appendUniqueFlag(privacySignals, "worker_telemetry_missing")
+		// However, if a client provides partial worker_* fields while selectively blanking out
+		// WorkerStaticWebGLFpHash or WorkerUserAgent, flag selective stripping!
+		allWorkerEmpty := wHash == "" && wRenderer == "" && wPlat == "" && wUA == "" && payload.Lies.WorkerCPUCores == 0
+		if payload.NativeAnchor == nil {
+			if allWorkerEmpty {
+				privacySignals = appendUniqueFlag(privacySignals, "worker_telemetry_missing")
+			} else if (wHash == "" && (payload.WebGL.WebGLAvailable == nil || *payload.WebGL.WebGLAvailable)) ||
+				(wUA == "" && strings.TrimSpace(payload.System.UserAgent) != "") {
+				workerLie = true
+				spoofFlags = appendUniqueFlag(spoofFlags, "worker_partial_telemetry_stripped")
+			}
 		}
 		if workerLie {
 			spoofFlags = appendUniqueFlag(spoofFlags, "worker_lie_detected")
@@ -490,6 +500,11 @@ func (v *Verifier) VerifyAndDerive(ctx context.Context, req IdentifyRequest, cli
 	for _, autoFlag := range payload.Lies.AutomationFlags {
 		if trimmed := strings.TrimSpace(autoFlag); trimmed != "" {
 			spoofFlags = appendUniqueFlag(spoofFlags, "automation:"+trimmed)
+			if trimmed == "navigator_webdriver" {
+				privacySignals = appendUniqueFlag(privacySignals, "automation:navigator_webdriver")
+			} else {
+				spoofTrapTriggered = true
+			}
 		}
 	}
 
@@ -936,6 +951,15 @@ func NormalizeOSFamily(webPlatform string, nativeAnchor *NativeHardwareAnchor) s
 			return "unknown"
 		}
 		return wp
+	}
+}
+
+func isGenericMaskedWebGLRenderer(renderer string) bool {
+	switch strings.ToLower(strings.TrimSpace(renderer)) {
+	case "", "webkit webgl", "mozilla", "webgl", "unknown":
+		return true
+	default:
+		return false
 	}
 }
 
