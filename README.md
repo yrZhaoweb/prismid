@@ -1,4 +1,4 @@
-# PrismID (`prismid` v0.5.0)
+# PrismID (`prismid` v1.0.0)
 
 > **Open-source orthogonal hardware signal collection, non-extractable WebCrypto ECDSA P-256 device key binding, raw-measurement server-side lie inference, and multi-slice risk correlation SDK for Web (`prismid-js`), Tauri / Rust Desktop (`prismid-native`), and Go (`prismid-go`).**
 >
@@ -13,7 +13,7 @@ Traditional open-source fingerprinting libraries hash ~20 browser attributes on 
 2. **Residential Proxy Evasion**: Mixing IP addresses into the device hash allows attackers to rotate `/24` proxy subnets to obtain a fresh ID on every request.
 3. **Shared-Model False Positives**: Treating model-level hardware hashes (such as WebGL/Audio hashes shared by all stock MacBook Pro M3 laptops) as unique device IDs falsely merges innocent users in offices or across cities.
 
-**PrismID v0.5.0** addresses these challenges with a strict separation between **Per-Device Hard Identity Anchors** and **Shared-Model Environment Velocity Signals**:
+**PrismID v1.0.0** addresses these challenges with a strict separation between **Per-Device Hard Identity Anchors** and **Shared-Model Environment Velocity Signals**:
 
 1. **Per-Device Hard Identity Slices (`d_key_*`, `d_nat_*`, `d_kch_*`, `d_bcn_*`)**:
    - `d_key_*` (**Non-Extractable WebCrypto ECDSA P-256 Key Binding + TOFU**): Generates an `ECDSA P-256` keypair with `extractable: false` on the private key (persisted in `IndexedDB` `_prismid_key_v1` with 150ms bounded timeout) and signs every challenge transcript (`prismid-v2-sig|<nonce>|<beacon_id>|<static_webgl_fp_hash>|<audio_compressor_hash>`). The Go server verifies the P-256 signature (`device_key_bound: true`, Web `confidence = 0.95` — proves possession of a bound keypair rather than hardware silicon attestation) and enforces **Trust-On-First-Use (TOFU)** binding between `d_bcn_*` and `d_key_*`. When a bound key is missing or rotated (`device_key_recovery_required`, `device_key_missing` / `device_key_rotated`), authoritative identity is withheld (`risk_pending: true`, `confidence: 0.30`) without marking the account as an active spoof (`red`) or overwriting the original binding.
@@ -55,7 +55,7 @@ prismid/
 │   ├── ANTI_SPOOFING_MATRIX.md      # Adversarial attack vectors, defense matrix & boundaries
 │   └── INTEGRATION_GUIDE.md         # Web, Tauri 2 Rust, Go & PostgreSQL integration guide
 ├── packages/
-│   └── web-sdk/                     # Zero-dependency TypeScript Browser & WebView SDK (prismid-js v0.5.0)
+│   └── web-sdk/                     # Zero-dependency TypeScript Browser & WebView SDK (prismid-js v1.0.0)
 │       ├── package.json
 │       ├── src/
 │       │   ├── index.ts             # createPrismClient with full header+body deadline & strict schema check
@@ -71,7 +71,7 @@ prismid/
 │       │       └── deviceKey.ts     # Non-extractable WebCrypto ECDSA P-256 keypair + challenge signing
 │       └── test/                    # Unit, regression & real Chrome E2E integration tests
 ├── crates/
-│   └── prismid-native/              # Rust native hardware anchor crate (prismid-native v0.5.0)
+│   └── prismid-native/              # Rust native hardware anchor crate (prismid-native v1.0.0)
 │       ├── Cargo.toml
 │       └── src/
 │           ├── lib.rs               # collect_native_anchor() + OnceLock cache + unit tests
@@ -79,7 +79,7 @@ prismid/
 │           ├── windows.rs           # MachineGuid + BIOS Serial + SMBIOS UUID + HKCU Registry anchor
 │           └── linux.rs             # /etc/machine-id + product_uuid + Hypervisor check
 └── server/
-    └── go/                          # Go verification & orthogonal slice risk graph engine (prismid-go v0.5.0)
+    └── go/                          # Go verification & orthogonal slice risk graph engine (prismid-go v1.0.0)
         ├── go.mod
         ├── engine.go                # Challenge issuer, AEAD opener, ECDSA P-256 verifier & raw inference
         ├── graph.go                 # Deterministic O(N) Union-Find risk graph + EvidenceChain + RemoveSubject

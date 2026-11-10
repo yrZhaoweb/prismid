@@ -64,7 +64,7 @@ func main() {
 		IdleTimeout:       60 * time.Second,
 	}
 
-	log.Printf("PrismID standalone verification server v0.5.0 listening on %s (demo-mode=%v, trust-proxy=%v)", *addr, *demoMode, *trustProxy)
+	log.Printf("PrismID standalone verification server v1.0.0 listening on %s (demo-mode=%v, trust-proxy=%v)", *addr, *demoMode, *trustProxy)
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("server error: %v", err)
 	}
@@ -78,7 +78,7 @@ func newHTTPHandler(verifier *prismid.Verifier, riskGraph *prismid.RiskGraph, se
 		writeJSON(w, http.StatusOK, map[string]any{
 			"status":    "ok",
 			"engine":    "prismid-go",
-			"version":   "0.5.0",
+			"version":   "1.0.0",
 			"demo_mode": demoMode,
 		})
 	})

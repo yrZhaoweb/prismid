@@ -1,6 +1,6 @@
 # PrismID Wire & Cryptographic Protocol Specification (`PROTOCOL_SPEC.md`)
 
-This document defines the byte-level cryptographic, mathematical, and JSON schema contracts between `prismid-js` (TypeScript `v0.5.0`), `prismid-native` (Rust `v0.5.0`), and `prismid-go` (Go `v0.5.0`).
+This document defines the byte-level cryptographic, mathematical, and JSON schema contracts between `prismid-js` (TypeScript `v1.0.0`), `prismid-native` (Rust `v1.0.0`), and `prismid-go` (Go `v1.0.0`).
 
 ---
 

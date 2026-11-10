@@ -1,5 +1,5 @@
 /**
- * PrismID Web & WebView SDK (`prismid-js` v0.5.0)
+ * PrismID Web & WebView SDK (`prismid-js` v1.0.0)
  *
  * Provides 3-line integration for Browser Web apps and Tauri Desktop WebViews:
  *   1. Requests a 60s single-use challenge (`nonce` + `render_seed` [s0,s1,s2,s3])

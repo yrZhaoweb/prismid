@@ -20,8 +20,8 @@ Conventional client-side fingerprinting libraries collect ~20 browser attributes
 flowchart TB
     subgraph L1["Tier 1 & Tier 2: Client Probes & Dynamic Shader Challenge"]
         direction LR
-        Desktop["Desktop App (Tauri 2 + prismid-native v0.5.0)<br/>• macOS: ioreg IOPlatformUUID + Serial + Keychain (12ms)<br/>• Windows: MachineGuid + BIOS Serial + SMBIOS UUID + HKCU Registry<br/>• Linux: /etc/machine-id + product_uuid<br/>• Hypervisor VM Detection + OnceLock Cache"]
-        Web["Web / WebView Layer (prismid-js v0.5.0)<br/>• Non-Extractable WebCrypto ECDSA P-256 Device Key (d_key_*)<br/>• 11 Canonical WebGL Register Limits + Static 3D Hash<br/>• Bounded 350ms 5-Silo Self-Healing Storage Beacon<br/>• Dynamic render_seed 256x256 Fragment Shader<br/>• Inline Blob Worker + OffscreenCanvas Lie Probe<br/>• Raw Control-Pixel & Audio copyFromChannel Telemetry"]
+        Desktop["Desktop App (Tauri 2 + prismid-native v1.0.0)<br/>• macOS: ioreg IOPlatformUUID + Serial + Keychain (12ms)<br/>• Windows: MachineGuid + BIOS Serial + SMBIOS UUID + HKCU Registry<br/>• Linux: /etc/machine-id + product_uuid<br/>• Hypervisor VM Detection + OnceLock Cache"]
+        Web["Web / WebView Layer (prismid-js v1.0.0)<br/>• Non-Extractable WebCrypto ECDSA P-256 Device Key (d_key_*)<br/>• 11 Canonical WebGL Register Limits + Static 3D Hash<br/>• Bounded 350ms 5-Silo Self-Healing Storage Beacon<br/>• Dynamic render_seed 256x256 Fragment Shader<br/>• Inline Blob Worker + OffscreenCanvas Lie Probe<br/>• Raw Control-Pixel & Audio copyFromChannel Telemetry"]
     end
 
     subgraph Wire["Encrypted Transport Layer (Replay-Protected AEAD Envelope)"]
@@ -31,7 +31,7 @@ flowchart TB
         ChReq --> Seal --> IdReq
     end
 
-    subgraph L3["Tier 3: Go Verification Engine & Identity-Safe Risk Graph (prismid-go v0.5.0)"]
+    subgraph L3["Tier 3: Go Verification Engine & Identity-Safe Risk Graph (prismid-go v1.0.0)"]
         AntiForgery["5-Layer Verification & Raw-Measurement Inference Engine<br/>① Atomic single-use nonce consumption & TTL bounds<br/>② GLSL +0.5 pixel-center math verification (absDiff <= 2)<br/>③ ECDSA P-256 + TOFU binding + Raw Canvas/Audio/Worker inference<br/>④ Virtual GPU / Software Renderer Demotion (Confidence = 0.30)<br/>⑤ /24 Subnet Hardware Diversity Telemetry (SubnetCrowdTriggered)"]
         Slices["Hard Identity Slices vs. Soft Environment Slices<br/>• Hard Per-Device Slices: d_key_* (ECDSA P-256), d_nat_* (Desktop), d_kch_* (Keychain/Registry), d_bcn_* (5-Silo Beacon)<br/>• Soft Model/Env Slices: d_gpu_* (11 registers + 3D + Audio), d_web_*, d_sys_*, d_gpusys_*"]
         AntiForgery --> Slices
@@ -60,7 +60,7 @@ When a client report passes decryption and verification, `prismid-go` derives **
 2. **`BeaconSliceID` (`d_bcn_*`) — 128-Bit 5-Silo Self-Healing Beacon (Decoupled from GPU Drift)**:
    $$\text{d\_bcn\_*} = \texttt{"d\_bcn\_"} \parallel \text{Hex}_{32}\big(\text{HMAC}(K, \texttt{"bcn|"} \parallel \text{beacon\_id})\big)$$
    > [!IMPORTANT]
-   > In `v0.5.0`, `d_bcn_*` is persisted across 5 browser storage silos (`localStorage`, `sessionStorage`, `IndexedDB`, `CacheStorage`, and `document.cookie`) and derived **exclusively** from the 128-bit cryptographic `beacon_id` without mixing in `d_gpu_*`. Consequently, browser upgrades (e.g., Chrome 130 $\to$ 131 altering ANGLE shader hashes, WebGL extension lists, or `OfflineAudioContext` output) **never** cause `d_bcn_*` drift.
+   > In `v1.0.0`, `d_bcn_*` is persisted across 5 browser storage silos (`localStorage`, `sessionStorage`, `IndexedDB`, `CacheStorage`, and `document.cookie`) and derived **exclusively** from the 128-bit cryptographic `beacon_id` without mixing in `d_gpu_*`. Consequently, browser upgrades (e.g., Chrome 130 $\to$ 131 altering ANGLE shader hashes, WebGL extension lists, or `OfflineAudioContext` output) **never** cause `d_bcn_*` drift.
 
 ### 3.2 Shared-Model & Environment Soft Slices (Conditional Promotion & Velocity Scoring)
 
@@ -90,7 +90,7 @@ When a client report passes decryption and verification, `prismid-go` derives **
 
 ---
 
-## 5. Native Hardware Anchor Architecture (`crates/prismid-native` v0.5.0)
+## 5. Native Hardware Anchor Architecture (`crates/prismid-native` v1.0.0)
 
 - **macOS (`src/macos.rs`)**:
   - Reads `IOPlatformUUID` and `IOPlatformSerialNumber` via `ioreg -rd1 -c IOPlatformExpertDevice` (~12ms, cached in `std::sync::OnceLock`), `sysctl` CPU/VM flags, and persists a 32-byte hex anchor in macOS Login Keychain (`security find-generic-password` / `add-generic-password`) with file fallback.
