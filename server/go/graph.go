@@ -16,11 +16,13 @@ const (
 	RiskStatusRed     = "red"
 )
 
-// Default velocity windows, burst thresholds, and graph capacity bounds.
+// Default velocity windows, edge TTLs, burst thresholds, and graph capacity bounds.
 const (
 	DefaultGPUBurstWindow        = 25 * time.Minute
 	DefaultWebProfileWindow      = 2 * time.Hour
 	DefaultSameNetFarmingWindow  = 6 * time.Hour
+	DefaultSpoofEdgeTTL          = 24 * time.Hour
+	DefaultSoftEdgeTTL           = 7 * 24 * time.Hour
 	DefaultCleanBeaconBurstCount = 3
 	DefaultMaxGraphSubjects      = 50000
 	MaxSlicesPerSubject          = 16
@@ -58,17 +60,18 @@ type RiskEvidence struct {
 // ComponentSnapshot describes the connected component, calibrated log-odds score,
 // evidence chain, and risk decision for a subject.
 type ComponentSnapshot struct {
-	SubjectID         string         `json:"subject_id"`
-	RiskStatus        string         `json:"risk_status"`
-	RiskPending       bool           `json:"risk_pending"`
-	BurstSuspicion    bool           `json:"burst_suspicion,omitempty"`
-	Truncated         bool           `json:"truncated,omitempty"`
-	LogOddsScore      float64        `json:"log_odds_score"`
-	EarliestSubjectID string         `json:"earliest_subject_id,omitempty"`
-	ComponentSubjects []string       `json:"component_subjects"`
-	SliceIDs          []string       `json:"slice_ids"`
-	SharedSliceIDs    []string       `json:"shared_slice_ids"`
-	EvidenceChain     []RiskEvidence `json:"evidence_chain,omitempty"`
+	SubjectID                 string         `json:"subject_id"`
+	RiskStatus                string         `json:"risk_status"`
+	RiskPending               bool           `json:"risk_pending"`
+	BurstSuspicion            bool           `json:"burst_suspicion,omitempty"`
+	Truncated                 bool           `json:"truncated,omitempty"`
+	DeviceKeyRecoveryRequired bool           `json:"device_key_recovery_required,omitempty"`
+	LogOddsScore              float64        `json:"log_odds_score"`
+	EarliestSubjectID         string         `json:"earliest_subject_id,omitempty"`
+	ComponentSubjects         []string       `json:"component_subjects"`
+	SliceIDs                  []string       `json:"slice_ids"`
+	SharedSliceIDs            []string       `json:"shared_slice_ids"`
+	EvidenceChain             []RiskEvidence `json:"evidence_chain,omitempty"`
 }
 
 // RiskGraph evaluates connected components over deduplicated (SubjectID, SliceID) bipartite
@@ -82,21 +85,24 @@ type ComponentSnapshot struct {
 //
 //  2. Shared Model / Environment Soft Slices (d_gpu_*, d_web_*, d_sys_*, d_gpusys_*):
 //     - Accounts possessing distinct, un-spoofed hard beacons (d_bcn_A != d_bcn_B) or distinct
-//       native anchors (d_nat_A != d_nat_B) are NEVER merged into the same identity component
-//       by shared model/network soft slices, and are NEVER marked red by soft slices alone.
+//     native anchors (d_nat_A != d_nat_B) are NEVER merged into the same identity component
+//     by shared model/network soft slices, and are NEVER marked red by soft slices alone.
 //     - When >= 3 distinct clean-beacon accounts share d_gpusys_* (within 6h) or d_web_* (within 25m),
-//       the graph sets BurstSuspicion=true, RiskPending=true, and elevates green -> yellow for
-//       step-up verification without falsely merging colleagues into a red identity component.
+//     the graph sets BurstSuspicion=true, RiskPending=true, and elevates green -> yellow for
+//     step-up verification without falsely merging colleagues into a red identity component.
 //     - Soft slices merge into ComponentSubjects ONLY when active tampering (SpoofTraphit=true)
-//       is detected on that hardware slice, or when both accounts lack a storage beacon in
-//       stateless/blocked-storage mode within the burst window.
+//     is detected on that hardware slice, or when both accounts lack a storage beacon in
+//     stateless/blocked-storage mode within the burst window.
 type RiskGraph struct {
-	mu           sync.RWMutex
-	minConf      float64
-	maxSubjects  int
-	subjectOrder []string
-	subjectEdges map[string]map[string]GraphEdge
-	sliceEdges   map[string]map[string]GraphEdge
+	mu                 sync.RWMutex
+	minConf            float64
+	maxSubjects        int
+	subjectOrder       []string
+	subjectEdges       map[string]map[string]GraphEdge
+	sliceEdges         map[string]map[string]GraphEdge
+	incompleteSubjects map[string]bool
+	incompleteSlices   map[string]bool
+	historyIncomplete  bool
 }
 
 // NewRiskGraph creates a standalone thread-safe, deduplicated, capacity-bounded risk graph.
@@ -105,11 +111,13 @@ func NewRiskGraph(minConfidence float64) *RiskGraph {
 		minConfidence = AuthoritativeConfidenceThreshold
 	}
 	return &RiskGraph{
-		minConf:      minConfidence,
-		maxSubjects:  DefaultMaxGraphSubjects,
-		subjectOrder: make([]string, 0, 256),
-		subjectEdges: make(map[string]map[string]GraphEdge),
-		sliceEdges:   make(map[string]map[string]GraphEdge),
+		minConf:            minConfidence,
+		maxSubjects:        DefaultMaxGraphSubjects,
+		subjectOrder:       make([]string, 0, 256),
+		subjectEdges:       make(map[string]map[string]GraphEdge),
+		sliceEdges:         make(map[string]map[string]GraphEdge),
+		incompleteSubjects: make(map[string]bool),
+		incompleteSlices:   make(map[string]bool),
 	}
 }
 
@@ -117,6 +125,12 @@ func NewRiskGraph(minConfidence float64) *RiskGraph {
 // and returns the updated ComponentSnapshot for that subject.
 func (g *RiskGraph) RecordVerification(subjectID string, subjectCreatedAt time.Time, res *VerifyResult) ComponentSnapshot {
 	subjectID = strings.TrimSpace(subjectID)
+	if res != nil && res.DeviceKeyRecoveryRequired {
+		// Recovery cannot overwrite authoritative history or link a claimed identity.
+		snap := EvaluateSubjectComponent(nil, subjectID, g.minConf)
+		snap.DeviceKeyRecoveryRequired = true
+		return snap
+	}
 	if subjectCreatedAt.IsZero() {
 		subjectCreatedAt = time.Now().UTC()
 	}
@@ -125,9 +139,8 @@ func (g *RiskGraph) RecordVerification(subjectID string, subjectCreatedAt time.T
 	if res != nil && res.Accepted && subjectID != "" {
 		if _, exists := g.subjectEdges[subjectID]; !exists {
 			if g.maxSubjects > 0 && len(g.subjectEdges) >= g.maxSubjects && len(g.subjectOrder) > 0 {
-				oldest := g.subjectOrder[0]
-				g.subjectOrder = g.subjectOrder[1:]
-				g.removeSubjectLocked(oldest)
+				g.mu.Unlock()
+				return markIncompleteSnapshot(EvaluateSubjectComponent(nil, subjectID, g.minConf))
 			}
 			g.subjectOrder = append(g.subjectOrder, subjectID)
 			g.subjectEdges[subjectID] = make(map[string]GraphEdge)
@@ -173,21 +186,27 @@ func (g *RiskGraph) RecordVerification(subjectID string, subjectCreatedAt time.T
 					edge.Confidence = prev.Confidence
 				}
 			} else if len(subjMap) >= MaxSlicesPerSubject {
-				// Enforce per-subject slice bound (evict a soft slice so hard anchors are preserved):
+				// Prefer soft evidence, deterministically, and retain uncertainty after eviction.
 				evictSlice := ""
+				existingSlices := make([]string, 0, len(subjMap))
 				for existingSlice := range subjMap {
+					existingSlices = append(existingSlices, existingSlice)
+				}
+				sort.Strings(existingSlices)
+				for _, existingSlice := range existingSlices {
 					if !isPerDeviceHardSlice(existingSlice) {
 						evictSlice = existingSlice
 						break
 					}
 				}
 				if evictSlice == "" {
-					for existingSlice := range subjMap {
+					for _, existingSlice := range existingSlices {
 						evictSlice = existingSlice
 						break
 					}
 				}
 				if evictSlice != "" {
+					g.markEvidenceLossLocked(subjectID, evictSlice)
 					delete(subjMap, evictSlice)
 					if smap, ok := g.sliceEdges[evictSlice]; ok {
 						delete(smap, subjectID)
@@ -227,6 +246,7 @@ func (g *RiskGraph) RecordVerification(subjectID string, subjectCreatedAt time.T
 					}
 				}
 				if evictSID != "" {
+					g.markEvidenceLossLocked(evictSID, sliceID)
 					delete(smap, evictSID)
 					if emap, ok := g.subjectEdges[evictSID]; ok {
 						delete(emap, sliceID)
@@ -241,8 +261,7 @@ func (g *RiskGraph) RecordVerification(subjectID string, subjectCreatedAt time.T
 
 	snap := EvaluateSubjectComponent(subEdges, subjectID, g.minConf)
 	if truncated {
-		snap.Truncated = true
-		snap.RiskPending = true
+		return markIncompleteSnapshot(snap)
 	}
 	return snap
 }
@@ -255,8 +274,7 @@ func (g *RiskGraph) EvaluateSubject(subjectID string) ComponentSnapshot {
 	g.mu.RUnlock()
 	snap := EvaluateSubjectComponent(subEdges, subjectID, g.minConf)
 	if truncated {
-		snap.Truncated = true
-		snap.RiskPending = true
+		return markIncompleteSnapshot(snap)
 	}
 	return snap
 }
@@ -296,12 +314,33 @@ func (g *RiskGraph) removeSubjectLocked(subjectID string) {
 		}
 	}
 	delete(g.subjectEdges, subjectID)
+	delete(g.incompleteSubjects, subjectID)
 }
 
-// collectLocalSubgraphEdgesLocked extracts the connected identity component of targetSubjectID
-// across all hops of hard identity / tampered slices (up to MaxComponentSize=512, avoiding
-// 3-hop truncation on chains like A-B-C-D-E), plus 1-hop soft-slice neighbors for burst counting.
-// The returned edges slice is deterministically sorted by (SubjectCreatedAt, SubjectID, SliceID).
+// Retain bounded loss markers even if an evicted slice no longer has cached edges.
+// A subsequent observation must not mistake forgotten evidence for a clean first visit.
+func (g *RiskGraph) markEvidenceLossLocked(subjectID, sliceID string) {
+	g.incompleteSubjects[subjectID] = true
+	const maxLossMarkers = DefaultMaxGraphSubjects * MaxSlicesPerSubject
+	if !g.incompleteSlices[sliceID] && len(g.incompleteSlices) >= maxLossMarkers {
+		g.historyIncomplete = true
+		return
+	}
+	g.incompleteSlices[sliceID] = true
+}
+
+func markIncompleteSnapshot(snap ComponentSnapshot) ComponentSnapshot {
+	snap.Truncated = true
+	snap.RiskPending = true
+	snap.EarliestSubjectID = ""
+	if snap.RiskStatus != RiskStatusRed {
+		snap.RiskStatus = RiskStatusUnknown
+	}
+	return snap
+}
+
+// Expand eligible identity edges to closure, then add non-linking velocity neighbors.
+// Soft neighbors that can merge enter the queue and expand their hard anchors too.
 func (g *RiskGraph) collectLocalSubgraphEdgesLocked(targetSubjectID string) ([]GraphEdge, bool) {
 	if targetSubjectID == "" {
 		return nil, false
@@ -309,71 +348,76 @@ func (g *RiskGraph) collectLocalSubgraphEdgesLocked(targetSubjectID string) ([]G
 	if _, ok := g.subjectEdges[targetSubjectID]; !ok {
 		return nil, false
 	}
-
-	visitedSubjects := map[string]bool{targetSubjectID: true}
-	visitedHardSlices := make(map[string]bool)
-	frontier := []string{targetSubjectID}
-	truncated := false
-
-	// Phase 1: Full multi-hop BFS across hard identity slices and tampered slices (no 3-hop limit!)
-	for len(frontier) > 0 && !truncated {
-		sort.Strings(frontier)
-		var nextFrontier []string
-		for _, sid := range frontier {
-			for sliceID, edge := range g.subjectEdges[sid] {
-				if visitedHardSlices[sliceID] {
-					continue
-				}
-				canMultiHop := isPerDeviceHardSlice(sliceID) || edge.SpoofTraphit || !edge.HasBeacon
-				if !canMultiHop {
-					continue
-				}
-				visitedHardSlices[sliceID] = true
-				for neighborSID, neighborEdge := range g.sliceEdges[sliceID] {
-					if !isPerDeviceHardSlice(sliceID) && !edge.SpoofTraphit && !neighborEdge.SpoofTraphit &&
-						(edge.HasBeacon && neighborEdge.HasBeacon) {
-						continue
-					}
-					if !visitedSubjects[neighborSID] {
-						if len(visitedSubjects) >= MaxComponentSize {
-							truncated = true
-							break
-						}
-						visitedSubjects[neighborSID] = true
-						nextFrontier = append(nextFrontier, neighborSID)
-					}
-				}
-				if truncated {
-					break
-				}
-			}
-			if truncated {
-				break
-			}
+	visited := map[string]bool{targetSubjectID: true}
+	queue := []string{targetSubjectID}
+	processedHard := make(map[string]bool)
+	truncated := g.historyIncomplete
+	sortedSlices := func(sid string) []string {
+		ids := make([]string, 0, len(g.subjectEdges[sid]))
+		for id := range g.subjectEdges[sid] {
+			ids = append(ids, id)
 		}
-		frontier = nextFrontier
+		sort.Strings(ids)
+		return ids
 	}
-
-	// Phase 2: Include 1-hop soft-slice neighbors of targetSubjectID so velocity burst density
-	// on d_gpusys_* / d_web_* / d_gpu_* can be evaluated deterministically.
-	for sliceID := range g.subjectEdges[targetSubjectID] {
-		if visitedHardSlices[sliceID] {
-			continue
+	sortedNeighbors := func(slice string) []string {
+		ids := make([]string, 0, len(g.sliceEdges[slice]))
+		for id := range g.sliceEdges[slice] {
+			ids = append(ids, id)
 		}
-		for neighborSID := range g.sliceEdges[sliceID] {
-			if !visitedSubjects[neighborSID] {
-				if len(visitedSubjects) >= MaxComponentSize {
+		sort.Strings(ids)
+		return ids
+	}
+	for head := 0; head < len(queue); head++ {
+		sid := queue[head]
+		for _, slice := range sortedSlices(sid) {
+			edge := g.subjectEdges[sid][slice]
+			if edge.Confidence < g.minConf {
+				continue
+			}
+			hard := isPerDeviceHardSlice(slice)
+			if hard && processedHard[slice] {
+				continue
+			}
+			if hard {
+				processedHard[slice] = true
+			}
+			for _, neighbor := range sortedNeighbors(slice) {
+				next := g.sliceEdges[slice][neighbor]
+				if visited[neighbor] || next.Confidence < g.minConf ||
+					!shouldMergeStatelessOrSpoofed(slice, edge, next) {
+					continue
+				}
+				if len(visited) >= MaxComponentSize {
 					truncated = true
-					break
+					continue
 				}
-				visitedSubjects[neighborSID] = true
+				visited[neighbor] = true
+				queue = append(queue, neighbor)
 			}
 		}
 	}
-
-	out := make([]GraphEdge, 0, len(visitedSubjects)*4)
-	for sid := range visitedSubjects {
-		for _, edge := range g.subjectEdges[sid] {
+	for _, slice := range sortedSlices(targetSubjectID) {
+		for _, neighbor := range sortedNeighbors(slice) {
+			if visited[neighbor] || g.sliceEdges[slice][neighbor].Confidence < g.minConf {
+				continue
+			}
+			if len(visited) >= MaxComponentSize {
+				truncated = true
+				continue
+			}
+			visited[neighbor] = true
+		}
+	}
+	out := make([]GraphEdge, 0, len(visited)*4)
+	for sid := range visited {
+		if g.incompleteSubjects[sid] {
+			truncated = true
+		}
+		for slice, edge := range g.subjectEdges[sid] {
+			if g.incompleteSlices[slice] {
+				truncated = true
+			}
 			out = append(out, edge)
 		}
 	}
@@ -418,10 +462,31 @@ func hasDifferentCleanBeacons(a, b GraphEdge) bool {
 	return a.HasBeacon && b.HasBeacon
 }
 
-// shouldMergeStatelessOrSpoofed determines whether two consecutive observations `a` and `b`
+func sharesHardAnchorOnEdge(a, b GraphEdge) bool {
+	if a.BeaconSliceID != "" && a.BeaconSliceID == b.BeaconSliceID {
+		return true
+	}
+	if a.DeviceKeySliceID != "" && a.DeviceKeySliceID == b.DeviceKeySliceID {
+		return true
+	}
+	if a.NativeSliceID != "" && a.NativeSliceID == b.NativeSliceID {
+		return true
+	}
+	return false
+}
+
+// shouldMergeStatelessOrSpoofed determines whether two observations `a` and `b`
 // on a soft slice should merge into the same identity connected component.
-// Note: Accounts with distinct, un-spoofed beacons (hasDifferentCleanBeacons == true) NEVER
-// merge into ComponentSubjects via soft slices; instead they are evaluated by velocity scoring.
+//
+// P0 Invariant (DeepSeek v0.5 Review):
+//   - A spoofed observation (SpoofTraphit=true) NEVER unconditionally merges across a model-wide
+//     slice (d_gpu_* / d_web_*), which would allow one privacy-extension user or griefing attacker
+//     to poison all clean users of the same laptop model.
+//   - Instead, a spoofed observation on a soft slice merges ONLY when:
+//     1) The two observations share a hard anchor (d_bcn_*, d_key_*, d_nat_*), OR
+//     2) They share the same /24 subnet + GPU/OS (d_gpusys_*) within DefaultGPUBurstWindow (25m), OR
+//     3) Both observations are stateless (no storage beacon) within DefaultGPUBurstWindow (25m);
+//     AND their time delta is within DefaultSpoofEdgeTTL (24h).
 func shouldMergeStatelessOrSpoofed(slice string, a, b GraphEdge) bool {
 	if isPerDeviceHardSlice(slice) {
 		return true
@@ -429,24 +494,39 @@ func shouldMergeStatelessOrSpoofed(slice string, a, b GraphEdge) bool {
 	if hasDifferentCleanNativeAnchors(a, b) {
 		return false
 	}
-	if a.SpoofTraphit || b.SpoofTraphit {
-		// Active spoofing/tampering trap triggered on shared hardware slice:
-		if strings.HasPrefix(slice, "d_gpu_") || strings.HasPrefix(slice, "d_web_") || strings.HasPrefix(slice, "d_gpusys_") {
-			return true
-		}
-		return false
-	}
-	// Never merge two accounts with distinct clean beacons on a soft slice (GPT R2 & DeepSeek #3):
-	if hasDifferentCleanBeacons(a, b) {
-		return false
-	}
 
 	dt := a.SubjectCreatedAt.Sub(b.SubjectCreatedAt)
 	if dt < 0 {
 		dt = -dt
 	}
+	// Soft-slice edges expire after DefaultSoftEdgeTTL (7 days) to prevent permanent slice poisoning:
+	if dt > DefaultSoftEdgeTTL {
+		return false
+	}
 
-	// Stateless / no-beacon observations (or identical beacon):
+	if a.SpoofTraphit || b.SpoofTraphit {
+		// Spoofed soft-slice edges expire after DefaultSpoofEdgeTTL (24 hours):
+		if dt > DefaultSpoofEdgeTTL {
+			return false
+		}
+		if sharesHardAnchorOnEdge(a, b) {
+			return true
+		}
+		if strings.HasPrefix(slice, "d_gpusys_") && dt <= DefaultGPUBurstWindow {
+			return true
+		}
+		if !a.HasBeacon && !b.HasBeacon && dt <= DefaultGPUBurstWindow &&
+			(strings.HasPrefix(slice, "d_gpu_") || strings.HasPrefix(slice, "d_web_") || strings.HasPrefix(slice, "d_sys_")) {
+			return true
+		}
+		return false
+	}
+	// Never merge two accounts with distinct clean beacons on a soft slice (GPT R2 & DeepSeek #3):
+	if hasDifferentCleanBeacons(a, b) || a.HasBeacon || b.HasBeacon {
+		return false
+	}
+
+	// Stateless / no-beacon observations:
 	if strings.HasPrefix(slice, "d_gpusys_") {
 		return dt <= DefaultSameNetFarmingWindow
 	}
@@ -647,43 +727,23 @@ func EvaluateSubjectComponent(edges []GraphEdge, targetSubjectID string, minConf
 			continue
 		}
 
-		// For soft slices:
-		// 1) Any observation with SpoofTraphit=true merges with compatible observations on this hardware slice in O(N)
-		var spoofedAnchor *GraphEdge
-		for idx := range obsList {
-			if obsList[idx].SpoofTraphit {
-				spoofedAnchor = &obsList[idx]
-				break
-			}
-		}
-		if spoofedAnchor != nil && (strings.HasPrefix(slice, "d_gpu_") || strings.HasPrefix(slice, "d_web_") || strings.HasPrefix(slice, "d_gpusys_")) {
-			linked := false
-			for k := 0; k < len(obsList); k++ {
-				if obsList[k].SubjectID == spoofedAnchor.SubjectID {
-					continue
+		// For soft slices: evaluate bounded sliding-window pairs (obsList is canonical-sorted by SubjectCreatedAt)
+		// using shouldMergeStatelessOrSpoofed so spoofed observations NEVER poison unrelated clean users across d_gpu_*/d_web_*.
+		for i := 0; i < len(obsList); i++ {
+			a := obsList[i]
+			for j := i + 1; j < len(obsList); j++ {
+				b := obsList[j]
+				if b.SubjectCreatedAt.Sub(a.SubjectCreatedAt) > DefaultSoftEdgeTTL {
+					break
 				}
-				if !hasDifferentCleanNativeAnchors(*spoofedAnchor, obsList[k]) {
-					union(spoofedAnchor.SubjectID, obsList[k].SubjectID)
-					linked = true
+				if a.SubjectID != b.SubjectID && shouldMergeStatelessOrSpoofed(slice, a, b) {
+					union(a.SubjectID, b.SubjectID)
+					if !strings.HasPrefix(slice, "d_gpusys_") {
+						activeSharedSlices[slice] = true
+					} else if gpuSlice := findSubjectPrefixSlice(subjectSlices[a.SubjectID], "d_gpu_"); gpuSlice != "" {
+						activeSharedSlices[gpuSlice] = true
+					}
 				}
-			}
-			if linked {
-				activeSharedSlices[slice] = true
-			}
-		}
-
-		// 2) Stateless / no-beacon observations sorted by SubjectCreatedAt link adjacent items in O(N)
-		var statelessObs []GraphEdge
-		for _, o := range obsList {
-			if !o.HasBeacon && !o.SpoofTraphit {
-				statelessObs = append(statelessObs, o)
-			}
-		}
-		for k := 1; k < len(statelessObs); k++ {
-			a, b := statelessObs[k-1], statelessObs[k]
-			if a.SubjectID != b.SubjectID && shouldMergeStatelessOrSpoofed(slice, a, b) {
-				union(a.SubjectID, b.SubjectID)
-				activeSharedSlices[slice] = true
 			}
 		}
 	}
@@ -792,8 +852,34 @@ func EvaluateSubjectComponent(edges []GraphEdge, targetSubjectID string, minConf
 	status := RiskStatusGreen
 	riskPending := false
 
+	targetHasBeacon := false
+	sharesHardWithMember := false
+	for sl := range subjectSlices[targetSubjectID] {
+		if strings.HasPrefix(sl, "d_bcn_") {
+			targetHasBeacon = true
+		}
+		if isPerDeviceHardSlice(sl) {
+			for _, otherSID := range members {
+				if otherSID != targetSubjectID {
+					if _, ok := subjectSlices[otherSID][sl]; ok {
+						sharesHardWithMember = true
+						break
+					}
+				}
+			}
+		}
+	}
+
 	if len(members) > 1 {
-		if componentSpoofed {
+		if spoofed[targetSubjectID] {
+			status = RiskStatusRed
+		} else if targetHasBeacon && !sharesHardWithMember {
+			// P0 Fix (DeepSeek v0.5 Review): A clean user with its own distinct beacon who was
+			// pulled into a component ONLY via a soft slice (d_gpusys_* within 25m on the same /24)
+			// due to a spoofed neighbor is capped at yellow + RiskPending=true (never red).
+			status = RiskStatusYellow
+			riskPending = true
+		} else if componentSpoofed {
 			status = RiskStatusRed
 		} else if targetSubjectID == earliest {
 			status = RiskStatusYellow

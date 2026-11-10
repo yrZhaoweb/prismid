@@ -375,169 +375,128 @@ function getSubtleCrypto() {
     }
     return null;
 }
-function readKeyFromIDB() {
+function isStoredKey(value) {
+    const rec = value;
+    return !!rec && typeof rec === 'object' && !!rec.privateKey &&
+        rec.privateKey.type === 'private' && rec.privateKey.extractable === false &&
+        rec.privateKey.algorithm?.name === 'ECDSA' &&
+        rec.privateKey.algorithm.namedCurve === 'P-256' &&
+        Array.isArray(rec.privateKey.usages) && rec.privateKey.usages.includes('sign') && typeof rec.pubKeyHex === 'string' &&
+        /^04[0-9a-f]{128}$/.test(rec.pubKeyHex);
+}
+// The read and conditional insert share one readwrite transaction. IndexedDB serializes
+// these transactions across tabs, so concurrent first visits all use the committed winner.
+function loadOrCreatePersistedKey(candidate) {
+    if (typeof indexedDB === 'undefined' || !indexedDB)
+        return Promise.resolve(null);
     return new Promise((resolve) => {
-        if (typeof indexedDB === 'undefined' || !indexedDB) {
-            resolve(null);
-            return;
-        }
         let settled = false;
-        const done = (val) => {
+        let db;
+        let tx;
+        const finish = (value) => {
             if (settled)
                 return;
             settled = true;
-            resolve(val);
+            clearTimeout(timer);
+            if (!value) {
+                try {
+                    tx?.abort();
+                }
+                catch { }
+            }
+            try {
+                db?.close();
+            }
+            catch { }
+            resolve(value);
         };
-        const timer = setTimeout(() => done(null), IDB_KEY_TIMEOUT_MS);
+        const timer = setTimeout(() => finish(null), IDB_KEY_TIMEOUT_MS);
         try {
             const req = indexedDB.open(KEY_DB_NAME, 1);
+            req.onblocked = req.onerror = () => finish(null);
             req.onupgradeneeded = () => {
-                const db = req.result;
-                if (!db.objectStoreNames.contains(KEY_STORE_NAME)) {
-                    db.createObjectStore(KEY_STORE_NAME);
+                if (settled) {
+                    req.transaction?.abort();
+                    return;
+                }
+                if (!req.result.objectStoreNames.contains(KEY_STORE_NAME)) {
+                    req.result.createObjectStore(KEY_STORE_NAME);
                 }
             };
-            req.onerror = () => {
-                clearTimeout(timer);
-                done(null);
-            };
-            req.onblocked = () => {
-                clearTimeout(timer);
-                done(null);
-            };
             req.onsuccess = () => {
-                const db = req.result;
+                db = req.result;
+                if (settled) {
+                    db.close();
+                    return;
+                }
+                db.onversionchange = () => db?.close();
                 try {
-                    const tx = db.transaction(KEY_STORE_NAME, 'readonly');
+                    tx = db.transaction(KEY_STORE_NAME, 'readwrite');
                     const store = tx.objectStore(KEY_STORE_NAME);
-                    const getReq = store.get(KEY_RECORD_ID);
-                    getReq.onsuccess = () => {
-                        clearTimeout(timer);
-                        const rec = getReq.result;
-                        db.close();
-                        if (rec &&
-                            typeof rec === 'object' &&
-                            rec.privateKey &&
-                            typeof rec.pubKeyHex === 'string' &&
-                            /^[0-9a-f]{130}$/.test(rec.pubKeyHex)) {
-                            done(rec);
+                    let winner = null;
+                    tx.oncomplete = () => finish(winner);
+                    tx.onerror = tx.onabort = () => finish(null);
+                    const read = store.get(KEY_RECORD_ID);
+                    read.onerror = () => finish(null);
+                    read.onsuccess = () => {
+                        if (settled)
+                            return;
+                        try {
+                            if (read.result === undefined) {
+                                winner = candidate;
+                                // Never overwrite another page's existing key (or an unreadable record).
+                                store.add(candidate, KEY_RECORD_ID);
+                            }
+                            else if (isStoredKey(read.result)) {
+                                winner = read.result;
+                            }
                         }
-                        else {
-                            done(null);
+                        catch {
+                            finish(null);
                         }
-                    };
-                    getReq.onerror = () => {
-                        clearTimeout(timer);
-                        db.close();
-                        done(null);
                     };
                 }
                 catch {
-                    clearTimeout(timer);
-                    db.close();
-                    done(null);
+                    finish(null);
                 }
             };
         }
         catch {
-            clearTimeout(timer);
-            done(null);
+            finish(null);
         }
     });
 }
-function writeKeyToIDB(rec) {
-    return new Promise((resolve) => {
-        if (typeof indexedDB === 'undefined' || !indexedDB) {
-            resolve();
-            return;
-        }
-        let settled = false;
-        const done = () => {
-            if (settled)
-                return;
-            settled = true;
-            resolve();
-        };
-        const timer = setTimeout(done, IDB_KEY_TIMEOUT_MS);
-        try {
-            const req = indexedDB.open(KEY_DB_NAME, 1);
-            req.onupgradeneeded = () => {
-                const db = req.result;
-                if (!db.objectStoreNames.contains(KEY_STORE_NAME)) {
-                    db.createObjectStore(KEY_STORE_NAME);
-                }
-            };
-            req.onerror = () => {
-                clearTimeout(timer);
-                done();
-            };
-            req.onblocked = () => {
-                clearTimeout(timer);
-                done();
-            };
-            req.onsuccess = () => {
-                const db = req.result;
-                try {
-                    const tx = db.transaction(KEY_STORE_NAME, 'readwrite');
-                    const store = tx.objectStore(KEY_STORE_NAME);
-                    store.put(rec, KEY_RECORD_ID);
-                    tx.oncomplete = () => {
-                        clearTimeout(timer);
-                        db.close();
-                        done();
-                    };
-                    tx.onerror = () => {
-                        clearTimeout(timer);
-                        db.close();
-                        done();
-                    };
-                    tx.onabort = () => {
-                        clearTimeout(timer);
-                        db.close();
-                        done();
-                    };
-                }
-                catch {
-                    clearTimeout(timer);
-                    db.close();
-                    done();
-                }
-            };
-        }
-        catch {
-            clearTimeout(timer);
-            done();
-        }
-    });
-}
+let keyInitialization = null;
 async function getOrCreateDeviceKeyRecord() {
-    if (memoryCachedKey) {
+    if (memoryCachedKey)
         return memoryCachedKey;
-    }
+    if (keyInitialization)
+        return keyInitialization;
     const subtle = getSubtleCrypto();
-    if (!subtle) {
+    if (!subtle || typeof indexedDB === 'undefined' || !indexedDB)
         return null;
-    }
-    const existing = await readKeyFromIDB();
-    if (existing) {
-        memoryCachedKey = existing;
-        return existing;
-    }
+    keyInitialization = (async () => {
+        try {
+            const pair = await subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, false, ['sign', 'verify']);
+            const rawPub = await subtle.exportKey('raw', pair.publicKey);
+            const persisted = await loadOrCreatePersistedKey({
+                privateKey: pair.privateKey,
+                pubKeyHex: bytesToHex(new Uint8Array(rawPub)),
+            });
+            // Only a confirmed transaction commit may establish a server-side TOFU binding.
+            if (persisted)
+                memoryCachedKey = persisted;
+            return persisted;
+        }
+        catch {
+            return null;
+        }
+    })();
     try {
-        const keyPair = await subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, false, // non-extractable private key!
-        ['sign', 'verify']);
-        const rawPub = await subtle.exportKey('raw', keyPair.publicKey);
-        const pubKeyHex = bytesToHex(new Uint8Array(rawPub));
-        const record = {
-            privateKey: keyPair.privateKey,
-            pubKeyHex,
-        };
-        memoryCachedKey = record;
-        await writeKeyToIDB(record);
-        return record;
+        return await keyInitialization;
     }
-    catch {
-        return null;
+    finally {
+        keyInitialization = null;
     }
 }
 export function buildDeviceKeyTranscript(params) {
@@ -2309,14 +2268,10 @@ export function createPrismClient(options = {}) {
                 ? withDeadline(Promise.resolve(options.getTurnstileToken()).catch(() => undefined), providerTimeoutMs, undefined)
                 : Promise.resolve(undefined),
         ]);
-        const effectiveWebGLHash = workerLie.worker_static_webgl_fp_hash &&
-            workerLie.worker_static_webgl_fp_hash !== 'worker-webgl-unavailable'
-            ? workerLie.worker_static_webgl_fp_hash
-            : webgl.static_webgl_fp_hash;
         const deviceKey = await withDeadline(signChallengeWithDeviceKey({
             nonce: challenge.nonce,
             beaconId: storageBeacon.beacon_id,
-            staticWebGLFpHash: effectiveWebGLHash,
+            staticWebGLFpHash: webgl.static_webgl_fp_hash,
             audioCompressorHash: audioRes.audio_compressor_hash,
         }), 350, undefined);
         const payload = {
@@ -2455,7 +2410,7 @@ export function createPrismClient(options = {}) {
                 if (!idRes.ok && candidate.accepted !== false) {
                     return null;
                 }
-                if (candidate.accepted) {
+                if (candidate.accepted && !candidate.risk_pending && !candidate.device_key_recovery_required) {
                     lastIdentifiedToken = token;
                     lastIdentifiedAt = Date.now();
                 }

@@ -98,6 +98,8 @@ export interface IdentifyResponse {
   confidence?: number
   exact_slice_id?: string
   device_key_slice_id?: string
+  device_key_attested?: boolean
+  device_key_recovery_required?: boolean
   keychain_slice_id?: string
   beacon_slice_id?: string
   gpu_audio_slice_id?: string
@@ -111,6 +113,7 @@ export interface IdentifyResponse {
   privacy_signals?: string[]
   risk_status?: string
   risk_pending?: boolean
+  truncated?: boolean
   burst_suspicion?: boolean
   log_odds_score?: number
   evidence_chain?: RiskEvidenceItem[]
@@ -421,17 +424,11 @@ export function createPrismClient(options: PrismClientOptions = {}): PrismClient
         : Promise.resolve(undefined),
     ])
 
-    const effectiveWebGLHash =
-      workerLie.worker_static_webgl_fp_hash &&
-      workerLie.worker_static_webgl_fp_hash !== 'worker-webgl-unavailable'
-        ? workerLie.worker_static_webgl_fp_hash
-        : webgl.static_webgl_fp_hash
-
     const deviceKey = await withDeadline(
       signChallengeWithDeviceKey({
         nonce: challenge.nonce,
         beaconId: storageBeacon.beacon_id,
-        staticWebGLFpHash: effectiveWebGLHash,
+        staticWebGLFpHash: webgl.static_webgl_fp_hash,
         audioCompressorHash: audioRes.audio_compressor_hash,
       }),
       350,
@@ -597,7 +594,7 @@ export function createPrismClient(options: PrismClientOptions = {}): PrismClient
           return null
         }
 
-        if (candidate.accepted) {
+        if (candidate.accepted && !candidate.risk_pending && !candidate.device_key_recovery_required) {
           lastIdentifiedToken = token
           lastIdentifiedAt = Date.now()
         }

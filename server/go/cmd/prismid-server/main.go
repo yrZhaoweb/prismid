@@ -53,7 +53,25 @@ func main() {
 	}, prismid.NewMemoryChallengeStore())
 	riskGraph := prismid.NewRiskGraph(prismid.AuthoritativeConfidenceThreshold)
 
-	allowProxyHeaders := *trustProxy || *demoMode
+	handler := newHTTPHandler(verifier, riskGraph, []byte(secret), *demoMode, *trustProxy, *corsOrigin)
+
+	srv := &http.Server{
+		Addr:              *addr,
+		Handler:           handler,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      10 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
+
+	log.Printf("PrismID standalone verification server v0.5.0 listening on %s (demo-mode=%v, trust-proxy=%v)", *addr, *demoMode, *trustProxy)
+	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		log.Fatalf("server error: %v", err)
+	}
+}
+
+func newHTTPHandler(verifier *prismid.Verifier, riskGraph *prismid.RiskGraph, secret []byte, demoMode, trustProxy bool, corsOrigin string) http.Handler {
+	allowProxyHeaders := trustProxy || demoMode
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
@@ -61,7 +79,7 @@ func main() {
 			"status":    "ok",
 			"engine":    "prismid-go",
 			"version":   "0.5.0",
-			"demo_mode": *demoMode,
+			"demo_mode": demoMode,
 		})
 	})
 
@@ -72,7 +90,7 @@ func main() {
 	})
 
 	mux.HandleFunc("/api/v1/risk/should-collect", func(w http.ResponseWriter, r *http.Request) {
-		enableCORS(w, r, *demoMode, *corsOrigin)
+		enableCORS(w, r, demoMode, corsOrigin)
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return
@@ -83,13 +101,21 @@ func main() {
 	})
 
 	mux.HandleFunc("/api/v1/risk/challenge", func(w http.ResponseWriter, r *http.Request) {
-		enableCORS(w, r, *demoMode, *corsOrigin)
+		enableCORS(w, r, demoMode, corsOrigin)
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
 		if r.Method != http.MethodPost {
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
+			return
+		}
+		subjectID, authErr := extractVerifiedSubjectID(r, demoMode, secret)
+		if authErr || (!demoMode && subjectID == "") {
+			writeJSON(w, http.StatusUnauthorized, map[string]any{
+				"accepted": false,
+				"error":    "invalid or unverified bearer token; when -demo-mode=false, Authorization must be Bearer <subject_id>.<hmac_sha256_hex>",
+			})
 			return
 		}
 		r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
@@ -102,13 +128,21 @@ func main() {
 	})
 
 	mux.HandleFunc("/api/v1/risk/identify", func(w http.ResponseWriter, r *http.Request) {
-		enableCORS(w, r, *demoMode, *corsOrigin)
+		enableCORS(w, r, demoMode, corsOrigin)
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
 		if r.Method != http.MethodPost {
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
+			return
+		}
+		subjectID, authErr := extractVerifiedSubjectID(r, demoMode, secret)
+		if authErr || (!demoMode && subjectID == "") {
+			writeJSON(w, http.StatusUnauthorized, map[string]any{
+				"accepted": false,
+				"error":    "invalid or unverified bearer token; when -demo-mode=false, Authorization must be Bearer <subject_id>.<hmac_sha256_hex>",
+			})
 			return
 		}
 		r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
@@ -135,37 +169,31 @@ func main() {
 			return
 		}
 
-		subjectID, authErr := extractVerifiedSubjectID(r, *demoMode, []byte(secret))
-		if authErr {
-			writeJSON(w, http.StatusUnauthorized, map[string]any{
-				"accepted": false,
-				"error":    "invalid or unverified bearer token; when -demo-mode=false, Authorization must be Bearer <subject_id>.<hmac_sha256_hex>",
-			})
-			return
-		}
 		if subjectID != "" {
 			snap := riskGraph.RecordVerification(subjectID, time.Now().UTC(), res)
 			writeJSON(w, http.StatusOK, map[string]any{
-				"accepted":               res.Accepted,
-				"confidence":             res.Confidence,
-				"device_key_slice_id":    res.DeviceKeySliceID,
-				"device_key_attested":    res.DeviceKeyAttested,
-				"exact_slice_id":         res.ExactSliceID,
-				"keychain_slice_id":      res.KeychainSliceID,
-				"beacon_slice_id":        res.BeaconSliceID,
-				"gpu_audio_slice_id":     res.GpuAudioSliceID,
-				"sys_net_slice_id":       res.SysNetSliceID,
-				"crowd_slice_id":         res.CrowdSliceID,
-				"subnet_crowd_triggered": res.SubnetCrowdTriggered,
-				"ip_subnet":              res.IPSubnet,
-				"is_native":              res.IsNative,
-				"is_virtual_gpu":         res.IsVirtualGPU,
-				"spoof_trap_triggered":   res.SpoofTrapTriggered,
-				"spoof_flags":            res.SpoofFlags,
-				"privacy_signals":        res.PrivacySignals,
-				"risk_status":            snap.RiskStatus,
-				"risk_pending":           snap.RiskPending,
-				"component_snapshot":     snap,
+				"accepted":                     res.Accepted,
+				"confidence":                   res.Confidence,
+				"device_key_slice_id":          res.DeviceKeySliceID,
+				"device_key_attested":          res.DeviceKeyAttested,
+				"device_key_recovery_required": res.DeviceKeyRecoveryRequired,
+				"exact_slice_id":               res.ExactSliceID,
+				"keychain_slice_id":            res.KeychainSliceID,
+				"beacon_slice_id":              res.BeaconSliceID,
+				"gpu_audio_slice_id":           res.GpuAudioSliceID,
+				"sys_net_slice_id":             res.SysNetSliceID,
+				"crowd_slice_id":               res.CrowdSliceID,
+				"subnet_crowd_triggered":       res.SubnetCrowdTriggered,
+				"ip_subnet":                    res.IPSubnet,
+				"is_native":                    res.IsNative,
+				"is_virtual_gpu":               res.IsVirtualGPU,
+				"spoof_trap_triggered":         res.SpoofTrapTriggered,
+				"spoof_flags":                  res.SpoofFlags,
+				"privacy_signals":              res.PrivacySignals,
+				"risk_status":                  snap.RiskStatus,
+				"risk_pending":                 snap.RiskPending,
+				"truncated":                    snap.Truncated,
+				"component_snapshot":           snap,
 			})
 			return
 		}
@@ -175,7 +203,7 @@ func main() {
 	// Explainability endpoint (DeepSeek #6): returns the full ComponentSnapshot, calibrated
 	// LogOddsScore, SharedSliceIDs, and human-readable EvidenceChain for a subject.
 	mux.HandleFunc("/api/v1/risk/explain", func(w http.ResponseWriter, r *http.Request) {
-		enableCORS(w, r, *demoMode, *corsOrigin)
+		enableCORS(w, r, demoMode, corsOrigin)
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return
@@ -184,7 +212,7 @@ func main() {
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
 			return
 		}
-		subjectID, authErr := extractVerifiedSubjectID(r, *demoMode, []byte(secret))
+		subjectID, authErr := extractVerifiedSubjectID(r, demoMode, secret)
 		if authErr || subjectID == "" {
 			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "verified subject identity required"})
 			return
@@ -195,7 +223,7 @@ func main() {
 
 	// Privacy erasure endpoint (DeepSeek #6 GDPR/CCPA): removes all graph edges for a subject.
 	mux.HandleFunc("/api/v1/risk/subject", func(w http.ResponseWriter, r *http.Request) {
-		enableCORS(w, r, *demoMode, *corsOrigin)
+		enableCORS(w, r, demoMode, corsOrigin)
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return
@@ -204,7 +232,7 @@ func main() {
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
 			return
 		}
-		subjectID, authErr := extractVerifiedSubjectID(r, *demoMode, []byte(secret))
+		subjectID, authErr := extractVerifiedSubjectID(r, demoMode, secret)
 		if authErr || subjectID == "" {
 			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "verified subject identity required"})
 			return
@@ -217,7 +245,7 @@ func main() {
 	})
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
-		if !*demoMode {
+		if !demoMode {
 			writeJSON(w, http.StatusNotFound, map[string]any{"error": "demo console disabled"})
 			return
 		}
@@ -225,19 +253,7 @@ func main() {
 		_, _ = w.Write([]byte(standaloneIndexHTML))
 	})
 
-	srv := &http.Server{
-		Addr:              *addr,
-		Handler:           mux,
-		ReadHeaderTimeout: 5 * time.Second,
-		ReadTimeout:       10 * time.Second,
-		WriteTimeout:      10 * time.Second,
-		IdleTimeout:       60 * time.Second,
-	}
-
-	log.Printf("PrismID standalone verification server v0.5.0 listening on %s (demo-mode=%v, trust-proxy=%v)", *addr, *demoMode, *trustProxy)
-	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		log.Fatalf("server error: %v", err)
-	}
+	return mux
 }
 
 func extractClientIP(r *http.Request, allowProxyHeaders bool) string {
@@ -259,10 +275,16 @@ func extractClientIP(r *http.Request, allowProxyHeaders bool) string {
 	return r.RemoteAddr
 }
 
-// SignSubjectBearerToken creates an HMAC-SHA256 authenticated bearer token for a subject:
-// `<subject_id>.<hex(HMAC_SHA256(secret, "prismid-auth|" + subject_id))>`.
+func deriveBearerAuthKey(secret []byte) []byte {
+	sum := sha256.Sum256(append([]byte("prismid-bearer-auth-v1:"), secret...))
+	return sum[:]
+}
+
+// SignSubjectBearerToken creates an HMAC-SHA256 authenticated bearer token for a subject
+// using a domain-separated subkey derived from secret:
+// `<subject_id>.<hex(HMAC_SHA256(subkey, "prismid-auth|" + subject_id))>`.
 func SignSubjectBearerToken(subjectID string, secret []byte) string {
-	mac := hmac.New(sha256.New, secret)
+	mac := hmac.New(sha256.New, deriveBearerAuthKey(secret))
 	mac.Write([]byte("prismid-auth|" + subjectID))
 	return subjectID + "." + hex.EncodeToString(mac.Sum(nil))
 }
@@ -300,7 +322,7 @@ func extractVerifiedSubjectID(r *http.Request, demoMode bool, hmacSecret []byte)
 		sigHex := rawToken[idx+1:]
 		sigBytes, err := hex.DecodeString(sigHex)
 		if err == nil {
-			mac := hmac.New(sha256.New, hmacSecret)
+			mac := hmac.New(sha256.New, deriveBearerAuthKey(hmacSecret))
 			mac.Write([]byte("prismid-auth|" + sid))
 			if hmac.Equal(sigBytes, mac.Sum(nil)) {
 				return sid, false

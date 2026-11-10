@@ -167,24 +167,27 @@ type NativeHardwareAnchor struct {
 
 // VerifyResult contains the verified orthogonal spectral slice IDs and forensic flags.
 type VerifyResult struct {
-	Accepted             bool          `json:"accepted"`
-	Confidence           float64       `json:"confidence"`
-	DeviceKeySliceID     string        `json:"device_key_slice_id,omitempty"`
-	DeviceKeyAttested    bool          `json:"device_key_attested,omitempty"`
-	ExactSliceID         string        `json:"exact_slice_id"`
-	KeychainSliceID      string        `json:"keychain_slice_id,omitempty"`
-	BeaconSliceID        string        `json:"beacon_slice_id,omitempty"`
-	GpuAudioSliceID      string        `json:"gpu_audio_slice_id"`
-	SysNetSliceID        string        `json:"sys_net_slice_id"`
-	CrowdSliceID         string        `json:"crowd_slice_id,omitempty"`
-	SubnetCrowdTriggered bool          `json:"subnet_crowd_triggered,omitempty"`
-	IPSubnet             string        `json:"ip_subnet"`
-	IsNative             bool          `json:"is_native"`
-	IsVirtualGPU         bool          `json:"is_virtual_gpu"`
-	SpoofTrapTriggered   bool          `json:"spoof_trap_triggered"`
-	SpoofFlags           []string      `json:"spoof_flags,omitempty"`
-	PrivacySignals       []string      `json:"privacy_signals,omitempty"`
-	DecryptedPayload     *ProbePayload `json:"-"`
+	Accepted                  bool          `json:"accepted"`
+	Confidence                float64       `json:"confidence"`
+	DeviceKeySliceID          string        `json:"device_key_slice_id,omitempty"`
+	DeviceKeyBound            bool          `json:"device_key_bound,omitempty"`
+	DeviceKeyAttested         bool          `json:"device_key_attested,omitempty"`
+	DeviceKeyRecoveryRequired bool          `json:"device_key_recovery_required,omitempty"`
+	RiskPending               bool          `json:"risk_pending,omitempty"`
+	ExactSliceID              string        `json:"exact_slice_id"`
+	KeychainSliceID           string        `json:"keychain_slice_id,omitempty"`
+	BeaconSliceID             string        `json:"beacon_slice_id,omitempty"`
+	GpuAudioSliceID           string        `json:"gpu_audio_slice_id"`
+	SysNetSliceID             string        `json:"sys_net_slice_id"`
+	CrowdSliceID              string        `json:"crowd_slice_id,omitempty"`
+	SubnetCrowdTriggered      bool          `json:"subnet_crowd_triggered,omitempty"`
+	IPSubnet                  string        `json:"ip_subnet"`
+	IsNative                  bool          `json:"is_native"`
+	IsVirtualGPU              bool          `json:"is_virtual_gpu"`
+	SpoofTrapTriggered        bool          `json:"spoof_trap_triggered"`
+	SpoofFlags                []string      `json:"spoof_flags,omitempty"`
+	PrivacySignals            []string      `json:"privacy_signals,omitempty"`
+	DecryptedPayload          *ProbePayload `json:"-"`
 }
 
 // SliceNodes returns all non-empty orthogonal slice node IDs that participate in graph linking.
@@ -414,16 +417,16 @@ func (v *Verifier) VerifyAndDerive(ctx context.Context, req IdentifyRequest, cli
 			effectiveTimezone = wTZ
 			spoofFlags = appendUniqueFlag(spoofFlags, "worker_timezone_mismatch")
 		}
-		// Server-side inference (DeepSeek #2): if the client claims WorkerUnavailable=false on Web
-		// but strips all raw Worker telemetry fields, treat as stripped telemetry tampering.
+		// Server-side telemetry (DeepSeek v0.5 P2): if optional worker_* fields are omitted while
+		// WorkerUnavailable=false, record "worker_telemetry_missing" in PrivacySignals without
+		// falsely marking minimal/legacy payloads as active spoofing (spoofTrapTriggered=false).
 		if payload.NativeAnchor == nil &&
 			strings.TrimSpace(payload.Lies.WorkerStaticWebGLFpHash) == "" &&
 			strings.TrimSpace(payload.Lies.WorkerGPURenderer) == "" &&
 			strings.TrimSpace(payload.Lies.WorkerPlatform) == "" &&
 			strings.TrimSpace(payload.Lies.WorkerUserAgent) == "" &&
 			payload.Lies.WorkerCPUCores == 0 {
-			workerLie = true
-			spoofFlags = appendUniqueFlag(spoofFlags, "worker_telemetry_stripped")
+			privacySignals = appendUniqueFlag(privacySignals, "worker_telemetry_missing")
 		}
 		if workerLie {
 			spoofFlags = appendUniqueFlag(spoofFlags, "worker_lie_detected")
@@ -554,7 +557,8 @@ func (v *Verifier) VerifyAndDerive(ctx context.Context, req IdentifyRequest, cli
 	// 2C. DeviceKeySliceID (d_key_*): Challenge-bound ECDSA P-256 signature from non-extractable
 	// WebCrypto CryptoKey (DeepSeek #1 Trust Root) + TOFU binding against BeaconSliceID.
 	var deviceKeySliceID string
-	deviceKeyAttested := false
+	deviceKeyBound := false
+	deviceKeyRecoveryRequired := false
 	if payload.DeviceKey != nil &&
 		(strings.TrimSpace(payload.DeviceKey.PubKey) != "" || strings.TrimSpace(payload.DeviceKey.Signature) != "") {
 		okSig, pubKeyHex := VerifyECDSAP256DeviceKey(
@@ -564,8 +568,17 @@ func (v *Verifier) VerifyAndDerive(ctx context.Context, req IdentifyRequest, cli
 			payload.WebGL.StaticWebGLFpHash,
 			payload.AudioCompressorHash,
 		)
+		if !okSig && !strings.EqualFold(effectiveStaticWebGLHash, strings.TrimSpace(payload.WebGL.StaticWebGLFpHash)) {
+			okSig, pubKeyHex = VerifyECDSAP256DeviceKey(
+				payload.DeviceKey,
+				nonce,
+				payload.BeaconID,
+				effectiveStaticWebGLHash,
+				payload.AudioCompressorHash,
+			)
+		}
 		if okSig && pubKeyHex != "" {
-			deviceKeyAttested = true
+			deviceKeyBound = true
 			deviceKeySliceID = "d_key_" + v.hmacHex32("key|"+pubKeyHex)
 		} else {
 			spoofFlags = appendUniqueFlag(spoofFlags, "device_key_signature_invalid")
@@ -574,9 +587,20 @@ func (v *Verifier) VerifyAndDerive(ctx context.Context, req IdentifyRequest, cli
 	}
 	if beaconSliceID != "" {
 		if tofuStore, ok := v.store.(DeviceKeyBindingStore); ok {
-			if okBind, err := tofuStore.CheckOrBindBeaconDeviceKey(ctx, beaconSliceID, deviceKeySliceID); err == nil && !okBind {
-				spoofFlags = appendUniqueFlag(spoofFlags, "device_key_tofu_mismatch")
-				spoofTrapTriggered = true
+			okBind, err := tofuStore.CheckOrBindBeaconDeviceKey(ctx, beaconSliceID, deviceKeySliceID)
+			if err != nil {
+				return nil, fmt.Errorf("check device key binding: %w", err)
+			}
+			if !okBind {
+				// Loss, timeout, or rotation of a stored key does not prove abuse. Keep the
+				// old binding and withhold authoritative identity until independent recovery.
+				deviceKeyRecoveryRequired = true
+				privacySignals = appendUniqueFlag(privacySignals, "device_key_recovery_required")
+				if deviceKeySliceID == "" {
+					privacySignals = appendUniqueFlag(privacySignals, "device_key_missing")
+				} else {
+					privacySignals = appendUniqueFlag(privacySignals, "device_key_rotated")
+				}
 			}
 		}
 	}
@@ -599,7 +623,7 @@ func (v *Verifier) VerifyAndDerive(ctx context.Context, req IdentifyRequest, cli
 	// we trigger native_uuid_split_trap ONLY when two different d_nat_* identities are observed
 	// under the same per-device persistent anchor (OS Keychain d_kch_* or 5-silo WebView d_bcn_*),
 	// or when NativeAnchor CPUCores contradicts the verified browser/Worker CPUCores.
-	if isNative {
+	if isNative && !deviceKeyRecoveryRequired {
 		splitDetected := false
 		if keychainSliceID != "" {
 			if n, err := v.store.RecordNativeAnchorForGPU(ctx, "kch:"+keychainSliceID, exactSliceID); err == nil && n >= 2 {
@@ -637,7 +661,7 @@ func (v *Verifier) VerifyAndDerive(ctx context.Context, req IdentifyRequest, cli
 	// so mobile CGNAT and large office /24 networks never merge unrelated users).
 	var crowdSliceID string
 	subnetCrowdTriggered := false
-	if ipSubnet != "" && ipSubnet != "unknown" && !isVirtualGPU {
+	if ipSubnet != "" && ipSubnet != "unknown" && !isVirtualGPU && !deviceKeyRecoveryRequired {
 		distinctGPUs, err := v.store.RecordSubnetGPU(ctx, ipSubnet, gpuAudioSliceID, v.cfg.SubnetWindow)
 		if err == nil && distinctGPUs > v.cfg.MaxDistinctGPUsPerSubnet {
 			crowdSliceID = "d_ip24_crowd_" + v.hmacHex32("crowd|"+ipSubnet)
@@ -647,8 +671,10 @@ func (v *Verifier) VerifyAndDerive(ctx context.Context, req IdentifyRequest, cli
 	}
 
 	// Rule-tier confidence weight (0.99 / 0.95 / 0.85 / 0.30):
+	// Note (DeepSeek v0.5 P1): WebCrypto ECDSA P-256 proves keypair possession (DeviceKeyBound=true),
+	// not hardware silicon attestation, so Web confidence stays 0.95 while native OS anchor gets 0.99.
 	confidence := 0.95
-	if isNative || deviceKeyAttested {
+	if isNative {
 		confidence = 0.99
 	}
 	if spoofTrapTriggered {
@@ -657,26 +683,32 @@ func (v *Verifier) VerifyAndDerive(ctx context.Context, req IdentifyRequest, cli
 	if isVirtualGPU {
 		confidence = VirtualGPUConfidence
 	}
+	if deviceKeyRecoveryRequired {
+		confidence = VirtualGPUConfidence // below authoritative graph threshold
+	}
 
 	return &VerifyResult{
-		Accepted:             true,
-		Confidence:           confidence,
-		DeviceKeySliceID:     deviceKeySliceID,
-		DeviceKeyAttested:    deviceKeyAttested,
-		ExactSliceID:         exactSliceID,
-		KeychainSliceID:      keychainSliceID,
-		BeaconSliceID:        beaconSliceID,
-		GpuAudioSliceID:      gpuAudioSliceID,
-		SysNetSliceID:        sysNetSliceID,
-		CrowdSliceID:         crowdSliceID,
-		SubnetCrowdTriggered: subnetCrowdTriggered,
-		IPSubnet:             ipSubnet,
-		IsNative:             isNative,
-		IsVirtualGPU:         isVirtualGPU,
-		SpoofTrapTriggered:   spoofTrapTriggered,
-		SpoofFlags:           spoofFlags,
-		PrivacySignals:       privacySignals,
-		DecryptedPayload:     &payload,
+		Accepted:                  true,
+		Confidence:                confidence,
+		DeviceKeySliceID:          deviceKeySliceID,
+		DeviceKeyBound:            deviceKeyBound,
+		DeviceKeyAttested:         deviceKeyBound,
+		DeviceKeyRecoveryRequired: deviceKeyRecoveryRequired,
+		RiskPending:               deviceKeyRecoveryRequired,
+		ExactSliceID:              exactSliceID,
+		KeychainSliceID:           keychainSliceID,
+		BeaconSliceID:             beaconSliceID,
+		GpuAudioSliceID:           gpuAudioSliceID,
+		SysNetSliceID:             sysNetSliceID,
+		CrowdSliceID:              crowdSliceID,
+		SubnetCrowdTriggered:      subnetCrowdTriggered,
+		IPSubnet:                  ipSubnet,
+		IsNative:                  isNative,
+		IsVirtualGPU:              isVirtualGPU,
+		SpoofTrapTriggered:        spoofTrapTriggered,
+		SpoofFlags:                spoofFlags,
+		PrivacySignals:            privacySignals,
+		DecryptedPayload:          &payload,
 	}, nil
 }
 

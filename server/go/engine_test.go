@@ -944,10 +944,10 @@ func TestRereview_R3_MultiHopHardSliceChainNoTruncation(t *testing.T) {
 }
 
 // TestDeepSeek_1_2_ECDSAP256DeviceKeyTOFUAndSilentAttacker verifies DeepSeek Roadmap #1 & #2:
-// 1. Valid ECDSA P-256 challenge signature derives d_key_* and binds to d_bcn_* (TOFU).
-// 2. Replaying the same beacon_id without the private key (or with a different key) triggers device_key_tofu_mismatch.
-// 3. A "silent attacker" client that sets all boolean flags in Lies to false while tampering with raw
-//    CanvasControlRGBA, AudioCopyHash, or stripping Worker fields is caught by server-side inference.
+//  1. Valid ECDSA P-256 challenge signature derives d_key_* and binds to d_bcn_* (TOFU).
+//  2. Replaying the same beacon_id without the private key requires recovery and cannot create authoritative graph edges.
+//  3. A "silent attacker" client that sets all boolean flags in Lies to false while tampering with raw
+//     CanvasControlRGBA, AudioCopyHash, or stripping Worker fields is caught by server-side inference.
 func TestDeepSeek_1_2_ECDSAP256DeviceKeyTOFUAndSilentAttacker(t *testing.T) {
 	ctx := context.Background()
 	v := NewVerifier(Config{HMACSecret: []byte("test-secret-key-32-bytes-long-000")}, nil)
@@ -996,8 +996,8 @@ func TestDeepSeek_1_2_ECDSAP256DeviceKeyTOFUAndSilentAttacker(t *testing.T) {
 	if err != nil {
 		t.Fatalf("attested verify: %v", err)
 	}
-	if !res1.DeviceKeyAttested || !strings.HasPrefix(res1.DeviceKeySliceID, "d_key_") || res1.Confidence != 0.99 {
-		t.Fatalf("expected DeviceKeyAttested=true, d_key_* slice, and Confidence=0.99, got %+v", res1)
+	if !res1.DeviceKeyBound || !res1.DeviceKeyAttested || !strings.HasPrefix(res1.DeviceKeySliceID, "d_key_") || res1.Confidence != 0.95 {
+		t.Fatalf("expected DeviceKeyBound=true, d_key_* slice, and Confidence=0.95, got %+v", res1)
 	}
 	snap1 := graph.RecordVerification("honest_key_user", t0, res1)
 	if snap1.RiskStatus != RiskStatusGreen {
@@ -1016,8 +1016,8 @@ func TestDeepSeek_1_2_ECDSAP256DeviceKeyTOFUAndSilentAttacker(t *testing.T) {
 	if err != nil {
 		t.Fatalf("stolen beacon verify: %v", err)
 	}
-	if !res2.SpoofTrapTriggered {
-		t.Fatalf("expected TOFU mismatch to trigger SpoofTrapTriggered=true when bound beacon omits device_key, got %+v", res2)
+	if !res2.DeviceKeyRecoveryRequired || res2.SpoofTrapTriggered || res2.Confidence >= AuthoritativeConfidenceThreshold {
+		t.Fatalf("missing bound key must await recovery without authoritative identity or spoof poisoning, got %+v", res2)
 	}
 
 	// 3. Silent Attacker sets ALL boolean flags in Lies to false, but tampers with raw measurements:
@@ -1117,5 +1117,127 @@ func TestEngineeringBounds_ChallengeStoreAndPerSubjectSlices(t *testing.T) {
 	snap := graph.EvaluateSubject("mutating_subject")
 	if len(snap.SliceIDs) > MaxSlicesPerSubject {
 		t.Fatalf("expected subject slices capped at <= %d, got %d", MaxSlicesPerSubject, len(snap.SliceIDs))
+	}
+}
+
+// TestDeepSeekV050_P0_SpoofDoesNotPoisonCleanSameModelUsers verifies DeepSeek v0.5.0 Review Fixes:
+//  1. P0: 5 clean users on the same GPU model (d_gpu_*) + 1 Canvas-noise spoof user (Brave farbling / griefing)
+//     + 1 subsequent ECDSA P-256 d_key_* bound user -> ONLY the 1 spoof user is red; all 5 prior clean users
+//     and the subsequent d_key_* user remain green with len(ComponentSubjects) == 1.
+//  2. P0 Edge TTL: A spoofed observation on the same /24 subnet expires after DefaultSpoofEdgeTTL (24h).
+//  3. P2 Minimal Payload Compatibility: Omitting optional worker_* fields when WorkerUnavailable=false
+//     records "worker_telemetry_missing" in PrivacySignals and stays green (SpoofTrapTriggered=false).
+func TestDeepSeekV050_P0_SpoofDoesNotPoisonCleanSameModelUsers(t *testing.T) {
+	ctx := context.Background()
+	v := NewVerifier(Config{HMACSecret: []byte("test-secret-key-32-bytes-long-000")}, nil)
+	graph := NewRiskGraph(AuthoritativeConfidenceThreshold)
+	t0 := time.Date(2026, 11, 10, 15, 0, 0, 0, time.UTC)
+
+	// 1. 5 clean users with the exact same GPU/Audio model (identical d_gpu_*) across different /24 subnets and distinct beacons -> all green
+	for i := 0; i < 5; i++ {
+		ip := fmt.Sprintf("198.%d.100.10", 50+i)
+		ch, _ := v.IssueChallenge(ctx, ip)
+		p := buildValidPayload(ch)
+		p.BeaconID = fmt.Sprintf("aa11000000000000000000000000%04x", i)
+		p.System.FontsBitmapHash = fmt.Sprintf("clean_user_local_fonts_%d", i)
+		res, err := v.VerifyAndDerive(ctx, IdentifyRequest{
+			ChallengeNonce: ch.Nonce,
+			SealedPayload:  sealProbePayload(t, ch.Nonce, p),
+		}, ip)
+		if err != nil {
+			t.Fatalf("clean user %d verify: %v", i, err)
+		}
+		snap := graph.RecordVerification(fmt.Sprintf("clean_user_%d", i), t0.Add(time.Duration(i)*time.Minute), res)
+		if snap.RiskStatus != RiskStatusGreen || len(snap.ComponentSubjects) != 1 {
+			t.Fatalf("expected clean_user_%d green with members=1, got %+v", i, snap)
+		}
+	}
+
+	// 2. 1 Canvas-noise user (Brave farbling / Firefox RFP / griefing attacker) on the exact same d_gpu_*
+	chSpoof, _ := v.IssueChallenge(ctx, "203.0.113.77")
+	pSpoof := buildValidPayload(chSpoof)
+	pSpoof.BeaconID = "bb220000000000000000000000009999"
+	pSpoof.System.CanvasControlRGBA = []int{0, 1, 0, 0, 17, 136, 221, 255} // triggers canvas_noise_injected
+	resSpoof, err := v.VerifyAndDerive(ctx, IdentifyRequest{
+		ChallengeNonce: chSpoof.Nonce,
+		SealedPayload:  sealProbePayload(t, chSpoof.Nonce, pSpoof),
+	}, "203.0.113.77")
+	if err != nil {
+		t.Fatalf("spoof user verify: %v", err)
+	}
+	snapSpoof := graph.RecordVerification("canvas_noise_user", t0.Add(6*time.Minute), resSpoof)
+	if snapSpoof.RiskStatus != RiskStatusRed || len(snapSpoof.ComponentSubjects) != 1 {
+		t.Fatalf("expected canvas_noise_user to be red with members=1 (isolated from clean users), got %+v", snapSpoof)
+	}
+
+	// Verify all 5 prior clean users are STILL green with members=1 (zero cohort contamination!)
+	for i := 0; i < 5; i++ {
+		uid := fmt.Sprintf("clean_user_%d", i)
+		snap := graph.EvaluateSubject(uid)
+		if snap.RiskStatus != RiskStatusGreen || len(snap.ComponentSubjects) != 1 {
+			t.Fatalf("P0 regression: %s was poisoned by canvas_noise_user on shared d_gpu_*: %+v", uid, snap)
+		}
+	}
+
+	// 3. Subsequent d_key_* bound user on the exact same d_gpu_* registers after the spoof user -> stays green!
+	privKey, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	pubBytes := elliptic.Marshal(elliptic.P256(), privKey.PublicKey.X, privKey.PublicKey.Y)
+	chKey, _ := v.IssueChallenge(ctx, "192.0.2.88")
+	pKey := buildValidPayload(chKey)
+	pKey.BeaconID = "cc330000000000000000000000008888"
+	pKey.System.FontsBitmapHash = "subsequent_dkey_fonts"
+	// Also test P2 minimal payload compatibility: omit optional worker_* fields while WorkerUnavailable=false
+	pKey.Lies.WorkerStaticWebGLFpHash = ""
+	pKey.Lies.WorkerGPURenderer = ""
+	pKey.Lies.WorkerPlatform = ""
+	pKey.Lies.WorkerUserAgent = ""
+	pKey.Lies.WorkerCPUCores = 0
+	msg := strings.Join([]string{
+		"prismid-v2-sig",
+		pKey.Nonce,
+		strings.ToLower(pKey.BeaconID),
+		strings.ToLower(pKey.WebGL.StaticWebGLFpHash),
+		strings.ToLower(pKey.AudioCompressorHash),
+	}, "|")
+	digest := sha256.Sum256([]byte(msg))
+	r, s, _ := ecdsa.Sign(rand.Reader, privKey, digest[:])
+	var rawSig [64]byte
+	r.FillBytes(rawSig[:32])
+	s.FillBytes(rawSig[32:64])
+	pKey.DeviceKey = &DeviceKeyProof{
+		Alg:       "ecdsa-p256",
+		PubKey:    base64.RawURLEncoding.EncodeToString(pubBytes),
+		Signature: base64.RawURLEncoding.EncodeToString(rawSig[:]),
+	}
+	resKey, err := v.VerifyAndDerive(ctx, IdentifyRequest{
+		ChallengeNonce: chKey.Nonce,
+		SealedPayload:  sealProbePayload(t, chKey.Nonce, pKey),
+	}, "192.0.2.88")
+	if err != nil {
+		t.Fatalf("d_key_* user verify: %v", err)
+	}
+	if !resKey.DeviceKeyBound || resKey.SpoofTrapTriggered {
+		t.Fatalf("expected DeviceKeyBound=true and SpoofTrapTriggered=false on minimal worker payload, got %+v", resKey)
+	}
+	snapKey := graph.RecordVerification("subsequent_dkey_user", t0.Add(10*time.Minute), resKey)
+	if snapKey.RiskStatus != RiskStatusGreen || len(snapKey.ComponentSubjects) != 1 {
+		t.Fatalf("P0 regression: subsequent_dkey_user was poisoned by earlier spoof user: %+v", snapKey)
+	}
+
+	// 4. Verify DefaultSpoofEdgeTTL (24h) expiry on the exact same /24 subnet (203.0.113.x):
+	chLater, _ := v.IssueChallenge(ctx, "203.0.113.78")
+	pLater := buildValidPayload(chLater)
+	pLater.BeaconID = "dd440000000000000000000000007777"
+	pLater.System.FontsBitmapHash = "later_user_fonts"
+	resLater, err := v.VerifyAndDerive(ctx, IdentifyRequest{
+		ChallengeNonce: chLater.Nonce,
+		SealedPayload:  sealProbePayload(t, chLater.Nonce, pLater),
+	}, "203.0.113.78")
+	if err != nil {
+		t.Fatalf("later user verify: %v", err)
+	}
+	snapLater := graph.RecordVerification("same_subnet_after_25h", t0.Add(25*time.Hour), resLater)
+	if snapLater.RiskStatus != RiskStatusGreen || len(snapLater.ComponentSubjects) != 1 {
+		t.Fatalf("expected spoof edge on same /24 to expire after 24h TTL, got %+v", snapLater)
 	}
 }

@@ -202,6 +202,29 @@ describe('PrismID Web SDK (prismid-js) Unit & Cross-Language Suite', () => {
     expect(stallElapsed).toBeLessThan(1500)
   })
 
+  it('allows recovery to retry immediately instead of applying the success cooldown', async () => {
+    let attempts = 0
+    const client = createPrismClient({
+      baseUrl: 'http://review.invalid',
+      fetchImpl: async (input) => {
+        const url = String(input)
+        if (url.endsWith('/should-collect')) {
+          return new Response(JSON.stringify({ should_collect: true }))
+        }
+        if (url.endsWith('/challenge')) {
+          return new Response(JSON.stringify({ nonce: 'review', render_seed: [2, 3, 4, 5] }))
+        }
+        attempts++
+        return new Response(JSON.stringify(attempts === 1
+          ? { accepted: true, risk_pending: true, device_key_recovery_required: true }
+          : { accepted: true, risk_pending: false }))
+      },
+    })
+    expect((await client.identify())?.device_key_recovery_required).toBe(true)
+    expect((await client.identify())?.risk_pending).toBe(false)
+    expect(attempts).toBe(2)
+  })
+
   describe('6. Live Cross-Language E2E Integration (prismid-js -> prismid-go standalone server)', () => {
     let serverProc: ChildProcess | null = null
     let baseUrl = ''
@@ -246,8 +269,9 @@ describe('PrismID Web SDK (prismid-js) Unit & Cross-Language Suite', () => {
       const webRes = await webClient.identify({ force: true })
       expect(webRes).not.toBeNull()
       expect(webRes?.accepted).toBe(true)
-      expect(webRes?.device_key_attested).toBe(true)
-      expect(webRes?.device_key_slice_id).toMatch(/^d_key_[0-9a-f]{32}$/)
+      // Node has no persistent IndexedDB: do not establish TOFU with an ephemeral key.
+      expect(webRes?.device_key_attested).not.toBe(true)
+      expect(webRes?.device_key_slice_id).toBeFalsy()
       expect(webRes?.exact_slice_id).toMatch(/^d_web_[0-9a-f]{32}$/)
       expect(webRes?.beacon_slice_id).toMatch(/^d_bcn_[0-9a-f]{32}$/)
       expect(webRes?.gpu_audio_slice_id).toMatch(/^d_gpu_[0-9a-f]{32}$/)
@@ -275,6 +299,56 @@ describe('PrismID Web SDK (prismid-js) Unit & Cross-Language Suite', () => {
       expect(desktopRes?.keychain_slice_id).toMatch(/^d_kch_[0-9a-f]{32}$/)
       expect(desktopRes?.gpu_audio_slice_id).toBe(webRes?.gpu_audio_slice_id)
     })
+
+    it.skipIf(!fs.existsSync(CHROME_MAC_PATH))(
+      'shares one committed key across pages and handles storage loss without poisoning history',
+      async () => {
+        const browser = await chromium.launch({
+          executablePath: CHROME_MAC_PATH,
+          headless: true,
+          args: ['--enable-webgl', '--ignore-gpu-blocklist', '--use-gl=angle'],
+        })
+        try {
+          const context = await browser.newContext()
+          const pages = await Promise.all([context.newPage(), context.newPage()])
+          await Promise.all(pages.map((p) => p.goto(baseUrl)))
+          const proofs = await Promise.all(pages.map((p, i) => p.evaluate(async (i) => {
+            // Load in the browser realm, without Vitest's server-side import transform.
+            const { signChallengeWithDeviceKey } = await new Function('return import("/prismid.bundle.js")')()
+            const params = { nonce: `concurrent-${i}`, beaconId: '1234567890abcdef1234567890abcdef', staticWebGLFpHash: 'gpu', audioCompressorHash: 'audio' }
+            // Also exercise same-page single-flight initialization.
+            return Promise.all([signChallengeWithDeviceKey(params), signChallengeWithDeviceKey({ ...params, nonce: `other-${i}` })])
+          }, i)))
+          const keys = proofs.flat().map((p) => p?.pub_key)
+          expect(keys.every((k) => typeof k === 'string' && k.length === 130)).toBe(true)
+          expect(new Set(keys).size).toBe(1)
+          const page = pages[0]
+          const identify = () => page.evaluate(async () => {
+            const { createPrismClient } = await new Function('return import("/prismid.bundle.js")')()
+            return createPrismClient({ getAccessToken: () => 'key-recovery-browser' }).identify({ force: true })
+          })
+          const first = await identify()
+          expect(first?.device_key_attested).toBe(true)
+          expect(first?.risk_status).toBe('green')
+          await page.reload()
+          await page.evaluate(() => Object.defineProperty(globalThis, 'indexedDB', { value: undefined, configurable: true }))
+          const unavailable = await identify()
+          expect(unavailable?.device_key_recovery_required).toBe(true)
+          expect(unavailable?.risk_pending).toBe(true)
+          expect(unavailable?.risk_status).toBe('unknown')
+          expect(unavailable?.spoof_trap_triggered).toBe(false)
+          // Restoring access to the original key restores the ordinary result; no sticky spoof.
+          await page.reload()
+          const restored = await identify()
+          expect(restored?.device_key_slice_id).toBe(first?.device_key_slice_id)
+          expect(restored?.risk_status).toBe('green')
+          expect(restored?.device_key_recovery_required).not.toBe(true)
+        } finally {
+          await browser.close()
+        }
+      },
+      25000
+    )
 
     it.skipIf(!fs.existsSync(CHROME_MAC_PATH))(
       'executes real Chrome GPU WebGL fragment shader, inline Blob Worker + OffscreenCanvas, OfflineAudioContext & TextMetrics against Go server',

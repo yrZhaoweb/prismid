@@ -155,3 +155,12 @@ WHERE d.confidence >= 0.60
     OR ud.spoof_trap_triggered = TRUE
   );
 ```
+
+
+## 4. Authentication, Key Recovery, and Incomplete Graph Results
+
+- Authenticate before invoking `IssueChallenge` or the stateful `VerifyAndDerive`. The standalone server requires a signed Bearer on both endpoints when `-demo-mode=false`; absent or invalid authentication returns 401 before nonce consumption or any binding/statistics writes. Demo mode retains the local playground behavior.
+- The Web SDK signs only with a key confirmed in a committed IndexedDB transaction. Concurrent initialization is shared within a page and uses an atomic read/conditional insert across pages. Blocked, timed-out, or aborted storage does not establish a binding with a temporary key.
+- When a previously bound beacon has no matching device-key proof, the result includes `device_key_recovery_required=true`, `risk_pending=true`, and a non-authoritative confidence. `RecordVerification` returns `risk_status="unknown"` for that request and leaves the old identity history and TOFU binding unchanged. Restore the original key or perform an independent authenticated step-up in the integrating application; the library does not silently authorize replacement keys. Recovery/pending responses do not activate the SDK success cooldown.
+- `truncated=true` with `risk_pending=true` means cached evidence was lost or the traversal/cache limit was reached. The graph withholds `earliest_subject_id`, returns unknown for otherwise green/yellow results, and may retain red when remaining evidence already proves a risk. Do not interpret a pending result as a clean identity.
+- Per-slice or per-subject eviction retains bounded loss markers, including markers for evicted slices observed again later. When the global subject cache is full, new subjects receive an incomplete/pending result instead of deleting existing history. Loss markers are conservative for the lifetime of the in-memory graph; their own capacity exhaustion makes all graph results incomplete. Use authoritative persistent observations and rebuild the cache to recover full-history conclusions.
