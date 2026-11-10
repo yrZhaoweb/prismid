@@ -1,8 +1,23 @@
 {
   "name": "prismid-js",
-  "version": "0.1.0",
+  "version": "0.3.0",
   "description": "Zero-dependency orthogonal hardware fingerprinting, WebGL shader challenge, and cross-thread lie detection SDK for Browser and Tauri WebView.",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/yrZhaoweb/prismid.git",
+    "directory": "packages/web-sdk"
+  },
+  "homepage": "https://github.com/yrZhaoweb/prismid",
+  "keywords": [
+    "fingerprint",
+    "device-fingerprint",
+    "anti-fraud",
+    "bot-detection",
+    "webgl",
+    "lie-detection",
+    "prismid"
+  ],
   "type": "module",
   "main": "./dist/index.js",
   "module": "./dist/index.js",
@@ -11,7 +26,8 @@
     ".": {
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
-    }
+    },
+    "./bundle": "./dist/prismid.bundle.js"
   },
   "files": [
     "dist",
@@ -19,6 +35,7 @@
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json && node scripts/bundle.mjs",
+    "prepublishOnly": "npm run build",
     "test": "vitest run",
     "typecheck": "tsc --noEmit"
   },
