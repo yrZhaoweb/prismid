@@ -67,7 +67,8 @@ function stripRelativeModuleSyntaxWithAST(relPath, code) {
   return out.trim()
 }
 
-let bundle = `// PrismID Web SDK (prismid-js v1.1.0) Standalone ES Module Bundle\n`
+const pkg = JSON.parse(fs.readFileSync(path.resolve(__dirname, '../package.json'), 'utf8'))
+let bundle = `// PrismID Web SDK (prismid-js v${pkg.version}) Standalone ES Module Bundle\n`
 for (const rel of filesInOrder) {
   const fullPath = path.join(distDir, rel)
   const code = fs.readFileSync(fullPath, 'utf8')

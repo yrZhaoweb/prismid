@@ -1,12 +1,12 @@
-# PrismID Full-Stack Integration Guide (`INTEGRATION_GUIDE.md` — `v1.1.0`)
+# PrismID Full-Stack Integration Guide (`INTEGRATION_GUIDE.md` — `v1.2.0`)
 
-This guide shows how to integrate **PrismID v1.1.0** into a Web application (`prismid-js`), a Tauri 2 Desktop application (`prismid-native`), and a Go backend (`prismid-go`) in single-node or multi-instance deployments.
+This guide shows how to integrate **PrismID v1.2.0** into a Web application (`prismid-js`), a Tauri 2 Desktop application (`prismid-native`), and a Go backend (`prismid-go`) in single-node or multi-instance deployments.
 
 ---
 
 ## 1. Browser Web Application Integration (`prismid-js`)
 
-Install `prismid-js` (`>= 1.1.0`):
+Install `prismid-js` (`>= 1.2.0`):
 
 ```bash
 npm install prismid-js
@@ -20,8 +20,10 @@ import { createPrismClient, resetDeviceKeyCache } from 'prismid-js'
 export const prismClient = createPrismClient({
   baseUrl: '', // Same-origin or custom API gateway host
   getAccessToken: () => sessionStorage.getItem('prismid_bearer_token'),
-  requestTimeoutMs: 5000, // Bounded HTTP header + body deadline (default: 5000ms)
-  probeTimeoutMs: 800,    // Aggregate client probe budget (default: 800ms)
+  requestTimeoutMs: 5000,  // Bounded HTTP header + body deadline (default: 5000ms)
+  probeTimeoutMs: 800,     // Per-probe browser signal budget (default: 800ms)
+  providerTimeoutMs: 2500, // Decoupled budget for external Turnstile / Tauri IPC providers
+  tenantId: undefined,     // Optional X-PrismID-Tenant-ID when -enable-multi-tenant is enabled
   onError: (err) => {
     console.warn('[PrismID]', err.code, err.status, err.message)
   },
@@ -61,11 +63,11 @@ await prismClient.rebindKey({ rotate: true })
 
 ### 2.1 Rust Side (`src-tauri/Cargo.toml` & `src-tauri/src/lib.rs`)
 
-Add `prismid-native` (`1.1.0`) to `src-tauri/Cargo.toml`:
+Add `prismid-native` (`1.2.0`) to `src-tauri/Cargo.toml`:
 
 ```toml
 [dependencies]
-prismid-native = { git = "https://github.com/yrZhaoweb/prismid", version = "1.1.0" }
+prismid-native = { git = "https://github.com/yrZhaoweb/prismid", version = "1.2.0" }
 ```
 
 Expose a Tauri command in `src-tauri/src/lib.rs` (note: set `PRISMID_DISABLE_KEYCHAIN=1` if running inside a headless CI daemon where macOS Login Keychain should be skipped in favor of the `0600` file anchor):
@@ -101,8 +103,8 @@ await prismClient.identify()
 > [!IMPORTANT]
 > **Production Authentication, Proxy & Multi-Instance Boundary**:
 > - Extract `subjectID` strictly from your server-side authenticated JWT/session middleware.
-> - Pass `clientIP` from `X-Forwarded-For` / `CF-Connecting-IP` **only** when the request arrives from trusted ingress proxy CIDRs.
-> - **Single-Node vs. Multi-Instance**: `FileStateStore` + `FileAuditStore` provide `0600` crash-safe persistence for a **single Go instance**. For multi-replica horizontal scaling behind a load balancer, implement `prismid.ChallengeStore` (Redis `SET NX EX` + `GETDEL` + `BeaconOwnerStore` + `DeviceKeyLookupStore`) and persist graph edges in PostgreSQL (Section 3.2) so challenge consumption, TOFU bindings, and `SubjectOwnsBeacon` checks are consistent across all replicas.
+> - Pass `clientIP` and JA4/HTTP2 headers (`X-PrismID-JA4` / `CF-JA4`, `X-PrismID-H2-Fingerprint`) via `prismid.ParseTrustedProxyCIDRs(...)` + `prismid.ExtractRealClientIP(...)` (`-trusted-proxy-cidrs` on `prismid-server`) so client-forged `X-Forwarded-For` prefixes and direct-peer headers are stripped right-to-left.
+> - **Single-Node vs. Multi-Instance**: `FileStateStore` + `FileAuditStore` provide `0600` crash-safe persistence for a **single Go instance**. For multi-replica horizontal scaling behind a load balancer, pass `-redis-url redis://...` (built-in zero-dependency `prismid.NewRedisStore`, implementing cluster-safe `ChallengeStore`, TOFU `SET NX EX`, `DistributedReplayGuard`, and pipelined 2-hop `GraphBackend`) or attach `prismid.NewSQLGraphStore(db, prismid.SQLDialectPostgres)` (`database/sql` PostgreSQL/SQLite backend).
 
 ```go
 import (
@@ -214,7 +216,7 @@ CREATE INDEX IF NOT EXISTS user_devices_device_id_idx ON user_devices(device_id)
   - `POST /api/v1/risk/admin/prune-graph` — Prunes expired soft/spoof edges on demand and compacts `-state-file`.
   - `POST /api/v1/risk/admin/flush-state` — Compacts `<state-file>.wal` into `<state-file>` atomically on demand and reports `persist_errors`.
 - **Dual-Path Key Rebinding (`RebindDeviceKeyWithProof` / `POST /api/v1/risk/rebind-key`)**:
-  1. **Proactive Rotation (No MFA Needed)**: Client calls `prismClient.rebindKey({ rotate: true })`, signing `"prismid-v2-rebind-prev|<nonce>|<subject_id>|<beacon_id>"` with the previous key and `"prismid-v2-rebind|<nonce>|<subject_id>|<beacon_id>"` with the new key. Server verifies continuity against the currently bound `d_key_*`, updates TOFU, retires `d_key_old` from `RiskGraph`, and records a `KeyRebindAuditEvent` (`Action: "rebind_key_rotation"`).
+  1. **Proactive Two-Phase Rotation (No MFA Needed, MitM-Safe)**: Client calls `prismClient.rebindKey({ rotate: true })`, preparing the new keypair via `prepareDeviceKeyRotation`, signing `"prismid-v2-rebind-prev|<nonce>|<subject_id>|<beacon_id>|<new_pub_key>"` with the previous key and `"prismid-v2-rebind|<nonce>|<subject_id>|<beacon_id>"` with the new key, and committing to `IndexedDB` only after HTTP 200. Server verifies continuity and `<new_pub_key>` binding against the currently bound `d_key_*`, updates TOFU, retires `d_key_old` from `RiskGraph`, and records a `KeyRebindAuditEvent` (`Action: "rebind_key_rotation"`).
   2. **Lost-Key Recovery (Single-Use Step-Up MFA)**: Backend verifies MFA (WebAuthn/Passkey/OTP) and mints a `stepup_v2` token via `SignStepUpToken(subjectID, beaconSliceID, stepUpSecret)`. Server checks co-owner membership (`riskGraph.SubjectOwnsBeacon` — works across shared family browsers and survives restarts via persistent `BeaconOwnerStore`), consumes the `stepup_v2` JTI **once** (replays return `403`), retires stale `d_key_*` edges for that subject, and audits `Action: "rebind_key"`.
 - **Audited Spoof Clearance (`ClearSubjectSpoofAudited` / `POST /api/v1/risk/clear-spoof`)**: Consumes a single-use `stepup_v2` token targeting `"clear_spoof"`, clears active spoof edges while retaining `+1.5` `HistoricalSpoof` log-odds, and writes an audit event (`Action: "clear_spoof"`) to `AuditStore` and `OnKeyRebindAudit`.
 - **Complete GDPR Erasure (`Verifier.EraseSubject` / `DELETE /api/v1/risk/subject`)**: Purges all subject graph edges, persistent `BeaconOwnerStore` entries, and `beaconToKey` TOFU bindings (including beacons previously shared on multi-user profiles).

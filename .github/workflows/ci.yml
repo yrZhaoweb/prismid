@@ -109,4 +109,4 @@ jobs:
           PRISMID_REQUIRE_ALL_BROWSERS: "1"
         run: |
           pnpm exec vitest run test/deviceKey.test.ts
-          pnpm exec vitest run test/prismid.test.ts -t "0\.|1\.|2\.|3\.|4\.|5\.|allows recovery|completes full|executes real Chrome GPU|7A\.|7C\."
+          pnpm exec vitest run test/prismid.test.ts -t "0\.|1\.|2\.|3\.|4\.|5\.|allows recovery|decouples external provider|completes full|executes real Chrome GPU|7A\.|7C\."

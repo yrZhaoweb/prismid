@@ -1,4 +1,4 @@
-# PrismID Architecture Specification (`ARCHITECTURE.md` — `v1.1.0`)
+# PrismID Architecture Specification (`ARCHITECTURE.md` — `v1.2.0`)
 
 ## 1. Design Philosophy & Threat Boundaries
 

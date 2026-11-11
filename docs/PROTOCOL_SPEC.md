@@ -1,6 +1,6 @@
 # PrismID Wire & Cryptographic Protocol Specification (`PROTOCOL_SPEC.md`)
 
-This document defines the byte-level cryptographic, mathematical, and JSON schema contracts between `prismid-js` (TypeScript `v1.1.0`), `prismid-native` (Rust `v1.1.0`), and `prismid-go` (Go `v1.1.0`).
+This document defines the byte-level cryptographic, mathematical, and JSON schema contracts between `prismid-js` (TypeScript `v1.2.0`), `prismid-native` (Rust `v1.2.0`), and `prismid-go` (Go `v1.2.0`).
 
 ---
 
@@ -46,9 +46,9 @@ sequenceDiagram
 }
 ```
 
-- `nonce`: 32 cryptographically random bytes encoded as 64 lowercase hexadecimal characters. Single-use only (`GETDEL` semantics); default TTL is 60 seconds. In `MemoryChallengeStore`, per-`/24`-subnet quota (`DefaultMaxChallengesPerIPSub = 64`) prevents single-subnet floods from evicting unrelated users' pending challenges.
+- `nonce`: 32 cryptographically random bytes encoded as 64 lowercase hexadecimal characters. Single-use only (`GETDEL` semantics); default TTL is 60 seconds. In `MemoryChallengeStore` and `RedisStore`, per-IP (`DefaultMaxChallengesPerIP = 64`) and per-`/24`-subnet (`DefaultMaxChallengesPerIPSub = 1024`) quotas prevent floods from evicting unrelated users' pending challenges.
 - `render_seed`: Array of 4 floating-point numbers `[s0, s1, s2, s3]` in `[1.25, 6.75]`.
-- `sample_points`: Array of 8 coordinate pairs `[x, y]` where $0 \le x < 256$ and $0 \le y < 256$.
+- `sample_points`: Stratified CSPRNG array of 8 coordinate pairs `[x, y]` sampled dynamically per challenge across a `4x2` grid inside `[8, 247]^2` (`Config.StaticSamplePoints` optional for deterministic lab fixtures).
 - `issued_at` / `expires_at`: Unix epoch timestamps in milliseconds (or seconds, auto-normalized by `prismid-go`).
 
 ---
@@ -107,10 +107,11 @@ Each channel $c \in \{r, g, b\}$ is clamped to $[0.0, 1.0]$ and quantized via `r
   ```text
   prismid-v2-rebind|<challenge_nonce>|<subject_id>|<beacon_id_lower>
   ```
-- **Proactive Rotation Previous-Key Continuity Transcript** (`rotateDeviceKeyAndSignRebind`):
+- **Proactive Rotation Previous-Key Continuity Transcript** (`prepareDeviceKeyRotation` / `rotateDeviceKeyAndSignRebind` / `VerifyECDSAP256PrevKeyRotationProofBound`):
   ```text
-  prismid-v2-rebind-prev|<challenge_nonce>|<subject_id>|<beacon_id_lower>
+  prismid-v2-rebind-prev|<challenge_nonce>|<subject_id>|<beacon_id_lower>|<new_pub_key_lower>
   ```
+  > Cryptographically binds `<new_pub_key_lower>` (130-char lowercase uncompressed SEC1 hex) so an attacker intercepting a rotation request cannot substitute their own `device_key`, and requires `prev_pub_key != new_pub_key`. On the client (`prismid-js`), `rebindKey({ rotate: true })` uses two-phase commit (`prepareDeviceKeyRotation`), writing the candidate keypair to `IndexedDB` only after `/api/v1/risk/rebind-key` returns HTTP 200.
 
 ---
 
@@ -222,3 +223,10 @@ Each channel $c \in \{r, g, b\}$ is clamped to $[0.0, 1.0]$ and quantized via `r
 | `POST /api/v1/risk/admin/revoke-token` | `X-PrismID-Admin-Secret` | `{ token?, subject_id?, ttl_seconds? }` | Immediately revokes a bearer token or subject session window (persisted across restarts via `-state-file` WAL). |
 | `POST /api/v1/risk/admin/prune-graph` | `X-PrismID-Admin-Secret` | `{}` | Prunes expired graph edges, compacts `-state-file`, and returns live `GraphStats`. |
 | `POST /api/v1/risk/admin/flush-state` | `X-PrismID-Admin-Secret` | `{}` | Compacts `<state-file>.wal` into `<state-file>` atomically on demand and returns `persist_errors`. |
+| `GET /metrics` | `X-PrismID-Admin-Secret` (unless `-metrics-public`) | — | Exposes Prometheus `0.0.4` counters, latency histograms, and live `RiskGraph` gauges. |
+
+### 6.3 Trusted Ingress Headers, Shadow Mode & Multi-Tenancy
+
+- **Trusted Proxy CIDRs (`-trusted-proxy-cidrs` / `PRISMID_TRUSTED_PROXY_CIDRS`)**: Strips `X-Forwarded-For` hops right-to-left until the first untrusted IP and extracts optional network-layer fingerprint headers (`X-PrismID-JA4` / `X-TLS-JA4` / `CF-JA4`, `X-PrismID-JA3` / `X-TLS-JA3`, `X-PrismID-H2-Fingerprint` / `X-HTTP2-Fingerprint`) **only** when `RemoteAddr` belongs to a configured CIDR.
+- **Shadow Mode (`-shadow-mode` / `PRISMID_SHADOW_MODE=true`)**: Executes full `VerifyAndDeriveWithTransport` + `RiskGraph` scoring and records Prometheus verdicts (`shadow="true"`), returning `"shadow_mode": true`, `"shadow_risk_status"`, and `"shadow_risk_pending"` while overriding `"risk_status": "green"` and `"risk_pending": false`.
+- **Multi-Tenant Isolation (`-enable-multi-tenant` / `X-PrismID-Tenant-ID`)**: Scopes HMAC slice derivation (`tenant:<len>:<id>|...`) and `RiskGraph` subject namespaces (`t:<id>:<subject>`) per tenant (`^[a-zA-Z0-9_-]{1,64}$`).

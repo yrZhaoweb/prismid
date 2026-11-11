@@ -1,4 +1,4 @@
-// PrismID Web SDK (prismid-js v1.1.0) Standalone ES Module Bundle
+// PrismID Web SDK (prismid-js v1.2.0) Standalone ES Module Bundle
 
 // --- crypto/aead.js ---
 /**

@@ -1,6 +1,6 @@
-# prismid-js (`v1.1.0`)
+# prismid-js (`v1.2.0`)
 
-Zero-dependency browser & Tauri WebView client SDK for **PrismID**: orthogonal hardware risk signals, dynamic WebGL fragment-shader spot-pixel verification, non-extractable WebCrypto `ECDSA P-256` device keys (`d_key_*`), 5-silo self-healing storage beacons (`d_bcn_*`), cross-thread `Blob` Worker + `OffscreenCanvas` consistency checks, and `AES-256-GCM` AEAD payload sealing.
+Zero-dependency browser & Tauri WebView client SDK for **PrismID**: orthogonal hardware risk signals, dynamic stratified WebGL fragment-shader spot-pixel verification, non-extractable WebCrypto `ECDSA P-256` device keys (`d_key_*`) with two-phase MitM-safe key rotation, 5-silo self-healing storage beacons (`d_bcn_*`), cross-thread `Blob` Worker + `OffscreenCanvas` consistency checks, multi-tenant namespace headers (`X-PrismID-Tenant-ID`), and `AES-256-GCM` AEAD payload sealing.
 
 ## Installation
 
@@ -18,6 +18,8 @@ import { createPrismClient } from 'prismid-js'
 const prism = createPrismClient({
   baseUrl: 'https://risk.example.com',
   getAccessToken: () => sessionStorage.getItem('access_token'),
+  providerTimeoutMs: 2500, // Decoupled deadline for async Turnstile / Tauri native providers
+  tenantId: undefined, // Optional multi-tenant isolation header (`X-PrismID-Tenant-ID`)
   // Optional MFA/Passkey callback for TOFU key recovery or spoof clearance:
   getStepUpToken: async (action, ctx) => requestStepUpFromBackend(action, ctx),
 })
