@@ -198,6 +198,7 @@ func TestDeepSeekV100_P1_Safari16WorkerWebGLUnavailableNotFlaggedRed(t *testing.
 	p.System.Platform = "MacIntel"
 	p.System.UserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Safari/605.1.15"
 	p.System.CPUCores = 8
+	p.System.DeviceMemory = 0 // Safari/WebKit does not expose navigator.deviceMemory
 	p.Lies.MathEngineSignature = "jsc"
 	p.Lies.WorkerUnavailable = false
 	p.Lies.WorkerWebGLAvailable = nil // Legacy/Safari 16 payload or explicit false

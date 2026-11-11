@@ -18,6 +18,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -107,12 +108,14 @@ func (rl *ipRateLimiter) allow(ip string, now time.Time) bool {
 }
 
 // replayAndRevocationGuard enforces single-use step-up token consumption (DeepSeek S2-10)
-// and bearer/subject token revocation (DeepSeek S3-52).
+// and bearer/subject token revocation (DeepSeek S3-52), optionally backed by a cluster-wide
+// DistributedReplayGuard (such as RedisStore) for multi-instance deployments.
 type replayAndRevocationGuard struct {
 	mu              sync.Mutex
 	consumedStepUp  map[string]int64
 	revokedTokenSHA map[[32]byte]int64
 	revokedSubjects map[string]int64
+	distributed     prismid.DistributedReplayGuard
 }
 
 func newReplayAndRevocationGuard() *replayAndRevocationGuard {
@@ -123,9 +126,39 @@ func newReplayAndRevocationGuard() *replayAndRevocationGuard {
 	}
 }
 
+func (g *replayAndRevocationGuard) attachDistributed(d prismid.DistributedReplayGuard) {
+	if g == nil {
+		return
+	}
+	if d != nil {
+		if rv := reflect.ValueOf(d); rv.Kind() == reflect.Pointer && rv.IsNil() {
+			d = nil
+		}
+	}
+	g.mu.Lock()
+	g.distributed = d
+	g.mu.Unlock()
+}
+
+func (g *replayAndRevocationGuard) getDistributed() prismid.DistributedReplayGuard {
+	if g == nil {
+		return nil
+	}
+	g.mu.Lock()
+	d := g.distributed
+	g.mu.Unlock()
+	return d
+}
+
 func (g *replayAndRevocationGuard) consumeStepUpJTI(jti string, expUnix int64, nowUnix int64) bool {
 	if jti == "" {
 		return false
+	}
+	if dist := g.getDistributed(); dist != nil {
+		ok, err := dist.ConsumeStepUpJTI(context.Background(), jti, expUnix, nowUnix)
+		if err != nil || !ok {
+			return false
+		}
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -155,10 +188,10 @@ func (g *replayAndRevocationGuard) revokeToken(rawToken string, expUnix int64) s
 		return ""
 	}
 	sum := sha256.Sum256([]byte(rawToken))
+	shaHex := hex.EncodeToString(sum[:])
+	now := time.Now().UTC().Unix()
 	g.mu.Lock()
-	defer g.mu.Unlock()
 	if len(g.revokedTokenSHA) >= 16384 {
-		now := time.Now().UTC().Unix()
 		for k, exp := range g.revokedTokenSHA {
 			if now > exp {
 				delete(g.revokedTokenSHA, k)
@@ -166,7 +199,12 @@ func (g *replayAndRevocationGuard) revokeToken(rawToken string, expUnix int64) s
 		}
 	}
 	g.revokedTokenSHA[sum] = expUnix
-	return hex.EncodeToString(sum[:])
+	dist := g.distributed
+	g.mu.Unlock()
+	if dist != nil {
+		_ = dist.RevokeTokenHash(context.Background(), shaHex, expUnix, now)
+	}
+	return shaHex
 }
 
 func (g *replayAndRevocationGuard) exportSnapshot(nowUnix int64) *prismid.ReplayGuardSnapshot {
@@ -232,10 +270,9 @@ func (g *replayAndRevocationGuard) revokeSubject(subjectID string, untilUnix int
 	if subjectID == "" {
 		return
 	}
+	now := time.Now().UTC().Unix()
 	g.mu.Lock()
-	defer g.mu.Unlock()
 	if len(g.revokedSubjects) >= 16384 {
-		now := time.Now().UTC().Unix()
 		for k, exp := range g.revokedSubjects {
 			if now > exp {
 				delete(g.revokedSubjects, k)
@@ -243,27 +280,49 @@ func (g *replayAndRevocationGuard) revokeSubject(subjectID string, untilUnix int
 		}
 	}
 	g.revokedSubjects[subjectID] = untilUnix
+	dist := g.distributed
+	g.mu.Unlock()
+	if dist != nil {
+		_ = dist.RevokeSubject(context.Background(), subjectID, untilUnix, now)
+	}
 }
 
 func (g *replayAndRevocationGuard) isRevoked(rawToken, subjectID string, nowUnix int64) bool {
 	if g == nil {
 		return false
 	}
-	sum := sha256.Sum256([]byte(strings.TrimSpace(rawToken)))
+	trimmedTok := strings.TrimSpace(rawToken)
+	var sum [32]byte
+	var shaHex string
+	if trimmedTok != "" {
+		sum = sha256.Sum256([]byte(trimmedTok))
+		shaHex = hex.EncodeToString(sum[:])
+	}
 	g.mu.Lock()
-	defer g.mu.Unlock()
-	if exp, ok := g.revokedTokenSHA[sum]; ok {
-		if nowUnix <= exp {
-			return true
+	if trimmedTok != "" {
+		if exp, ok := g.revokedTokenSHA[sum]; ok {
+			if nowUnix <= exp {
+				g.mu.Unlock()
+				return true
+			}
+			delete(g.revokedTokenSHA, sum)
 		}
-		delete(g.revokedTokenSHA, sum)
 	}
 	if subjectID != "" {
 		if until, ok := g.revokedSubjects[subjectID]; ok {
 			if nowUnix <= until {
+				g.mu.Unlock()
 				return true
 			}
 			delete(g.revokedSubjects, subjectID)
+		}
+	}
+	dist := g.distributed
+	g.mu.Unlock()
+
+	if dist != nil {
+		if rev, err := dist.IsRevoked(context.Background(), shaHex, subjectID, nowUnix); err == nil && rev {
+			return true
 		}
 	}
 	return false
@@ -278,13 +337,19 @@ type serverHandlerConfig struct {
 	adminSecret       []byte
 	demoMode          bool
 	trustProxy        bool
+	trustedProxies    *prismid.TrustedProxyChecker
+	shadowMode        bool
+	enableMultiTenant bool
+	metricsPublic     bool
 	corsOrigin        string
 	ratePerSec        float64
 	burst             float64
 	allowLegacyTokens bool
 	stateStore        *prismid.FileStateStore
 	memStore          *prismid.MemoryChallengeStore
+	redisStore        *prismid.RedisStore
 	replayGuard       *replayAndRevocationGuard
+	metrics           *prismid.Metrics
 }
 
 func envOrFlag(flagVal, envKey string) string {
@@ -292,6 +357,18 @@ func envOrFlag(flagVal, envKey string) string {
 		return v
 	}
 	return strings.TrimSpace(os.Getenv(envKey))
+}
+
+func envBoolOrFlag(flagVal bool, envKey string) bool {
+	if flagVal {
+		return true
+	}
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(envKey))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
 }
 
 // validateStartupConfig fails closed on unsafe/incomplete production CLI/env combinations (DeepSeek P2-2).
@@ -350,8 +427,13 @@ func main() {
 	stateFileFlag := flag.String("state-file", "", "Optional WAL + background-compacted snapshot file path to persist RiskGraph & TOFU bindings (or PRISMID_STATE_FILE)")
 	stateFlushInterval := flag.Duration("state-flush-interval", 30*time.Second, "Minimum interval between background state snapshot compactions when -state-file is enabled")
 	auditLogFlag := flag.String("audit-log", "", "Optional append-only JSONL file path for durable security audit events (or PRISMID_AUDIT_LOG)")
+	redisURLFlag := flag.String("redis-url", "", "Optional Redis URL (redis:// or rediss://) for horizontally scaled multi-instance ChallengeStore, RiskGraph & ReplayGuard (or PRISMID_REDIS_URL)")
+	trustedProxyCIDRsFlag := flag.String("trusted-proxy-cidrs", "", "Comma-separated trusted reverse-proxy CIDRs/IPs for right-to-left X-Forwarded-For stripping & JA4/H2 headers (or PRISMID_TRUSTED_PROXY_CIDRS)")
+	shadowModeFlag := flag.Bool("shadow-mode", false, "Shadow evaluation mode: compute full risk verdicts & metrics while returning risk_status=green to callers (or PRISMID_SHADOW_MODE=true)")
+	enableMultiTenantFlag := flag.Bool("enable-multi-tenant", false, "Enable per-tenant slice & graph isolation via X-PrismID-Tenant-ID header (or PRISMID_ENABLE_MULTI_TENANT=true)")
+	metricsPublicFlag := flag.Bool("metrics-public", false, "Allow unauthenticated GET /metrics scraping even when -admin-secret is configured (or PRISMID_METRICS_PUBLIC=true)")
 	demoMode := flag.Bool("demo-mode", false, "Enable standalone lab playground UI and demo identity/IP simulation headers (NEVER enable in production)")
-	trustProxy := flag.Bool("trust-proxy", false, "Trust X-Forwarded-For and X-Real-IP headers from reverse proxy")
+	trustProxy := flag.Bool("trust-proxy", false, "Trust X-Forwarded-For and X-Real-IP headers from reverse proxy (prefer -trusted-proxy-cidrs in production)")
 	corsOrigin := flag.String("cors-origin", "", "Allowed CORS Origin (defaults to request origin only in -demo-mode)")
 	rateLimit := flag.Float64("rate-limit", 60, "Per-IP API rate limit in requests/sec (0 to disable)")
 	allowLegacyTokens := flag.Bool("allow-legacy-tokens", false, "Accept deprecated non-expiring <subject_id>.<hmac> bearer tokens")
@@ -361,6 +443,19 @@ func main() {
 	if err != nil {
 		log.Fatalf("invalid -hard-anchor-policy: %v", err)
 	}
+
+	var trustedChecker *prismid.TrustedProxyChecker
+	if rawCIDRs := envOrFlag(*trustedProxyCIDRsFlag, "PRISMID_TRUSTED_PROXY_CIDRS"); rawCIDRs != "" {
+		tc, err := prismid.ParseTrustedProxyCIDRs(rawCIDRs)
+		if err != nil {
+			log.Fatalf("invalid -trusted-proxy-cidrs: %v", err)
+		}
+		trustedChecker = tc
+	}
+
+	shadowMode := envBoolOrFlag(*shadowModeFlag, "PRISMID_SHADOW_MODE")
+	enableMultiTenant := envBoolOrFlag(*enableMultiTenantFlag, "PRISMID_ENABLE_MULTI_TENANT")
+	metricsPublic := envBoolOrFlag(*metricsPublicFlag, "PRISMID_METRICS_PUBLIC")
 
 	secret := envOrFlag(*hmacSecret, "PRISMID_HMAC_SECRET")
 	tsSecret := envOrFlag(*turnstileSecretFlag, "PRISMID_TURNSTILE_SECRET")
@@ -385,14 +480,33 @@ func main() {
 		auditStore = fa
 	}
 
+	var redisStore *prismid.RedisStore
+	if redisURL := envOrFlag(*redisURLFlag, "PRISMID_REDIS_URL"); redisURL != "" {
+		rs, err := prismid.NewRedisStore(prismid.RedisOptions{URL: redisURL})
+		if err != nil {
+			log.Fatalf("failed to connect to Redis (%s): %v", redisURL, err)
+		}
+		redisStore = rs
+	}
+
 	memStore := prismid.NewMemoryChallengeStore()
+	var activeStore prismid.ChallengeStore = memStore
+	var graphBackend prismid.GraphBackend
+	if redisStore != nil {
+		activeStore = redisStore
+		graphBackend = redisStore
+	}
 	riskGraph := prismid.NewRiskGraphWithOptions(prismid.GraphOptions{
 		MinConfidence:    prismid.AuthoritativeConfidenceThreshold,
 		HardAnchorPolicy: hardPolicy,
 		NowFunc:          time.Now,
-		Store:            memStore,
+		Store:            activeStore,
+		Backend:          graphBackend,
 	})
 	guard := newReplayAndRevocationGuard()
+	if redisStore != nil {
+		guard.attachDistributed(redisStore)
+	}
 
 	var stateStore *prismid.FileStateStore
 	if statePath := envOrFlag(*stateFileFlag, "PRISMID_STATE_FILE"); statePath != "" {
@@ -441,7 +555,7 @@ func main() {
 		vCfg.TurnstileVerifier = buildCloudflareTurnstileVerifier(tsSecret)
 	}
 
-	verifier := prismid.NewVerifier(vCfg, memStore)
+	verifier := prismid.NewVerifier(vCfg, activeStore)
 	verifier.BindRiskGraph(riskGraph)
 
 	hCfg := serverHandlerConfig{
@@ -453,13 +567,19 @@ func main() {
 		adminSecret:       []byte(envOrFlag(*adminSecretFlag, "PRISMID_ADMIN_SECRET")),
 		demoMode:          *demoMode,
 		trustProxy:        *trustProxy,
+		trustedProxies:    trustedChecker,
+		shadowMode:        shadowMode,
+		enableMultiTenant: enableMultiTenant,
+		metricsPublic:     metricsPublic,
 		corsOrigin:        *corsOrigin,
 		ratePerSec:        *rateLimit,
 		burst:             *rateLimit * 2,
 		allowLegacyTokens: *allowLegacyTokens,
 		stateStore:        stateStore,
 		memStore:          memStore,
+		redisStore:        redisStore,
 		replayGuard:       guard,
+		metrics:           prismid.NewMetrics(),
 	}
 
 	handler := newHTTPHandlerWithConfig(verifier, riskGraph, hCfg)
@@ -485,10 +605,13 @@ func main() {
 				log.Printf("[ERROR] failed to flush state on shutdown: %v", err)
 			}
 		}
+		if redisStore != nil {
+			_ = redisStore.Close()
+		}
 	}()
 
-	log.Printf("PrismID standalone verification server v%s listening on %s (demo-mode=%v, policy=%s, trust-proxy=%v, rate-limit=%.0f/s)",
-		serverVersion, *addr, *demoMode, hardPolicy, *trustProxy, *rateLimit)
+	log.Printf("PrismID standalone verification server v%s listening on %s (demo-mode=%v, shadow-mode=%v, multi-tenant=%v, redis=%v, policy=%s, rate-limit=%.0f/s)",
+		serverVersion, *addr, *demoMode, shadowMode, enableMultiTenant, redisStore != nil, hardPolicy, *rateLimit)
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("server error: %v", err)
 	}
@@ -514,8 +637,39 @@ func newHTTPHandlerWithOptions(verifier *prismid.Verifier, riskGraph *prismid.Ri
 	})
 }
 
+func isValidTenantID(tid string) bool {
+	if len(tid) == 0 || len(tid) > 64 {
+		return false
+	}
+	for i := 0; i < len(tid); i++ {
+		c := tid[i]
+		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-') {
+			return false
+		}
+	}
+	return true
+}
+
+func scopeTenantSubjectID(tenantID, rawSubjectID string) (string, bool) {
+	if tenantID == "" || rawSubjectID == "" {
+		return rawSubjectID, true
+	}
+	expectedPrefix := "t:" + tenantID + ":"
+	if strings.HasPrefix(rawSubjectID, expectedPrefix) {
+		return rawSubjectID, true
+	}
+	if strings.HasPrefix(rawSubjectID, "t:") {
+		// Bearer token was minted for a different explicit tenant namespace!
+		return "", false
+	}
+	return expectedPrefix + rawSubjectID, true
+}
+
 func newHTTPHandlerWithConfig(verifier *prismid.Verifier, riskGraph *prismid.RiskGraph, cfg serverHandlerConfig) http.Handler {
 	verifier.BindRiskGraph(riskGraph)
+	if cfg.redisStore != nil {
+		riskGraph.AttachBackend(cfg.redisStore)
+	}
 	authPrimary := cfg.authSecret
 	if len(authPrimary) == 0 {
 		authPrimary = cfg.hmacSecret
@@ -531,10 +685,62 @@ func newHTTPHandlerWithConfig(verifier *prismid.Verifier, riskGraph *prismid.Ris
 	if guard == nil {
 		guard = newReplayAndRevocationGuard()
 	}
+	if cfg.redisStore != nil && guard.getDistributed() == nil {
+		guard.attachDistributed(cfg.redisStore)
+	}
+	metrics := cfg.metrics
+	if metrics == nil {
+		metrics = prismid.NewMetrics()
+	}
+
+	resolveClientIP := func(r *http.Request) string {
+		return prismid.ExtractRealClientIP(r, cfg.trustedProxies, allowProxyHeaders)
+	}
+	resolveTransportSignals := func(r *http.Request) prismid.TransportSignals {
+		return prismid.ExtractTrustedTransportSignals(r, cfg.trustedProxies, allowProxyHeaders)
+	}
+	resolveTenant := func(w http.ResponseWriter, r *http.Request) (string, *prismid.Verifier, bool) {
+		if !cfg.enableMultiTenant {
+			return "", verifier, true
+		}
+		tid := strings.TrimSpace(r.Header.Get("X-PrismID-Tenant-ID"))
+		if tid == "" {
+			return "", verifier, true
+		}
+		if !isValidTenantID(tid) {
+			writeJSON(w, http.StatusBadRequest, map[string]any{
+				"accepted": false,
+				"error":    "invalid X-PrismID-Tenant-ID header (expected 1..64 alphanumeric, '_' or '-' chars)",
+			})
+			return "", nil, false
+		}
+		return tid, verifier.WithTenant(tid), true
+	}
+
 	appendWAL := func(rec prismid.StateWALRecord, syncImmediate bool) {
 		if cfg.stateStore != nil {
 			_ = cfg.stateStore.AppendWAL(rec, syncImmediate)
 		}
+	}
+
+	// Admin endpoints for standalone deployments (S2-25, S3-52, S1-5): protected by X-PrismID-Admin-Secret.
+	requireAdmin := func(w http.ResponseWriter, r *http.Request) bool {
+		if len(cfg.adminSecret) == 0 {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "admin API disabled; configure -admin-secret or PRISMID_ADMIN_SECRET"})
+			return false
+		}
+		provided := strings.TrimSpace(r.Header.Get("X-PrismID-Admin-Secret"))
+		if provided == "" {
+			auth := strings.TrimSpace(r.Header.Get("Authorization"))
+			if strings.HasPrefix(strings.ToLower(auth), "bearer ") {
+				provided = strings.TrimSpace(auth[7:])
+			}
+		}
+		if len(provided) == 0 || subtle.ConstantTimeCompare([]byte(provided), cfg.adminSecret) != 1 {
+			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "invalid admin secret"})
+			return false
+		}
+		return true
 	}
 
 	mux := http.NewServeMux()
@@ -546,10 +752,28 @@ func newHTTPHandlerWithConfig(verifier *prismid.Verifier, riskGraph *prismid.Ris
 			"engine":             "prismid-go",
 			"version":            serverVersion,
 			"demo_mode":          cfg.demoMode,
+			"shadow_mode":        cfg.shadowMode,
+			"multi_tenant":       cfg.enableMultiTenant,
+			"redis_enabled":      cfg.redisStore != nil,
 			"hard_anchor_policy": stats.HardAnchorPolicy,
 			"active_subjects":    stats.ActiveSubjects,
 			"persist_errors":     cfg.stateStore.PersistErrors(),
 		})
+	})
+
+	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
+			return
+		}
+		if len(cfg.adminSecret) > 0 && !cfg.metricsPublic {
+			if !requireAdmin(w, r) {
+				return
+			}
+		}
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(metrics.RenderPrometheus(riskGraph, cfg.stateStore.PersistErrors())))
 	})
 
 	mux.HandleFunc("/prismid.bundle.js", func(w http.ResponseWriter, _ *http.Request) {
@@ -579,6 +803,10 @@ func newHTTPHandlerWithConfig(verifier *prismid.Verifier, riskGraph *prismid.Ris
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
 			return
 		}
+		tid, scopedVerifier, tenantOK := resolveTenant(w, r)
+		if !tenantOK {
+			return
+		}
 		subjectID, authErr := extractVerifiedSubjectIDMultiKey(r, cfg.demoMode, authPrimary, cfg.authSecretPrev, cfg.allowLegacyTokens, guard)
 		if authErr || (!cfg.demoMode && subjectID == "") {
 			writeJSON(w, http.StatusUnauthorized, map[string]any{
@@ -587,11 +815,19 @@ func newHTTPHandlerWithConfig(verifier *prismid.Verifier, riskGraph *prismid.Ris
 			})
 			return
 		}
+		if _, okScope := scopeTenantSubjectID(tid, subjectID); !okScope {
+			writeJSON(w, http.StatusForbidden, map[string]any{
+				"accepted": false,
+				"error":    "bearer token tenant mismatch",
+			})
+			return
+		}
 		r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
-		ch, err := verifier.IssueChallenge(r.Context(), extractClientIP(r, allowProxyHeaders))
+		ch, err := scopedVerifier.IssueChallenge(r.Context(), resolveClientIP(r))
 		if err != nil {
 			var vErr *prismid.VerificationError
 			if errors.As(err, &vErr) && vErr.Code == prismid.ErrCodeChallengeRateLimited {
+				metrics.RecordChallengeRateLimited()
 				writeJSON(w, http.StatusTooManyRequests, map[string]any{
 					"accepted": false,
 					"code":     vErr.Code,
@@ -602,10 +838,12 @@ func newHTTPHandlerWithConfig(verifier *prismid.Verifier, riskGraph *prismid.Ris
 			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 			return
 		}
+		metrics.RecordChallengeIssued()
 		writeJSON(w, http.StatusOK, ch)
 	})
 
 	mux.HandleFunc("/api/v1/risk/identify", func(w http.ResponseWriter, r *http.Request) {
+		startedAt := time.Now()
 		enableCORS(w, r, cfg.demoMode, cfg.corsOrigin)
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
@@ -615,24 +853,40 @@ func newHTTPHandlerWithConfig(verifier *prismid.Verifier, riskGraph *prismid.Ris
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
 			return
 		}
-		subjectID, authErr := extractVerifiedSubjectIDMultiKey(r, cfg.demoMode, authPrimary, cfg.authSecretPrev, cfg.allowLegacyTokens, guard)
-		if authErr || (!cfg.demoMode && subjectID == "") {
+		tid, scopedVerifier, tenantOK := resolveTenant(w, r)
+		if !tenantOK {
+			return
+		}
+		rawSubjectID, authErr := extractVerifiedSubjectIDMultiKey(r, cfg.demoMode, authPrimary, cfg.authSecretPrev, cfg.allowLegacyTokens, guard)
+		if authErr || (!cfg.demoMode && rawSubjectID == "") {
 			writeJSON(w, http.StatusUnauthorized, map[string]any{
 				"accepted": false,
 				"error":    "invalid, expired, or revoked bearer token",
 			})
 			return
 		}
+		graphSubjectID, okScope := scopeTenantSubjectID(tid, rawSubjectID)
+		if !okScope {
+			writeJSON(w, http.StatusForbidden, map[string]any{
+				"accepted": false,
+				"error":    "bearer token tenant mismatch",
+			})
+			return
+		}
 		r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
 		var req prismid.IdentifyRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			metrics.RecordIdentifyRejection("INVALID_JSON", time.Since(startedAt))
 			writeJSON(w, http.StatusBadRequest, map[string]any{"accepted": false, "error": "invalid request body"})
 			return
 		}
-		res, err := verifier.VerifyAndDerive(r.Context(), req, extractClientIP(r, allowProxyHeaders))
+		clientIP := resolveClientIP(r)
+		transportSig := resolveTransportSignals(r)
+		res, err := scopedVerifier.VerifyAndDeriveWithTransport(r.Context(), req, clientIP, transportSig)
 		if err != nil {
 			status := http.StatusBadRequest
 			if vErr, ok := err.(*prismid.VerificationError); ok {
+				metrics.RecordIdentifyRejection(vErr.Code, time.Since(startedAt))
 				switch vErr.Code {
 				case prismid.ErrCodeChallengeInvalid:
 					status = http.StatusConflict
@@ -646,22 +900,27 @@ func newHTTPHandlerWithConfig(verifier *prismid.Verifier, riskGraph *prismid.Ris
 				})
 				return
 			}
+			metrics.RecordIdentifyRejection("VERIFY_ERROR", time.Since(startedAt))
 			writeJSON(w, status, map[string]any{"accepted": false, "message": err.Error()})
 			return
 		}
 
-		if subjectID != "" {
-			ownerRecorded := verifier.RecordVerifiedBeaconOwner(r.Context(), subjectID, res)
+		if graphSubjectID != "" {
+			ownerRecorded := scopedVerifier.RecordVerifiedBeaconOwner(r.Context(), graphSubjectID, res)
 			nowUTC := time.Now().UTC()
-			snap := riskGraph.RecordVerification(subjectID, nowUTC, res)
+			snap := riskGraph.RecordVerification(graphSubjectID, nowUTC, res)
+			metrics.RecordIdentifyVerdict(string(snap.RiskStatus), cfg.shadowMode, res.SpoofTrapTriggered, res.DeviceKeyRecoveryRequired, time.Since(startedAt))
 			appendWAL(prismid.StateWALRecord{
 				Op:            prismid.WALOpIdentify,
 				At:            nowUTC,
-				SubjectID:     subjectID,
+				SubjectID:     graphSubjectID,
 				OwnerRecorded: ownerRecorded,
 				VerifyResult:  res,
 			}, false)
-			writeJSON(w, http.StatusOK, map[string]any{
+
+			effectiveRiskStatus := snap.RiskStatus
+			effectiveRiskPending := snap.RiskPending
+			resp := map[string]any{
 				"accepted":                     res.Accepted,
 				"confidence":                   res.Confidence,
 				"device_key_slice_id":          res.DeviceKeySliceID,
@@ -681,23 +940,32 @@ func newHTTPHandlerWithConfig(verifier *prismid.Verifier, riskGraph *prismid.Ris
 				"spoof_trap_triggered":         res.SpoofTrapTriggered,
 				"spoof_flags":                  res.SpoofFlags,
 				"privacy_signals":              res.PrivacySignals,
-				"risk_status":                  snap.RiskStatus,
-				"risk_pending":                 snap.RiskPending,
 				"truncated":                    snap.Truncated,
 				"burst_suspicion":              snap.BurstSuspicion,
 				"log_odds_score":               snap.LogOddsScore,
 				"evidence_chain":               snap.EvidenceChain,
 				"component_snapshot":           snap,
-			})
+			}
+			if cfg.shadowMode {
+				resp["shadow_mode"] = true
+				resp["shadow_risk_status"] = snap.RiskStatus
+				resp["shadow_risk_pending"] = snap.RiskPending
+				effectiveRiskStatus = prismid.RiskStatusGreen
+				effectiveRiskPending = false
+			}
+			resp["risk_status"] = effectiveRiskStatus
+			resp["risk_pending"] = effectiveRiskPending
+			writeJSON(w, http.StatusOK, resp)
 			return
 		}
+		metrics.RecordIdentifyVerdict("anonymous", cfg.shadowMode, res.SpoofTrapTriggered, res.DeviceKeyRecoveryRequired, time.Since(startedAt))
 		writeJSON(w, http.StatusOK, res)
 	})
 
 	// Audited TOFU device-key recovery & rotation endpoint (S1-1, S1-3, S2-10, S2-11, S2-12):
 	// Supports two cryptographic authorization paths:
 	//  Path A (Loss Recovery): Single-use `step_up_token` bound to `(subject_id, beacon_slice_id)`.
-	//  Path B (Key Rotation):  `previous_device_key` ECDSA signature proving possession of the currently bound device key.
+	//  Path B (Key Rotation):  `previous_device_key` ECDSA signature proving possession of the currently bound device key + `<new_pub_key>`.
 	mux.HandleFunc("/api/v1/risk/rebind-key", func(w http.ResponseWriter, r *http.Request) {
 		enableCORS(w, r, cfg.demoMode, cfg.corsOrigin)
 		if r.Method == http.MethodOptions {
@@ -708,9 +976,18 @@ func newHTTPHandlerWithConfig(verifier *prismid.Verifier, riskGraph *prismid.Ris
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
 			return
 		}
-		subjectID, authErr := extractVerifiedSubjectIDMultiKey(r, cfg.demoMode, authPrimary, cfg.authSecretPrev, cfg.allowLegacyTokens, guard)
-		if authErr || subjectID == "" {
+		tid, scopedVerifier, tenantOK := resolveTenant(w, r)
+		if !tenantOK {
+			return
+		}
+		rawSubjectID, authErr := extractVerifiedSubjectIDMultiKey(r, cfg.demoMode, authPrimary, cfg.authSecretPrev, cfg.allowLegacyTokens, guard)
+		if authErr || rawSubjectID == "" {
 			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "verified subject identity required"})
+			return
+		}
+		graphSubjectID, okScope := scopeTenantSubjectID(tid, rawSubjectID)
+		if !okScope {
+			writeJSON(w, http.StatusForbidden, map[string]any{"error": "bearer token tenant mismatch"})
 			return
 		}
 		r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
@@ -719,12 +996,14 @@ func newHTTPHandlerWithConfig(verifier *prismid.Verifier, riskGraph *prismid.Ris
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid request body"})
 			return
 		}
-		req.SubjectID = subjectID
-		clientIP := extractClientIP(r, allowProxyHeaders)
+		req.SubjectID = rawSubjectID
+		req.GraphSubjectID = graphSubjectID
+		clientIP := resolveClientIP(r)
 
-		bcnSlice, err := verifier.DeriveBeaconSliceID(req.BeaconID)
+		bcnSlice, err := scopedVerifier.DeriveBeaconSliceID(req.BeaconID)
 		if err != nil {
-			verifier.RecordDeniedRebindAudit(subjectID, "", clientIP, "denied_invalid_beacon")
+			metrics.RecordRebindOutcome("denied")
+			scopedVerifier.RecordDeniedRebindAudit(graphSubjectID, "", clientIP, "denied_invalid_beacon")
 			writeJSON(w, http.StatusBadRequest, map[string]any{
 				"accepted": false,
 				"code":     prismid.ErrCodeRebindInvalidKeyProof,
@@ -734,9 +1013,10 @@ func newHTTPHandlerWithConfig(verifier *prismid.Verifier, riskGraph *prismid.Ris
 		}
 
 		// Verify ownership FIRST before consuming any single-use step-up token or challenge nonce:
-		ownerCheck := verifier.BeaconOwnerCheck(riskGraph)
-		if !ownerCheck(subjectID, bcnSlice) {
-			verifier.RecordDeniedRebindAudit(subjectID, bcnSlice, clientIP, "denied_not_owner")
+		ownerCheck := scopedVerifier.BeaconOwnerCheck(riskGraph)
+		if !ownerCheck(graphSubjectID, bcnSlice) {
+			metrics.RecordRebindOutcome("denied")
+			scopedVerifier.RecordDeniedRebindAudit(graphSubjectID, bcnSlice, clientIP, "denied_not_owner")
 			writeJSON(w, http.StatusForbidden, map[string]any{
 				"accepted": false,
 				"code":     prismid.ErrCodeRebindForbidden,
@@ -745,15 +1025,21 @@ func newHTTPHandlerWithConfig(verifier *prismid.Verifier, riskGraph *prismid.Ris
 			return
 		}
 
-		// Dual-path authorization (S2-10 single-use step-up OR S2-12 previous-key continuity proof):
-		authorizedByPrevKey := verifier.HasValidPreviousKeyProof(r.Context(), req)
+		// Dual-path authorization (S2-10 single-use step-up OR S2-12 5-segment bound previous-key continuity proof):
+		authorizedByPrevKey := scopedVerifier.HasValidPreviousKeyProof(r.Context(), req)
 		if !authorizedByPrevKey {
 			stepUpTok := strings.TrimSpace(req.StepUpToken)
 			if stepUpTok == "" {
 				stepUpTok = strings.TrimSpace(r.Header.Get("X-PrismID-StepUp-Token"))
 			}
-			if !verifyAndConsumeStepUpToken(stepUpTok, subjectID, bcnSlice, stepUpPrimary, cfg.stepUpSecretPrev, guard, cfg.stateStore) {
-				verifier.RecordDeniedRebindAudit(subjectID, bcnSlice, clientIP, "denied_invalid_stepup")
+			stepUpOK := verifyAndConsumeStepUpToken(stepUpTok, graphSubjectID, bcnSlice, stepUpPrimary, cfg.stepUpSecretPrev, guard, cfg.stateStore)
+			if !stepUpOK && graphSubjectID != rawSubjectID {
+				// Also accept step-up token minted for rawSubjectID because target `bcnSlice` is already tenant-HMAC-isolated:
+				stepUpOK = verifyAndConsumeStepUpToken(stepUpTok, rawSubjectID, bcnSlice, stepUpPrimary, cfg.stepUpSecretPrev, guard, cfg.stateStore)
+			}
+			if !stepUpOK {
+				metrics.RecordRebindOutcome("denied")
+				scopedVerifier.RecordDeniedRebindAudit(graphSubjectID, bcnSlice, clientIP, "denied_invalid_stepup")
 				writeJSON(w, http.StatusForbidden, map[string]any{
 					"accepted": false,
 					"code":     prismid.ErrCodeRebindForbidden,
@@ -763,8 +1049,9 @@ func newHTTPHandlerWithConfig(verifier *prismid.Verifier, riskGraph *prismid.Ris
 			}
 		}
 
-		res, err := verifier.RebindDeviceKeyWithProof(r.Context(), req, ownerCheck, clientIP)
+		res, err := scopedVerifier.RebindDeviceKeyWithProof(r.Context(), req, ownerCheck, clientIP)
 		if err != nil {
+			metrics.RecordRebindOutcome("denied")
 			status := http.StatusBadRequest
 			if vErr, ok := err.(*prismid.VerificationError); ok {
 				switch vErr.Code {
@@ -783,10 +1070,15 @@ func newHTTPHandlerWithConfig(verifier *prismid.Verifier, riskGraph *prismid.Ris
 			writeJSON(w, status, map[string]any{"accepted": false, "error": err.Error()})
 			return
 		}
+		if authorizedByPrevKey {
+			metrics.RecordRebindOutcome("rotation")
+		} else {
+			metrics.RecordRebindOutcome("step_up")
+		}
 		appendWAL(prismid.StateWALRecord{
 			Op:            prismid.WALOpRebind,
 			At:            time.Now().UTC(),
-			SubjectID:     subjectID,
+			SubjectID:     graphSubjectID,
 			BeaconSliceID: res.BeaconSliceID,
 			KeySliceID:    res.DeviceKeySliceID,
 		}, true)
@@ -804,12 +1096,21 @@ func newHTTPHandlerWithConfig(verifier *prismid.Verifier, riskGraph *prismid.Ris
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
 			return
 		}
-		subjectID, authErr := extractVerifiedSubjectIDMultiKey(r, cfg.demoMode, authPrimary, cfg.authSecretPrev, cfg.allowLegacyTokens, guard)
-		if authErr || subjectID == "" {
+		tid, scopedVerifier, tenantOK := resolveTenant(w, r)
+		if !tenantOK {
+			return
+		}
+		rawSubjectID, authErr := extractVerifiedSubjectIDMultiKey(r, cfg.demoMode, authPrimary, cfg.authSecretPrev, cfg.allowLegacyTokens, guard)
+		if authErr || rawSubjectID == "" {
 			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "verified subject identity required"})
 			return
 		}
-		clientIP := extractClientIP(r, allowProxyHeaders)
+		graphSubjectID, okScope := scopeTenantSubjectID(tid, rawSubjectID)
+		if !okScope {
+			writeJSON(w, http.StatusForbidden, map[string]any{"error": "bearer token tenant mismatch"})
+			return
+		}
+		clientIP := resolveClientIP(r)
 		r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
 		var body struct {
 			StepUpToken string `json:"step_up_token"`
@@ -819,8 +1120,9 @@ func newHTTPHandlerWithConfig(verifier *prismid.Verifier, riskGraph *prismid.Ris
 		if stepUpTok == "" {
 			stepUpTok = strings.TrimSpace(r.Header.Get("X-PrismID-StepUp-Token"))
 		}
-		if !verifyAndConsumeStepUpToken(stepUpTok, subjectID, "clear_spoof", stepUpPrimary, cfg.stepUpSecretPrev, guard, cfg.stateStore) {
-			verifier.RecordClearSpoofAudit(subjectID, clientIP, "denied_invalid_stepup")
+		if !verifyAndConsumeStepUpToken(stepUpTok, graphSubjectID, "clear_spoof", stepUpPrimary, cfg.stepUpSecretPrev, guard, cfg.stateStore) {
+			metrics.RecordClearSpoof(false)
+			scopedVerifier.RecordClearSpoofAudit(graphSubjectID, clientIP, "denied_invalid_stepup")
 			writeJSON(w, http.StatusForbidden, map[string]any{
 				"accepted": false,
 				"error":    "valid single-use step_up_token for clear_spoof is required",
@@ -828,18 +1130,19 @@ func newHTTPHandlerWithConfig(verifier *prismid.Verifier, riskGraph *prismid.Ris
 			return
 		}
 		clearedAt := time.Now().UTC()
-		cleared := verifier.ClearSubjectSpoofAudited(riskGraph, subjectID, clientIP, clearedAt)
+		cleared := scopedVerifier.ClearSubjectSpoofAudited(riskGraph, graphSubjectID, clientIP, clearedAt)
+		metrics.RecordClearSpoof(true)
 		if cleared {
 			appendWAL(prismid.StateWALRecord{
 				Op:        prismid.WALOpClearSpoof,
 				At:        clearedAt,
-				SubjectID: subjectID,
+				SubjectID: graphSubjectID,
 			}, true)
 		}
 		writeJSON(w, http.StatusOK, map[string]any{
-			"subject_id":         subjectID,
+			"subject_id":         rawSubjectID,
 			"cleared":            cleared,
-			"component_snapshot": riskGraph.EvaluateSubject(subjectID),
+			"component_snapshot": riskGraph.EvaluateSubject(graphSubjectID),
 		})
 	})
 
@@ -853,12 +1156,21 @@ func newHTTPHandlerWithConfig(verifier *prismid.Verifier, riskGraph *prismid.Ris
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
 			return
 		}
-		subjectID, authErr := extractVerifiedSubjectIDMultiKey(r, cfg.demoMode, authPrimary, cfg.authSecretPrev, cfg.allowLegacyTokens, guard)
-		if authErr || subjectID == "" {
+		tid, _, tenantOK := resolveTenant(w, r)
+		if !tenantOK {
+			return
+		}
+		rawSubjectID, authErr := extractVerifiedSubjectIDMultiKey(r, cfg.demoMode, authPrimary, cfg.authSecretPrev, cfg.allowLegacyTokens, guard)
+		if authErr || rawSubjectID == "" {
 			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "verified subject identity required"})
 			return
 		}
-		snap := riskGraph.EvaluateSubject(subjectID)
+		graphSubjectID, okScope := scopeTenantSubjectID(tid, rawSubjectID)
+		if !okScope {
+			writeJSON(w, http.StatusForbidden, map[string]any{"error": "bearer token tenant mismatch"})
+			return
+		}
+		snap := riskGraph.EvaluateSubject(graphSubjectID)
 		writeJSON(w, http.StatusOK, snap)
 	})
 
@@ -873,45 +1185,35 @@ func newHTTPHandlerWithConfig(verifier *prismid.Verifier, riskGraph *prismid.Ris
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
 			return
 		}
-		subjectID, authErr := extractVerifiedSubjectIDMultiKey(r, cfg.demoMode, authPrimary, cfg.authSecretPrev, cfg.allowLegacyTokens, guard)
-		if authErr || subjectID == "" {
+		tid, scopedVerifier, tenantOK := resolveTenant(w, r)
+		if !tenantOK {
+			return
+		}
+		rawSubjectID, authErr := extractVerifiedSubjectIDMultiKey(r, cfg.demoMode, authPrimary, cfg.authSecretPrev, cfg.allowLegacyTokens, guard)
+		if authErr || rawSubjectID == "" {
 			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "verified subject identity required"})
 			return
 		}
-		removed, purgedBindings := verifier.EraseSubject(r.Context(), riskGraph, subjectID, extractClientIP(r, allowProxyHeaders))
+		graphSubjectID, okScope := scopeTenantSubjectID(tid, rawSubjectID)
+		if !okScope {
+			writeJSON(w, http.StatusForbidden, map[string]any{"error": "bearer token tenant mismatch"})
+			return
+		}
+		removed, purgedBindings := scopedVerifier.EraseSubject(r.Context(), riskGraph, graphSubjectID, resolveClientIP(r))
 		if removed || purgedBindings > 0 {
+			metrics.RecordSubjectErased()
 			appendWAL(prismid.StateWALRecord{
 				Op:        prismid.WALOpEraseSubject,
 				At:        time.Now().UTC(),
-				SubjectID: subjectID,
+				SubjectID: graphSubjectID,
 			}, true)
 		}
 		writeJSON(w, http.StatusOK, map[string]any{
-			"subject_id":          subjectID,
+			"subject_id":          rawSubjectID,
 			"deleted":             removed,
 			"purged_key_bindings": purgedBindings,
 		})
 	})
-
-	// Admin endpoints for standalone deployments (S2-25, S3-52, S1-5): protected by X-PrismID-Admin-Secret.
-	requireAdmin := func(w http.ResponseWriter, r *http.Request) bool {
-		if len(cfg.adminSecret) == 0 {
-			writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "admin API disabled; configure -admin-secret or PRISMID_ADMIN_SECRET"})
-			return false
-		}
-		provided := strings.TrimSpace(r.Header.Get("X-PrismID-Admin-Secret"))
-		if provided == "" {
-			auth := strings.TrimSpace(r.Header.Get("Authorization"))
-			if strings.HasPrefix(strings.ToLower(auth), "bearer ") {
-				provided = strings.TrimSpace(auth[7:])
-			}
-		}
-		if len(provided) == 0 || subtle.ConstantTimeCompare([]byte(provided), cfg.adminSecret) != 1 {
-			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "invalid admin secret"})
-			return false
-		}
-		return true
-	}
 
 	mux.HandleFunc("/api/v1/risk/admin/mint-bearer", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -924,20 +1226,40 @@ func newHTTPHandlerWithConfig(verifier *prismid.Verifier, riskGraph *prismid.Ris
 		r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
 		var body struct {
 			SubjectID  string `json:"subject_id"`
+			TenantID   string `json:"tenant_id"`
 			TTLSeconds int64  `json:"ttl_seconds"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || strings.TrimSpace(body.SubjectID) == "" {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "subject_id is required"})
 			return
 		}
+		sid := strings.TrimSpace(body.SubjectID)
+		if cfg.enableMultiTenant {
+			tid := strings.TrimSpace(body.TenantID)
+			if tid == "" {
+				tid = strings.TrimSpace(r.Header.Get("X-PrismID-Tenant-ID"))
+			}
+			if tid != "" {
+				if !isValidTenantID(tid) {
+					writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid tenant_id"})
+					return
+				}
+				scopedSID, okScope := scopeTenantSubjectID(tid, sid)
+				if !okScope {
+					writeJSON(w, http.StatusBadRequest, map[string]any{"error": "subject_id conflicts with tenant_id"})
+					return
+				}
+				sid = scopedSID
+			}
+		}
 		ttl := DefaultBearerTokenTTL
 		if body.TTLSeconds > 0 && body.TTLSeconds <= 30*86400 {
 			ttl = time.Duration(body.TTLSeconds) * time.Second
 		}
 		exp := time.Now().UTC().Add(ttl)
-		tok := SignSubjectBearerTokenWithExpiry(strings.TrimSpace(body.SubjectID), exp, authPrimary)
+		tok := SignSubjectBearerTokenWithExpiry(sid, exp, authPrimary)
 		writeJSON(w, http.StatusOK, map[string]any{
-			"subject_id": strings.TrimSpace(body.SubjectID),
+			"subject_id": sid,
 			"token":      tok,
 			"expires_at": exp.Unix(),
 		})
@@ -954,6 +1276,7 @@ func newHTTPHandlerWithConfig(verifier *prismid.Verifier, riskGraph *prismid.Ris
 		r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
 		var body struct {
 			SubjectID  string `json:"subject_id"`
+			TenantID   string `json:"tenant_id"`
 			Target     string `json:"target"`
 			BeaconID   string `json:"beacon_id"`
 			TTLSeconds int64  `json:"ttl_seconds"`
@@ -962,12 +1285,33 @@ func newHTTPHandlerWithConfig(verifier *prismid.Verifier, riskGraph *prismid.Ris
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "subject_id is required"})
 			return
 		}
+		scopedVerifier := verifier
+		sid := strings.TrimSpace(body.SubjectID)
+		if cfg.enableMultiTenant {
+			tid := strings.TrimSpace(body.TenantID)
+			if tid == "" {
+				tid = strings.TrimSpace(r.Header.Get("X-PrismID-Tenant-ID"))
+			}
+			if tid != "" {
+				if !isValidTenantID(tid) {
+					writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid tenant_id"})
+					return
+				}
+				scopedVerifier = verifier.WithTenant(tid)
+				scopedSID, okScope := scopeTenantSubjectID(tid, sid)
+				if !okScope {
+					writeJSON(w, http.StatusBadRequest, map[string]any{"error": "subject_id conflicts with tenant_id"})
+					return
+				}
+				sid = scopedSID
+			}
+		}
 		target := strings.TrimSpace(body.Target)
 		if target == "" && strings.TrimSpace(body.BeaconID) != "" {
 			target = strings.TrimSpace(body.BeaconID)
 		}
 		if target != "clear_spoof" && !strings.HasPrefix(target, "d_bcn_") {
-			derived, err := verifier.DeriveBeaconSliceID(target)
+			derived, err := scopedVerifier.DeriveBeaconSliceID(target)
 			if err != nil {
 				writeJSON(w, http.StatusBadRequest, map[string]any{"error": "target must be 'clear_spoof', a d_bcn_* slice ID, or a 32-char hex beacon_id"})
 				return
@@ -979,9 +1323,9 @@ func newHTTPHandlerWithConfig(verifier *prismid.Verifier, riskGraph *prismid.Ris
 			ttl = time.Duration(body.TTLSeconds) * time.Second
 		}
 		exp := time.Now().UTC().Add(ttl)
-		tok := SignStepUpTokenWithExpiry(strings.TrimSpace(body.SubjectID), target, exp, stepUpPrimary)
+		tok := SignStepUpTokenWithExpiry(sid, target, exp, stepUpPrimary)
 		writeJSON(w, http.StatusOK, map[string]any{
-			"subject_id":    strings.TrimSpace(body.SubjectID),
+			"subject_id":    sid,
 			"target":        target,
 			"step_up_token": tok,
 			"expires_at":    exp.Unix(),
@@ -1094,8 +1438,9 @@ func newHTTPHandlerWithConfig(verifier *prismid.Verifier, riskGraph *prismid.Ris
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasPrefix(r.URL.Path, "/api/") && r.Method != http.MethodOptions {
-			clientIP := extractClientIP(r, allowProxyHeaders)
+			clientIP := resolveClientIP(r)
 			if !limiter.allow(clientIP, time.Now()) {
+				metrics.RecordHTTP429()
 				enableCORS(w, r, cfg.demoMode, cfg.corsOrigin)
 				writeJSON(w, http.StatusTooManyRequests, map[string]any{
 					"accepted": false,
@@ -1323,7 +1668,7 @@ func enableCORS(w http.ResponseWriter, r *http.Request, demoMode bool, configure
 		w.Header().Set("Access-Control-Allow-Origin", origin)
 	}
 	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Forwarded-For, X-PrismID-StepUp-Token, X-PrismID-Admin-Secret")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Forwarded-For, X-PrismID-StepUp-Token, X-PrismID-Admin-Secret, X-PrismID-Tenant-ID")
 }
 
 func writeJSON(w http.ResponseWriter, status int, payload any) {

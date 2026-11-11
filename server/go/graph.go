@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"reflect"
 	"sort"
 	"strings"
 	"sync"
@@ -133,6 +134,15 @@ type GraphStats struct {
 	HistoryIncomplete      bool             `json:"history_incomplete"`
 }
 
+// GraphBackend synchronizes RiskGraph edges across horizontally scaled server replicas and
+// persistent external datastores (implemented by RedisStore and SQLGraphStore).
+type GraphBackend interface {
+	UpsertGraphEdges(ctx context.Context, edges []GraphEdge) error
+	DeleteGraphEdges(ctx context.Context, subjectID string, sliceIDs ...string) error
+	DeleteSubjectGraphEdges(ctx context.Context, subjectID string) error
+	LoadGraphNeighborhood(ctx context.Context, seedSubjectID string, extraSliceIDs []string, maxSubjects int) ([]GraphEdge, error)
+}
+
 // GraphOptions configures RiskGraph behavior, persistence hooks, and capacity bounds.
 type GraphOptions struct {
 	MinConfidence    float64
@@ -140,6 +150,7 @@ type GraphOptions struct {
 	HardAnchorPolicy HardAnchorPolicy
 	NowFunc          func() time.Time
 	Store            ChallengeStore
+	Backend          GraphBackend
 }
 
 // RiskGraph evaluates connected components over deduplicated (SubjectID, SliceID) bipartite
@@ -152,6 +163,7 @@ type RiskGraph struct {
 	nowFunc                func() time.Time
 	ownerStore             BeaconOwnerStore
 	rebindStore            DeviceKeyRebindStore
+	backend                GraphBackend
 	lastObservedAt         time.Time
 	subjectOrder           []string
 	subjectEdges           map[string]map[string]GraphEdge
@@ -229,16 +241,35 @@ func NewRiskGraphWithOptions(opts GraphOptions) *RiskGraph {
 		incompleteSlices:   make(map[string]bool),
 		pendingRecovery:    make(map[string]map[string]time.Time),
 	}
-	if opts.Store != nil {
+	if !isNilInterfaceValue(opts.Store) {
 		g.AttachStore(opts.Store)
+	}
+	if !isNilInterfaceValue(opts.Backend) {
+		g.AttachBackend(opts.Backend)
 	}
 	return g
 }
 
-// AttachStore connects a ChallengeStore implementing BeaconOwnerStore and/or DeviceKeyRebindStore
-// so that beacon ownership survives in-memory graph eviction/restarts (S1-1) and RemoveSubject
-// purges TOFU bindings automatically (S2-21).
+func isNilInterfaceValue(v any) bool {
+	if v == nil {
+		return true
+	}
+	rv := reflect.ValueOf(v)
+	switch rv.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		return rv.IsNil()
+	default:
+		return false
+	}
+}
+
+// AttachStore connects a ChallengeStore implementing BeaconOwnerStore, DeviceKeyRebindStore,
+// and/or GraphBackend so that beacon ownership, TOFU bindings, and connected-component neighborhoods
+// survive in-memory graph eviction, restarts, and multi-replica load balancing.
 func (g *RiskGraph) AttachStore(store ChallengeStore) {
+	if isNilInterfaceValue(store) {
+		return
+	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if bos, ok := store.(BeaconOwnerStore); ok {
@@ -246,6 +277,102 @@ func (g *RiskGraph) AttachStore(store ChallengeStore) {
 	}
 	if rs, ok := store.(DeviceKeyRebindStore); ok {
 		g.rebindStore = rs
+	}
+	if gb, ok := store.(GraphBackend); ok && g.backend == nil {
+		g.backend = gb
+	}
+}
+
+// AttachBackend connects a distributed or persistent GraphBackend (e.g. RedisStore or SQLGraphStore).
+func (g *RiskGraph) AttachBackend(backend GraphBackend) {
+	if isNilInterfaceValue(backend) {
+		backend = nil
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.backend = backend
+}
+
+func (g *RiskGraph) getBackend() GraphBackend {
+	g.mu.RLock()
+	b := g.backend
+	g.mu.RUnlock()
+	return b
+}
+
+// syncNeighborhoodFromBackend hydrates the 2-hop bipartite neighborhood around `seedSubjectID`
+// and `extraSlices` from `g.backend` (if attached) without holding `g.mu` across network/DB I/O.
+func (g *RiskGraph) syncNeighborhoodFromBackend(seedSubjectID string, extraSlices []string) {
+	backend := g.getBackend()
+	if backend == nil {
+		return
+	}
+	edges, err := backend.LoadGraphNeighborhood(context.Background(), seedSubjectID, extraSlices, MaxComponentSize)
+	if err != nil {
+		return
+	}
+
+	bySub := make(map[string]map[string]GraphEdge)
+	for _, e := range edges {
+		if e.SubjectID == "" || e.SliceID == "" {
+			continue
+		}
+		if bySub[e.SubjectID] == nil {
+			bySub[e.SubjectID] = make(map[string]GraphEdge)
+		}
+		bySub[e.SubjectID][e.SliceID] = e
+	}
+
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	refNow := g.referenceNowLocked()
+
+	// If `seedSubjectID` was deleted on another replica, purge stale local cache for `seedSubjectID`.
+	if seedSubjectID != "" && len(bySub[seedSubjectID]) == 0 {
+		if _, hadLocal := g.subjectEdges[seedSubjectID]; hadLocal {
+			g.removeSubjectLocked(seedSubjectID)
+			for i, sid := range g.subjectOrder {
+				if sid == seedSubjectID {
+					g.subjectOrder = append(g.subjectOrder[:i], g.subjectOrder[i+1:]...)
+					break
+				}
+			}
+		}
+	}
+
+	for sid, remoteSlices := range bySub {
+		if _, exists := g.subjectEdges[sid]; !exists {
+			if g.maxSubjects > 0 && len(g.subjectEdges) >= g.maxSubjects {
+				if !g.evictOneSubjectByPriorityLocked(refNow, nil) {
+					continue
+				}
+			}
+			g.subjectOrder = append(g.subjectOrder, sid)
+			g.subjectEdges[sid] = make(map[string]GraphEdge, len(remoteSlices))
+		} else {
+			// Reconcile any edges removed on another replica (e.g. retired d_key_* after rebind).
+			for localSlice := range g.subjectEdges[sid] {
+				if _, stillPresent := remoteSlices[localSlice]; !stillPresent {
+					delete(g.subjectEdges[sid], localSlice)
+					if smap, ok := g.sliceEdges[localSlice]; ok {
+						delete(smap, sid)
+						if len(smap) == 0 {
+							delete(g.sliceEdges, localSlice)
+						}
+					}
+				}
+			}
+		}
+		for sl, edge := range remoteSlices {
+			if obs := edgeObservedAt(edge); obs.After(g.lastObservedAt) {
+				g.lastObservedAt = obs
+			}
+			g.subjectEdges[sid][sl] = edge
+			if g.sliceEdges[sl] == nil {
+				g.sliceEdges[sl] = make(map[string]GraphEdge)
+			}
+			g.sliceEdges[sl][sid] = edge
+		}
 	}
 }
 
@@ -573,6 +700,18 @@ func (g *RiskGraph) RecordVerification(subjectID string, observedAt time.Time, r
 
 	var ownerStoreToRecord BeaconOwnerStore
 	var bcnToRecord string
+	var backendToSync GraphBackend
+	var backendUpsert []GraphEdge
+	var backendDeletedSlices []string
+
+	if res != nil && res.Accepted && subjectID != "" && g.getBackend() != nil {
+		cand := make([]string, 0, 7)
+		cand = append(cand, res.SliceNodes()...)
+		if comp, ok := deriveCompositeGpuSysSlice(res.GpuAudioSliceID, res.SysNetSliceID); ok {
+			cand = append(cand, comp)
+		}
+		g.syncNeighborhoodFromBackend(subjectID, cand)
+	}
 
 	g.mu.Lock()
 	if observedAt.After(g.lastObservedAt) {
@@ -608,7 +747,8 @@ func (g *RiskGraph) RecordVerification(subjectID string, observedAt time.Time, r
 		bcnClean := strings.TrimSpace(res.BeaconSliceID)
 		keyClean := strings.TrimSpace(res.DeviceKeySliceID)
 		if res.DeviceKeyBound && strings.HasPrefix(keyClean, "d_key_") && strings.HasPrefix(bcnClean, "d_bcn_") {
-			g.retireSubjectDeviceKeyLocked(subjectID, bcnClean, "", keyClean)
+			_, deletedKeys := g.retireSubjectDeviceKeyWithDiffLocked(subjectID, bcnClean, "", keyClean)
+			backendDeletedSlices = append(backendDeletedSlices, deletedKeys...)
 		}
 		if strings.HasPrefix(bcnClean, "d_bcn_") && res.Confidence >= g.minConf && !res.SpoofTrapTriggered && !res.IsVirtualGPU {
 			delete(g.pendingRecovery, bcnClean)
@@ -822,10 +962,24 @@ func (g *RiskGraph) RecordVerification(subjectID string, observedAt time.Time, r
 			smap[subjectID] = edge
 		}
 	}
+	if g.backend != nil && res != nil && res.Accepted && subjectID != "" {
+		backendToSync = g.backend
+		for _, e := range g.subjectEdges[subjectID] {
+			backendUpsert = append(backendUpsert, e)
+		}
+	}
 	policy := g.hardAnchorPolicy
 	subEdges, truncated := g.collectLocalSubgraphEdgesLocked(subjectID)
 	g.mu.Unlock()
 
+	if backendToSync != nil {
+		if len(backendDeletedSlices) > 0 {
+			_ = backendToSync.DeleteGraphEdges(context.Background(), subjectID, backendDeletedSlices...)
+		}
+		if len(backendUpsert) > 0 {
+			_ = backendToSync.UpsertGraphEdges(context.Background(), backendUpsert)
+		}
+	}
 	if ownerStoreToRecord != nil && bcnToRecord != "" {
 		_ = ownerStoreToRecord.RecordBeaconOwner(context.Background(), bcnToRecord, subjectID)
 	}
@@ -881,15 +1035,40 @@ func (g *RiskGraph) RetireSubjectDeviceKey(subjectID, beaconSliceID, oldDeviceKe
 	if subjectID == "" {
 		return false
 	}
+	if g.getBackend() != nil {
+		g.syncNeighborhoodFromBackend(subjectID, nil)
+	}
 	g.mu.Lock()
-	defer g.mu.Unlock()
-	return g.retireSubjectDeviceKeyLocked(subjectID, beaconSliceID, oldDeviceKeySliceID, newDeviceKeySliceID)
+	retired, deletedKeys := g.retireSubjectDeviceKeyWithDiffLocked(subjectID, beaconSliceID, oldDeviceKeySliceID, newDeviceKeySliceID)
+	backend := g.backend
+	var migrated []GraphEdge
+	if backend != nil {
+		for _, e := range g.subjectEdges[subjectID] {
+			migrated = append(migrated, e)
+		}
+	}
+	g.mu.Unlock()
+
+	if backend != nil {
+		if len(deletedKeys) > 0 {
+			_ = backend.DeleteGraphEdges(context.Background(), subjectID, deletedKeys...)
+		}
+		if len(migrated) > 0 {
+			_ = backend.UpsertGraphEdges(context.Background(), migrated)
+		}
+	}
+	return retired
 }
 
 func (g *RiskGraph) retireSubjectDeviceKeyLocked(subjectID, beaconSliceID, oldDeviceKeySliceID, newDeviceKeySliceID string) bool {
+	retired, _ := g.retireSubjectDeviceKeyWithDiffLocked(subjectID, beaconSliceID, oldDeviceKeySliceID, newDeviceKeySliceID)
+	return retired
+}
+
+func (g *RiskGraph) retireSubjectDeviceKeyWithDiffLocked(subjectID, beaconSliceID, oldDeviceKeySliceID, newDeviceKeySliceID string) (bool, []string) {
 	subjMap, ok := g.subjectEdges[subjectID]
 	if !ok || len(subjMap) == 0 {
-		return false
+		return false, nil
 	}
 	retired := false
 	var toDelete []string
@@ -929,12 +1108,15 @@ func (g *RiskGraph) retireSubjectDeviceKeyLocked(subjectID, beaconSliceID, oldDe
 			}
 		}
 	}
-	return retired
+	return retired, toDelete
 }
 
 // EvaluateSubject returns the current ComponentSnapshot for a subject using bounded local subgraph traversal.
 func (g *RiskGraph) EvaluateSubject(subjectID string) ComponentSnapshot {
 	subjectID = strings.TrimSpace(subjectID)
+	if subjectID != "" && g.getBackend() != nil {
+		g.syncNeighborhoodFromBackend(subjectID, nil)
+	}
 	g.mu.RLock()
 	policy := g.hardAnchorPolicy
 	subEdges, truncated := g.collectLocalSubgraphEdgesLocked(subjectID)
@@ -1051,13 +1233,17 @@ func (g *RiskGraph) ClearSubjectSpoofAfterStepUp(subjectID string, clearedAt tim
 	if clearedAt.IsZero() {
 		clearedAt = time.Now().UTC()
 	}
+	if g.getBackend() != nil {
+		g.syncNeighborhoodFromBackend(subjectID, nil)
+	}
 	g.mu.Lock()
-	defer g.mu.Unlock()
 	subjMap, ok := g.subjectEdges[subjectID]
 	if !ok {
+		g.mu.Unlock()
 		return false
 	}
 	cleared := false
+	var updated []GraphEdge
 	for sl, edge := range subjMap {
 		if edge.SpoofTraphit {
 			edge.SpoofTraphit = false
@@ -1068,8 +1254,14 @@ func (g *RiskGraph) ClearSubjectSpoofAfterStepUp(subjectID string, clearedAt tim
 			if smap, exists := g.sliceEdges[sl]; exists {
 				smap[subjectID] = edge
 			}
+			updated = append(updated, edge)
 			cleared = true
 		}
+	}
+	backend := g.backend
+	g.mu.Unlock()
+	if backend != nil && len(updated) > 0 {
+		_ = backend.UpsertGraphEdges(context.Background(), updated)
 	}
 	return cleared
 }
@@ -1081,6 +1273,9 @@ func (g *RiskGraph) RemoveSubjectAndCollectBeacons(subjectID string) (bool, []st
 	subjectID = strings.TrimSpace(subjectID)
 	if subjectID == "" {
 		return false, nil
+	}
+	if g.getBackend() != nil {
+		g.syncNeighborhoodFromBackend(subjectID, nil)
 	}
 	g.mu.Lock()
 	subjMap, exists := g.subjectEdges[subjectID]
@@ -1109,7 +1304,12 @@ func (g *RiskGraph) RemoveSubjectAndCollectBeacons(subjectID string) (bool, []st
 		}
 	}
 	ownerStore := g.ownerStore
+	backend := g.backend
 	g.mu.Unlock()
+
+	if backend != nil {
+		_ = backend.DeleteSubjectGraphEdges(context.Background(), subjectID)
+	}
 
 	if ownerStore != nil {
 		if _, allOwnerBeacons, err := ownerStore.RemoveSubjectBeaconOwnership(context.Background(), subjectID); err == nil {

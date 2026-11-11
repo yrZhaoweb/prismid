@@ -267,6 +267,7 @@ type BeaconOwnerStore interface {
 type KeyRebindRequest struct {
 	ChallengeNonce    string          `json:"challenge_nonce"`
 	SubjectID         string          `json:"subject_id,omitempty"`
+	GraphSubjectID    string          `json:"-"`
 	BeaconID          string          `json:"beacon_id"`
 	DeviceKey         *DeviceKeyProof `json:"device_key"`
 	PreviousDeviceKey *DeviceKeyProof `json:"previous_device_key,omitempty"`
@@ -301,8 +302,10 @@ type KeyRebindAuditEvent struct {
 // Config configures the PrismID Verifier engine.
 type Config struct {
 	HMACSecret               []byte
+	TenantID                 string
 	ChallengeTTL             time.Duration
 	SpotPixelTolerance       int
+	StaticSamplePoints       bool
 	MaxDistinctGPUsPerSubnet int
 	SubnetWindow             time.Duration
 	RejectOnGPULawViolation  bool
@@ -357,6 +360,26 @@ func NewVerifier(cfg Config, store ChallengeStore) *Verifier {
 		store = NewMemoryChallengeStoreWithClock(cfg.NowFunc)
 	}
 	return &Verifier{cfg: cfg, store: store}
+}
+
+// WithTenant returns a shallow Verifier clone scoped to `tenantID` so all derived HMAC slices
+// (`d_web_*`, `d_gpu_*`, `d_sys_*`, `d_bcn_*`, `d_key_*`, `d_nat_*`, `d_kch_*`) are cryptographically
+// isolated across SaaS tenants while sharing the underlying ChallengeStore and RiskGraph.
+func (v *Verifier) WithTenant(tenantID string) *Verifier {
+	cleaned := strings.TrimSpace(tenantID)
+	if cleaned == v.cfg.TenantID {
+		return v
+	}
+	cfgCopy := v.cfg
+	cfgCopy.TenantID = cleaned
+	v.boundGraphMu.RLock()
+	bg := v.boundGraph
+	v.boundGraphMu.RUnlock()
+	return &Verifier{
+		cfg:        cfgCopy,
+		store:      v.store,
+		boundGraph: bg,
+	}
 }
 
 // BindRiskGraph connects `graph` to the verifier's `ChallengeStore` so that:
@@ -447,7 +470,27 @@ func (v *Verifier) IssueChallenge(ctx context.Context, clientIP string) (*Challe
 
 	now := v.cfg.NowFunc()
 	points := make([][2]int, len(DefaultSamplePoints))
-	copy(points, DefaultSamplePoints)
+	if v.cfg.StaticSamplePoints {
+		copy(points, DefaultSamplePoints)
+	} else {
+		var ptRand [16]byte
+		if _, err := rand.Read(ptRand[:]); err != nil {
+			copy(points, DefaultSamplePoints)
+		} else {
+			// Stratified 4x2 grid inside [8..247] x [8..247] (each cell 60x120 px) so every challenge
+			// samples unpredictable coordinates across the entire 256x256 shader viewport.
+			for i := 0; i < 8; i++ {
+				col := i % 4
+				row := i / 4
+				xMin := 8 + col*60
+				yMin := 8 + row*120
+				points[i] = [2]int{
+					xMin + int(ptRand[i*2])%60,
+					yMin + int(ptRand[i*2+1])%120,
+				}
+			}
+		}
+	}
 
 	ch := Challenge{
 		Nonce:        hex.EncodeToString(nonceBytes),
@@ -479,6 +522,12 @@ func canonicalizeWebGLLimits(raw string) string {
 
 // VerifyAndDerive executes the verification pipeline and derives the orthogonal device slices.
 func (v *Verifier) VerifyAndDerive(ctx context.Context, req IdentifyRequest, clientIP string) (*VerifyResult, error) {
+	return v.VerifyAndDeriveWithTransport(ctx, req, clientIP, TransportSignals{})
+}
+
+// VerifyAndDeriveWithTransport executes the full verification pipeline plus gateway-level TLS JA4/JA3
+// and HTTP/2 frame fingerprint cross-consistency checks against the decrypted browser payload.
+func (v *Verifier) VerifyAndDeriveWithTransport(ctx context.Context, req IdentifyRequest, clientIP string, transport TransportSignals) (*VerifyResult, error) {
 	nonce := strings.TrimSpace(req.ChallengeNonce)
 	if nonce == "" {
 		return nil, &VerificationError{Code: ErrCodeChallengeInvalid, Detail: "empty challenge nonce"}
@@ -705,6 +754,12 @@ func (v *Verifier) VerifyAndDerive(ctx context.Context, req IdentifyRequest, cli
 				Detail: strings.Join(lawViolations, "; "),
 			}
 		}
+	}
+
+	// Layer 3A-Transport: Gateway TLS JA4 & HTTP/2 Fingerprint vs Browser Claim Verification
+	for _, tv := range VerifyTransportConsistency(transport, &payload) {
+		spoofFlags = appendUniqueFlag(spoofFlags, tv)
+		spoofTrapTriggered = true
 	}
 
 	// Derive Orthogonal Spectral Slices:
@@ -934,7 +989,8 @@ func VerifyECDSAP256RebindProof(proof *DeviceKeyProof, nonce, subjectID, beaconI
 }
 
 // VerifyECDSAP256PrevKeyRotationProof verifies a domain-separated ECDSA P-256 continuity signature
-// by the PREVIOUS device key over "prismid-v2-rebind-prev|<nonce>|<subject_id>|<beacon_id>" (S2-12).
+// by the PREVIOUS device key over "prismid-v2-rebind-prev|<nonce>|<subject_id>|<beacon_id>".
+// Prefer VerifyECDSAP256PrevKeyRotationProofBound which also binds `<new_pub_key>`.
 func VerifyECDSAP256PrevKeyRotationProof(proof *DeviceKeyProof, nonce, subjectID, beaconID string) (bool, string) {
 	if strings.TrimSpace(nonce) == "" || strings.TrimSpace(subjectID) == "" || strings.TrimSpace(beaconID) == "" {
 		return false, ""
@@ -948,11 +1004,51 @@ func VerifyECDSAP256PrevKeyRotationProof(proof *DeviceKeyProof, nonce, subjectID
 	return verifyECDSAP256Transcript(proof, transcript)
 }
 
+// VerifyECDSAP256PrevKeyRotationProofBound verifies a domain-separated ECDSA P-256 continuity signature
+// by the PREVIOUS device key over "prismid-v2-rebind-prev|<nonce>|<subject_id>|<beacon_id>|<new_pub_key>",
+// cryptographically binding the replacement public key so an attacker intercepting a rotation request
+// cannot substitute their own `device_key`.
+func VerifyECDSAP256PrevKeyRotationProofBound(proof *DeviceKeyProof, nonce, subjectID, beaconID, newPubKeyHex string) (bool, string) {
+	if strings.TrimSpace(nonce) == "" || strings.TrimSpace(subjectID) == "" ||
+		strings.TrimSpace(beaconID) == "" || strings.TrimSpace(newPubKeyHex) == "" {
+		return false, ""
+	}
+	transcript := strings.Join([]string{
+		"prismid-v2-rebind-prev",
+		strings.TrimSpace(nonce),
+		strings.TrimSpace(subjectID),
+		strings.ToLower(strings.TrimSpace(beaconID)),
+		strings.ToLower(strings.TrimSpace(newPubKeyHex)),
+	}, "|")
+	return verifyECDSAP256Transcript(proof, transcript)
+}
+
+func canonicalECDSAP256PubKeyHex(proof *DeviceKeyProof) (string, bool) {
+	if proof == nil {
+		return "", false
+	}
+	pubRaw, err := decodeHexOrBase64(strings.TrimSpace(proof.PubKey))
+	if err != nil || len(pubRaw) != 65 || pubRaw[0] != 0x04 {
+		return "", false
+	}
+	curve := elliptic.P256()
+	x := new(big.Int).SetBytes(pubRaw[1:33])
+	y := new(big.Int).SetBytes(pubRaw[33:65])
+	if !curve.IsOnCurve(x, y) {
+		return "", false
+	}
+	return hex.EncodeToString(pubRaw), true
+}
+
 // HasValidPreviousKeyProof verifies whether `req.PreviousDeviceKey` proves possession of the
-// ECDSA P-256 private key currently bound to `req.BeaconID` in the store (enabling cryptographic
-// key-continuity rotation without step-up MFA in S2-12).
+// ECDSA P-256 private key currently bound to `req.BeaconID` in the store AND explicitly signs
+// `req.DeviceKey`'s public key (enabling MitM-safe key-continuity rotation without step-up MFA).
 func (v *Verifier) HasValidPreviousKeyProof(ctx context.Context, req KeyRebindRequest) bool {
-	if req.PreviousDeviceKey == nil {
+	if req.PreviousDeviceKey == nil || req.DeviceKey == nil {
+		return false
+	}
+	newPubHex, okNew := canonicalECDSAP256PubKeyHex(req.DeviceKey)
+	if !okNew || newPubHex == "" {
 		return false
 	}
 	ls, ok := v.store.(DeviceKeyLookupStore)
@@ -967,13 +1063,14 @@ func (v *Verifier) HasValidPreviousKeyProof(ctx context.Context, req KeyRebindRe
 	if err != nil || boundKeySlice == "" {
 		return false
 	}
-	okSig, prevPubHex := VerifyECDSAP256PrevKeyRotationProof(
+	okSig, prevPubHex := VerifyECDSAP256PrevKeyRotationProofBound(
 		req.PreviousDeviceKey,
 		req.ChallengeNonce,
 		req.SubjectID,
 		req.BeaconID,
+		newPubHex,
 	)
-	if !okSig || prevPubHex == "" {
+	if !okSig || prevPubHex == "" || strings.EqualFold(prevPubHex, newPubHex) {
 		return false
 	}
 	derivedPrevKey := "d_key_" + v.hmacHex32("key|"+prevPubHex)
@@ -1136,6 +1233,9 @@ func decodeBase64Flexible(s string) ([]byte, error) {
 
 func (v *Verifier) hmacHex32(data string) string {
 	mac := hmac.New(sha256.New, v.cfg.HMACSecret)
+	if v.cfg.TenantID != "" {
+		fmt.Fprintf(mac, "tenant:%d:%s|", len(v.cfg.TenantID), v.cfg.TenantID)
+	}
 	mac.Write([]byte(data))
 	sum := mac.Sum(nil)
 	return hex.EncodeToString(sum[:16])
@@ -1928,49 +2028,53 @@ func (v *Verifier) RebindDeviceKeyWithProof(
 		v.RecordDeniedRebindAudit("", "", clientIP, "denied_missing_subject")
 		return nil, &VerificationError{Code: ErrCodeRebindForbidden, Detail: "subject_id is required"}
 	}
+	graphSubjectID := strings.TrimSpace(req.GraphSubjectID)
+	if graphSubjectID == "" {
+		graphSubjectID = subjectID
+	}
 	bcnLow := strings.ToLower(strings.TrimSpace(req.BeaconID))
 	if !isValidHexBeacon(bcnLow) {
-		v.RecordDeniedRebindAudit(subjectID, "", clientIP, "denied_invalid_beacon")
+		v.RecordDeniedRebindAudit(graphSubjectID, "", clientIP, "denied_invalid_beacon")
 		return nil, &VerificationError{Code: ErrCodeRebindInvalidKeyProof, Detail: "beacon_id must be a 32-character hex string"}
 	}
 	beaconSliceID := "d_bcn_" + v.hmacHex32("bcn|"+bcnLow)
 
-	// Persistent BeaconOwnerStore guard (S1-1): if durable owners exist, subjectID must be among them.
+	// Persistent BeaconOwnerStore guard (S1-1): if durable owners exist, graphSubjectID must be among them.
 	if bos, ok := v.store.(BeaconOwnerStore); ok {
 		if owners, err := bos.GetBeaconOwners(ctx, beaconSliceID); err == nil && len(owners) > 0 {
 			found := false
 			for _, o := range owners {
-				if o == subjectID {
+				if o == graphSubjectID {
 					found = true
 					break
 				}
 			}
 			if !found {
-				v.RecordDeniedRebindAudit(subjectID, beaconSliceID, clientIP, "denied_not_owner")
+				v.RecordDeniedRebindAudit(graphSubjectID, beaconSliceID, clientIP, "denied_not_owner")
 				return nil, &VerificationError{Code: ErrCodeRebindForbidden, Detail: "beacon is not owned by authenticated subject"}
 			}
 		}
 	}
 
-	if ownerCheck != nil && !ownerCheck(subjectID, beaconSliceID) {
-		v.RecordDeniedRebindAudit(subjectID, beaconSliceID, clientIP, "denied_not_owner")
+	if ownerCheck != nil && !ownerCheck(graphSubjectID, beaconSliceID) {
+		v.RecordDeniedRebindAudit(graphSubjectID, beaconSliceID, clientIP, "denied_not_owner")
 		return nil, &VerificationError{Code: ErrCodeRebindForbidden, Detail: "beacon is not owned by authenticated subject"}
 	}
 
 	nonce := strings.TrimSpace(req.ChallengeNonce)
 	if nonce == "" {
-		v.RecordDeniedRebindAudit(subjectID, beaconSliceID, clientIP, "denied_invalid_nonce")
+		v.RecordDeniedRebindAudit(graphSubjectID, beaconSliceID, clientIP, "denied_invalid_nonce")
 		return nil, &VerificationError{Code: ErrCodeChallengeInvalid, Detail: "challenge_nonce is required"}
 	}
 	ch, err := v.store.ConsumeChallenge(ctx, nonce)
 	if err != nil || ch == nil || v.cfg.NowFunc().UnixMilli() > ch.ExpiresAt {
-		v.RecordDeniedRebindAudit(subjectID, beaconSliceID, clientIP, "denied_invalid_nonce")
+		v.RecordDeniedRebindAudit(graphSubjectID, beaconSliceID, clientIP, "denied_invalid_nonce")
 		return nil, &VerificationError{Code: ErrCodeChallengeInvalid, Detail: "challenge_nonce invalid, expired, or already replayed"}
 	}
 
 	okSig, pubKeyHex := VerifyECDSAP256RebindProof(req.DeviceKey, nonce, subjectID, bcnLow)
 	if !okSig || pubKeyHex == "" {
-		v.RecordDeniedRebindAudit(subjectID, beaconSliceID, clientIP, "denied_invalid_pop")
+		v.RecordDeniedRebindAudit(graphSubjectID, beaconSliceID, clientIP, "denied_invalid_pop")
 		return nil, &VerificationError{Code: ErrCodeRebindInvalidKeyProof, Detail: "invalid ECDSA P-256 proof-of-possession over rebind transcript"}
 	}
 
@@ -1984,7 +2088,7 @@ func (v *Verifier) RebindDeviceKeyWithProof(
 		return nil, err
 	}
 	if bos, ok := v.store.(BeaconOwnerStore); ok {
-		_ = bos.RecordBeaconOwner(ctx, beaconSliceID, subjectID)
+		_ = bos.RecordBeaconOwner(ctx, beaconSliceID, graphSubjectID)
 	}
 
 	retiredGraphEdge := false
@@ -1992,12 +2096,16 @@ func (v *Verifier) RebindDeviceKeyWithProof(
 	bg := v.boundGraph
 	v.boundGraphMu.RUnlock()
 	if bg != nil {
-		retiredGraphEdge = bg.RetireSubjectDeviceKey(subjectID, beaconSliceID, prevKey, newKeySliceID)
+		retiredGraphEdge = bg.RetireSubjectDeviceKey(graphSubjectID, beaconSliceID, prevKey, newKeySliceID)
 	}
 
+	auditAction := "rebind_key"
+	if req.PreviousDeviceKey != nil && strings.TrimSpace(req.StepUpToken) == "" {
+		auditAction = "rebind_key_rotation"
+	}
 	aud := v.appendRebindAudit(KeyRebindAuditEvent{
-		Action:              "rebind_key",
-		SubjectID:           subjectID,
+		Action:              auditAction,
+		SubjectID:           graphSubjectID,
 		BeaconSliceID:       beaconSliceID,
 		NewDeviceKeySliceID: newKeySliceID,
 		PreviousKeyPresent:  prevKey != "",

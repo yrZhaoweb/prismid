@@ -217,5 +217,63 @@ func VerifyGPURegisterLaws(payload *ProbePayload) []string {
 		violations = append(violations, "gpu_register_law_violation:linux_gpu_driver_on_macos")
 	}
 
+	// Law 8: Internal WebGL hardware register hierarchy & shader float precision bounds.
+	// In all conformant OpenGL ES / WebGL / Metal / Direct3D11 drivers, MAX_CUBE_MAP_TEXTURE_SIZE
+	// cannot exceed MAX_TEXTURE_SIZE, and MAX_RENDERBUFFER_SIZE must be >= 1024.
+	if maxCube, errCube := strconv.Atoi(strings.TrimSpace(parts[1])); errCube == nil && errTex == nil {
+		if maxCube < 512 || maxCube > maxTexSize {
+			violations = append(violations, "gpu_register_law_violation:inconsistent_cubemap_vs_texture_size")
+		}
+	}
+	if maxRB, errRB := strconv.Atoi(strings.TrimSpace(parts[3])); errRB == nil {
+		if maxRB < 1024 {
+			violations = append(violations, "gpu_register_law_violation:invalid_max_renderbuffer_size")
+		}
+	}
+	if len(parts) >= 11 && strings.TrimSpace(parts[10]) != "" {
+		precBits := strings.Split(strings.TrimSpace(parts[10]), ",")
+		if len(precBits) != 4 {
+			violations = append(violations, "gpu_register_law_violation:malformed_shader_precision_bits")
+		} else {
+			for _, pb := range precBits {
+				if v, err := strconv.Atoi(strings.TrimSpace(pb)); err != nil || v < 10 || v > 64 {
+					violations = append(violations, "gpu_register_law_violation:invalid_shader_precision_bits")
+					break
+				}
+			}
+		}
+	}
+
+	// Law 9: Cross-vendor discrete GPU & mobile-SoC-on-desktop spoofing checks.
+	// Preserves 0% FPR on real Windows on ARM Copilot+ laptops (Snapdragon X Elite / 8cx reporting
+	// `Win32` + `Adreno ... Direct3D11`) and Chrome 110+ UA Reduction / Android "Desktop site" /
+	// ARM64 Chromebooks (reporting `Linux x86_64` + `Mali`/`Adreno` OpenGL ES).
+	if strings.Contains(vendorLower, "nvidia") &&
+		(strings.Contains(rendererLower, "radeon") || strings.Contains(rendererLower, "apple m") || strings.Contains(rendererLower, "adreno") || strings.Contains(rendererLower, "mali-")) {
+		violations = append(violations, "gpu_register_law_violation:vendor_renderer_brand_mismatch")
+	}
+	if (vendorLower == "amd" || strings.Contains(vendorLower, "(amd)") || strings.Contains(vendorLower, "ati technologies")) &&
+		(strings.Contains(rendererLower, "geforce") || strings.Contains(rendererLower, "nvidia") || strings.Contains(rendererLower, "apple m")) {
+		violations = append(violations, "gpu_register_law_violation:vendor_renderer_brand_mismatch")
+	}
+	isMaliOrPowerVR := strings.Contains(rendererLower, "mali-g") ||
+		strings.Contains(rendererLower, "mali-t") ||
+		strings.Contains(rendererLower, "powervr")
+	isAdreno := strings.Contains(rendererLower, "adreno")
+	hasDirect3D := strings.Contains(rendererLower, "direct3d") ||
+		strings.Contains(rendererLower, "d3d11") ||
+		strings.Contains(rendererLower, "d3d9")
+	isWinDesktop := strings.Contains(platformLower, "win32") || strings.Contains(platformLower, "win64")
+	isMacDesktop := strings.Contains(platformLower, "macintel") || strings.Contains(platformLower, "macppc")
+	if (isMacDesktop && (isAdreno || strings.Contains(rendererLower, "mali-"))) ||
+		(isWinDesktop && (isMaliOrPowerVR || (isAdreno && !hasDirect3D))) {
+		violations = append(violations, "gpu_register_law_violation:mobile_gpu_on_desktop_platform")
+	}
+
+	// Law 10: Blink/Chromium-exclusive `navigator.deviceMemory` leaked while claiming WebKit/JSC or Gecko/SpiderMonkey.
+	if payload.System.DeviceMemory > 0 && (mathSig == "jsc" || mathSig == "spidermonkey") {
+		violations = append(violations, "engine_api_leak:device_memory_on_non_chromium")
+	}
+
 	return violations
 }

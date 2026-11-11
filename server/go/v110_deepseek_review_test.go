@@ -42,14 +42,18 @@ func signDeviceKeyForTest(t *testing.T, priv *ecdsa.PrivateKey, nonce, beaconHex
 	}
 }
 
-func signRebindForTest(t *testing.T, priv *ecdsa.PrivateKey, prefix, nonce, subjectID, beaconHex string) *DeviceKeyProof {
+func signRebindForTest(t *testing.T, priv *ecdsa.PrivateKey, prefix, nonce, subjectID, beaconHex string, extra ...string) *DeviceKeyProof {
 	t.Helper()
-	msg := strings.Join([]string{
+	parts := []string{
 		prefix,
 		nonce,
 		subjectID,
 		strings.ToLower(beaconHex),
-	}, "|")
+	}
+	for _, ex := range extra {
+		parts = append(parts, strings.ToLower(ex))
+	}
+	msg := strings.Join(parts, "|")
 	dig := sha256.Sum256([]byte(msg))
 	r, s, err := ecdsa.Sign(rand.Reader, priv, dig[:])
 	if err != nil {
@@ -171,12 +175,13 @@ func TestS1_1_And_3_GraphRestartKeyRecoveryNoDeadlockAndOldKeyRetired(t *testing
 	// 3. Verify S1-3 on graph1: rebinding retires `d_key_old` immediately so compromised `keyOld` cannot link a thief to Bob!
 	v.BindRiskGraph(graph1)
 	chRot, _ := v.IssueChallenge(ctx, "203.0.113.10")
+	newRotProof := signRebindForTest(t, keyRotated, "prismid-v2-rebind", chRot.Nonce, "bob", bcnBob)
 	rotReq := KeyRebindRequest{
 		ChallengeNonce:    chRot.Nonce,
 		SubjectID:         "bob",
 		BeaconID:          bcnBob,
-		DeviceKey:         signRebindForTest(t, keyRotated, "prismid-v2-rebind", chRot.Nonce, "bob", bcnBob),
-		PreviousDeviceKey: signRebindForTest(t, keyNew, "prismid-v2-rebind-prev", chRot.Nonce, "bob", bcnBob),
+		DeviceKey:         newRotProof,
+		PreviousDeviceKey: signRebindForTest(t, keyNew, "prismid-v2-rebind-prev", chRot.Nonce, "bob", bcnBob, newRotProof.PubKey),
 	}
 	if !v.HasValidPreviousKeyProof(ctx, rotReq) {
 		t.Fatalf("expected HasValidPreviousKeyProof=true for valid keyNew -> keyRotated continuity signature")

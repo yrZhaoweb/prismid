@@ -20,9 +20,13 @@ import (
 	prismid "github.com/yrZhaoweb/prismid/server/go"
 )
 
-func signRebindServerTest(t *testing.T, priv *ecdsa.PrivateKey, prefix, nonce, subjectID, beaconHex string) *prismid.DeviceKeyProof {
+func signRebindServerTest(t *testing.T, priv *ecdsa.PrivateKey, prefix, nonce, subjectID, beaconHex string, extra ...string) *prismid.DeviceKeyProof {
 	t.Helper()
-	msg := strings.Join([]string{prefix, nonce, subjectID, strings.ToLower(beaconHex)}, "|")
+	parts := []string{prefix, nonce, subjectID, strings.ToLower(beaconHex)}
+	for _, ex := range extra {
+		parts = append(parts, strings.ToLower(ex))
+	}
+	msg := strings.Join(parts, "|")
 	dig := sha256.Sum256([]byte(msg))
 	r, s, err := ecdsa.Sign(rand.Reader, priv, dig[:])
 	if err != nil {
@@ -181,11 +185,12 @@ func TestV110_SingleUseStepUpNoReplayPipeDelimiterAdminMintKeyRotationAndAudit(t
 	}
 
 	// S2-12: Routine key rotation (`key2` -> `key3`) using `PreviousDeviceKey` WITHOUT `step_up_token` -> 200 OK!
+	newKey3Proof := signRebindServerTest(t, key3, "prismid-v2-rebind", chRebindReplay.Nonce, "bob", bobBeaconHex)
 	rbPrevKeyBody, _ := json.Marshal(prismid.KeyRebindRequest{
 		ChallengeNonce:    chRebindReplay.Nonce, // note: nonce was NOT consumed by 403 step-up rejection!
 		BeaconID:          bobBeaconHex,
-		DeviceKey:         signRebindServerTest(t, key3, "prismid-v2-rebind", chRebindReplay.Nonce, "bob", bobBeaconHex),
-		PreviousDeviceKey: signRebindServerTest(t, key2, "prismid-v2-rebind-prev", chRebindReplay.Nonce, "bob", bobBeaconHex),
+		DeviceKey:         newKey3Proof,
+		PreviousDeviceKey: signRebindServerTest(t, key2, "prismid-v2-rebind-prev", chRebindReplay.Nonce, "bob", bobBeaconHex, newKey3Proof.PubKey),
 	})
 	reqRBPrev := httptest.NewRequest(http.MethodPost, "/api/v1/risk/rebind-key", bytes.NewReader(rbPrevKeyBody))
 	reqRBPrev.Header.Set("Authorization", "Bearer "+bobRotatedBearer)
