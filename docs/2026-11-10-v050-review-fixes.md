@@ -4,7 +4,7 @@
 
 ## 实施交接
 
-审查依据保留在 [原复审报告](/Users/yrzhao/.codex/visualizations/2026/11/10/01a1c53a-92bb-7312-a57a-acaba8be2669/prismid-v050-rereview.md)。本次使用当前上下文中的交接记录继续实施，没有单独的压缩工具。
+审查依据见历史归档记录（`v0.5.0` 复审 V5-1 至 V5-4）及仓库内架构说明 [ARCHITECTURE.md](./ARCHITECTURE.md)。本次使用交接记录继续实施，没有单独的压缩工具。
 
 | 问题 | 证据（修复前） | 实施方向 |
 |---|---|---|

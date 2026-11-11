@@ -9,7 +9,7 @@ on:
 
 jobs:
   go-engine:
-    name: Go Verifier & Risk Graph (-race)
+    name: Go Verifier, Persistence, Fuzz & Risk Graph (-race)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -29,9 +29,14 @@ jobs:
       - name: Run go vet
         working-directory: server/go
         run: go vet ./...
-      - name: Run go test -race
+      - name: Run go test -race -shuffle=on
         working-directory: server/go
-        run: go test -v -race ./...
+        run: go test -v -race -shuffle=on ./...
+      - name: Run fuzz smoke tests
+        working-directory: server/go
+        run: |
+          go test -fuzz=FuzzRecordVerification -fuzztime=3s .
+          go test -fuzz=FuzzVerifyAndDerive -fuzztime=3s .
 
   rust-native:
     name: Rust Native Hardware Anchor (${{ matrix.os }})
@@ -43,13 +48,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Run cargo test
+      - name: Run cargo test (default & no-default-features)
         working-directory: crates/prismid-native
-        run: cargo test
+        run: |
+          cargo test --locked
+          cargo test --locked --no-default-features
+      - name: Execute live prismid-anchor binary (live OS probe & keychain fallback)
+        working-directory: crates/prismid-native
+        env:
+          PRISMID_DISABLE_KEYCHAIN: "1"
+        run: cargo run --locked --bin prismid-anchor
 
   web-sdk:
-    name: Web SDK Typecheck, Build & E2E (macOS Chrome WebGL)
-    runs-on: macos-latest
+    name: Web SDK Multi-Browser Matrix (Chrome + Firefox + WebKit on ${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -67,14 +83,30 @@ jobs:
         id: setup-chrome
       - name: Install workspace dependencies
         run: pnpm install --frozen-lockfile
-      - name: Typecheck & build prismid-js
+      - name: Install Playwright Firefox & WebKit engines
+        working-directory: packages/web-sdk
+        run: pnpm exec playwright-core install firefox webkit
+      - name: Typecheck, AST bundle & tarball verification
         working-directory: packages/web-sdk
         run: |
           pnpm typecheck
           pnpm build
-      - name: Run unit & Chrome E2E tests
+          npm pack --dry-run
+      - name: Run unit & 3-engine E2E tests (macOS physical Metal GPU full suite)
+        if: matrix.os == 'macos-latest'
         working-directory: packages/web-sdk
         env:
           CHROME_PATH: ${{ steps.setup-chrome.outputs.chrome-path }}
           PRISMID_REQUIRE_CHROME: "1"
+          PRISMID_REQUIRE_ALL_BROWSERS: "1"
         run: pnpm test
+      - name: Run unit & 3-engine E2E tests (Windows VM 3-browser matrix & WebCrypto suite)
+        if: matrix.os == 'windows-latest'
+        working-directory: packages/web-sdk
+        env:
+          CHROME_PATH: ${{ steps.setup-chrome.outputs.chrome-path }}
+          PRISMID_REQUIRE_CHROME: "1"
+          PRISMID_REQUIRE_ALL_BROWSERS: "1"
+        run: |
+          pnpm exec vitest run test/deviceKey.test.ts
+          pnpm exec vitest run test/prismid.test.ts -t "0\.|1\.|2\.|3\.|4\.|5\.|allows recovery|completes full|executes real Chrome GPU|7A\.|7C\."

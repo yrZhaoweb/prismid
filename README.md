@@ -1,8 +1,8 @@
-# PrismID (`prismid` v1.0.1)
+# PrismID (`prismid` v1.1.0)
 
-> **Open-source orthogonal hardware signal collection, non-extractable WebCrypto ECDSA P-256 device key binding, raw-measurement server-side lie inference, and multi-slice risk correlation SDK for Web (`prismid-js`), Tauri / Rust Desktop (`prismid-native`), and Go (`prismid-go`).**
+> **Open-source orthogonal hardware signal collection, non-extractable WebCrypto ECDSA P-256 device key binding, raw-measurement consistency checks, and multi-slice risk correlation SDK for Web (`prismid-js`), Tauri / Rust Desktop (`prismid-native`), and Go (`prismid-go`).**
 >
-> **零商业调用成本、支持 Browser Web + Tauri Desktop (Rust) + Go Server 的全栈设备风控信号采集、WebCrypto 非导出私钥签名锚点、原始测量服务端测谎与正交切片关联开源引擎（MIT License）。**
+> **零商业调用成本、支持 Browser Web + Tauri Desktop (Rust) + Go Server 的全栈设备风控信号采集、WebCrypto 非导出私钥签名锚点、原始测量一致性校验与正交切片关联开源引擎（MIT License）。**
 
 ---
 
@@ -11,22 +11,24 @@
 Traditional open-source fingerprinting libraries hash ~20 browser attributes on the client side into a single string (`visitorId`) and send it to the backend. In adversarial scenarios, that approach suffers from three structural weaknesses:
 1. **SHA-256 Avalanche Fragility**: Modifying a single attribute (such as Canvas 2D noise or screen dimensions) changes the entire hash.
 2. **Residential Proxy Evasion**: Mixing IP addresses into the device hash allows attackers to rotate `/24` proxy subnets to obtain a fresh ID on every request.
-3. **Shared-Model False Positives**: Treating model-level hardware hashes (such as WebGL/Audio hashes shared by all stock MacBook Pro M3 laptops) as unique device IDs falsely merges innocent users in offices or across cities.
+3. **Shared-Model False Positives**: Treating model-level hardware hashes (such as WebGL/Audio hashes shared by stock MacBook Pro M3 laptops) as unique device IDs falsely merges innocent users in offices or across cities.
 
-**PrismID v1.0.1** addresses these challenges with a strict separation between **Per-Device Hard Identity Anchors** and **Shared-Model Environment Velocity Signals**:
+**PrismID v1.1.0** addresses these challenges with a clear separation between **Per-Device Hard Identity Anchors** and **Shared-Model Environment Velocity Signals**:
 
 1. **Per-Device Hard Identity Slices (`d_key_*`, `d_nat_*`, `d_kch_*`, `d_bcn_*`)**:
-   - `d_key_*` (**Non-Extractable WebCrypto ECDSA P-256 Key Binding + TOFU & Ownership-Verified PoP Rebind**): Generates an `ECDSA P-256` keypair with `extractable: false` on the private key (persisted in `IndexedDB` `_prismid_key_v1` with bounded transaction timeout) and signs every challenge transcript (`prismid-v2-sig|<nonce>|<beacon_id>|<static_webgl_fp_hash>|<audio_compressor_hash>`). The Go server verifies the P-256 signature (`device_key_bound: true`, Web `confidence = 0.95` — proves possession of a bound keypair rather than hardware silicon attestation) and enforces **Trust-On-First-Use (TOFU)** binding between `d_bcn_*` and `d_key_*`. When a bound key is missing or rotated (`device_key_recovery_required`), authoritative identity is withheld (`risk_pending: true`, `confidence: 0.30`) without marking the account as an active spoof (`red`). Key recovery via `Verifier.RebindDeviceKeyWithProof` / `POST /api/v1/risk/rebind-key` enforces: (a) exclusive `d_bcn_*` ownership by the authenticated subject, (b) an independent domain-separated expiring `step_up_token`, (c) a single-use `challenge_nonce` + ECDSA P-256 proof-of-possession over `"prismid-v2-rebind|<nonce>|<subject_id>|<beacon_id>"`, and (d) structured audit logging without exposing prior key slices.
-   - `d_nat_*` & `d_kch_*` (**Desktop Native Hardware & OS Keychain/Registry Anchor**): Combines motherboard UUID (`IOPlatformUUID` / `MachineGuid` + `Win32_BIOS.SerialNumber` + `SMBIOS UUID`) with an OS-persisted anchor (macOS Keychain / Windows `HKCU\Software\PrismID` Registry / user config vault).
-   - `d_bcn_*` (**Web 128-bit 5-Silo Self-Healing Beacon — Decoupled from GPU Drift**): Persisted across 5 browser storage silos (`localStorage`, `sessionStorage`, `IndexedDB`, `CacheStorage`, and `document.cookie`) with bounded 350ms timeouts. Derived purely via `HMAC(Secret, "bcn|" + beacon_id)` so browser or GPU driver updates never break longitudinal user recall.
-2. **Server-Side Raw Measurement Consistency & Cross-Thread Lie Detection (`prismid-js` + `prismid-go`)**:
-   - **Raw Control-Pixel & Audio Channel Consistency Checks (Browser Extensions & Unmodified SDK Hooks)**: Rather than relying solely on client-computed boolean flags, `prismid-js` reports raw control-zone RGBA bytes (`canvas_control_rgba`, `canvas_readback_delta`), raw `copyFromChannel` digest (`audio_copy_hash`, `audio_silent_delta`), and raw Worker telemetry (`worker_*`). This catches in-browser noise extensions, anti-detect browser hooks running the unmodified SDK, and naive proxy/script edits that flip `lies.*` booleans to `false` without synthesizing matching raw values (while a fully custom out-of-browser client can synthesize raw fields — see Threat Model table below). Safari < 17 or GPU-blocklisted Workers where `OffscreenCanvas` WebGL is unavailable record non-penalizing `worker_webgl_unavailable` in `privacy_signals` without false `red` verdicts.
-   - **Inline Blob Worker + `OffscreenCanvas` & ECMAScript `§10.1.2.1` Proxy Trap**: Compares `WorkerNavigator` and Worker `OffscreenCanvas` WebGL against the main thread and detects `new Proxy(...)` wrappers and `Object.defineProperty` overrides.
-3. **Deterministic, Identity-Safe Orthogonal Risk Graph (`prismid-go`)**:
-   - **Zero Colleague False Merges, Spoof-Isolation & Anti-Wash Spoof Decay (`DefaultSpoofEdgeTTL = 24h`, `DefaultCleanObservationsToClearSpoof = 3`, `DefaultMinCleanStreakInterval = 1h`, `DefaultSoftEdgeTTL = 7d`)**: Accounts possessing distinct, un-spoofed hard beacons (`d_bcn_A != d_bcn_B`) or distinct native anchors (`d_nat_A != d_nat_B`) are **never** merged into the same identity component by shared model/network soft slices (`d_gpu_*`, `d_web_*`, `d_sys_*`, `d_gpusys_*`), and are **never** marked `red` by soft slices alone. A spoofed observation never contaminates unrelated clean users of the same laptop model. Single-account tampering signals (`red` / `active_tampering_detected`) represent an **active/cooldown risk window** rather than an irrevocable ban, and are hardened against scripted/cross-device washing: `CleanStreak` increments **only** when a clean observation arrives from the **same strongest hard anchor** (`d_key_*`, `d_nat_*`, or `d_bcn_*`) spaced at least **1 hour** apart (or immediately after MFA via `POST /api/v1/risk/clear-spoof`), transitioning `red` $\to$ `yellow + pending` (`historical_tampering_cooldown`) $\to$ `green` (`historical_tampering_decayed`) while retaining permanent `+1.5` `HistoricalSpoof` residual log-odds (`LogOddsScore = -0.5` rather than `-2.0`). Soft-slice edges track `ObservedAt` and are pruned after 7 days.
-   - **Soft-Slice Velocity Step-Up (`BurstSuspicion`)**: When $\ge 3$ distinct clean-beacon accounts share `d_gpusys_*` (within 6h) or `d_web_*` (within 25m), `RiskGraph` sets `BurstSuspicion = true`, `RiskPending = true`, and elevates `green` $\to$ `yellow` for step-up verification without falsely merging colleagues into a `red` component.
-   - **100% Permutation-Invariant $O(N)$ Union-Find & Multi-Hop Hard-Slice Traversal**: Canonical sorting by `(SubjectCreatedAt, SubjectID, SliceID)` guarantees identical results across all edge permutations, and full multi-hop traversal across hard identity slices (up to `MaxComponentSize = 512`) prevents 3-hop chain truncation. Loss markers (`incompleteSlices`) are scoped to per-device hard slices so popular laptop models exceeding `MaxSubjectsPerSlice = 256` never poison unrelated users.
-   - **Explainability, Ownership-Verified Key Rebinding & Complete GDPR Erasure**: Built-in `LogOddsScore`, timestamped `EvidenceChain` (`GET /api/v1/risk/explain`), audited ownership + step-up + ECDSA P-256 PoP key rebinding (`POST /api/v1/risk/rebind-key`), MFA spoof-cooldown clearance (`POST /api/v1/risk/clear-spoof`), and complete GDPR/CCPA erasure (`DELETE /api/v1/risk/subject`, purging both graph edges and `beaconToKey` TOFU bindings).
+   - `d_key_*` (**Non-Extractable WebCrypto ECDSA P-256 Key Binding + Dual-Path TOFU Rebind & Key Retirement**): Reads existing `IndexedDB` `_prismid_key_v1` key material before generating a new `ECDSA P-256` keypair (`extractable: false`) and signs every challenge transcript (`prismid-v2-sig|<nonce>|<beacon_id>|<static_webgl_fp_hash>|<audio_compressor_hash>`). The Go server verifies the P-256 signature (`device_key_bound: true`, Web `confidence = 0.95` — proves possession of a bound keypair rather than hardware silicon attestation) and enforces **Trust-On-First-Use (TOFU)** binding between `d_bcn_*` and `d_key_*`. Rebinding via `Verifier.RebindDeviceKeyWithProof` / `POST /api/v1/risk/rebind-key` supports two cryptographic paths and **retires the superseded `d_key_old` edge** from `RiskGraph` on rotation:
+     - **Path A — Proactive Key Rotation (No MFA Required)**: Signs `"prismid-v2-rebind-prev|<nonce>|<subject_id>|<beacon_id>"` with the still-held previous private key alongside the new key's PoP (`prism.rebindKey({ rotate: true })`).
+     - **Path B — Lost-Key Recovery (Single-Use Step-Up MFA)**: Verifies co-owner `d_bcn_*` membership (`RiskGraph.SubjectOwnsBeacon`, backed by persistent `GraphStore` so server restarts or cache eviction do not deadlock recovery, and supporting shared family browsers), consumes a **single-use** `stepup_v2.<jti>.<exp>.<hmac>` token, verifies ECDSA P-256 PoP over `"prismid-v2-rebind|<nonce>|<subject_id>|<beacon_id>"`, and writes an append-only `KeyRebindAuditEvent`.
+   - **Configurable Shared-Browser Policy (`HardAnchorPolicy`)**: By default (`HardAnchorPolicySharedStepUp`), 2–3 clean accounts sharing a Web browser profile (`d_bcn_*` / `d_key_*`, such as a family PC or school lab) elevate to `yellow + risk_pending: true` (`shared_hard_anchor_step_up`) for step-up verification rather than immediately turning `red`; $\ge 4$ accounts on one profile or any spoofed/Desktop-native (`d_nat_*` / `d_kch_*`) multi-account cluster escalates to `red`. Integrators can select `strict_1to1`, `step_up_all`, or `disabled` (`disabled` turns off hard-anchor cross-account merging while keeping soft-slice `BurstSuspicion` velocity step-up active).
+   - `d_nat_*` & `d_kch_*` (**Desktop Native Hardware & OS Keychain/Registry Anchor**): Combines motherboard UUID (`IOPlatformUUID` / `MachineGuid` + `Win32_BIOS.SerialNumber` + `SMBIOS UUID`) with a `0600` local anchor and bounded-timeout macOS Keychain (`120ms` budget, non-blocking fallback) or Windows `HKCU\Software\PrismID` Registry (`BCryptGenRandom` CSPRNG + VBS/WSL2-safe `Win32_ComputerSystem.Model` VM check).
+   - `d_bcn_*` (**Web 128-bit 5-Silo Self-Healing Beacon — Decoupled from GPU Drift**): Persisted across 5 browser storage silos (`localStorage`, `sessionStorage`, `IndexedDB`, `CacheStorage`, and `document.cookie` with `; Secure` on HTTPS) under bounded 350ms deadlines. Derived via `HMAC(Secret, "bcn|" + beacon_id)` so browser or GPU driver updates do not break longitudinal recall.
+2. **Server-Side Raw Measurement Consistency & Cross-Thread Lie Checks (`prismid-js` + `prismid-go`)**:
+   - **Raises the Bar Against Extensions & Unmodified-SDK Hooks**: Rather than relying solely on client boolean flags, `prismid-js` reports raw control-zone RGBA bytes (`canvas_control_rgba`, `canvas_readback_delta`), raw `copyFromChannel` digest (`audio_copy_hash`, `audio_silent_delta`, distinguishing muted all-zero audio via `audio_output_muted`), and dedicated `64x64` non-antialiased Worker `OffscreenCanvas` telemetry (`worker_*`). This catches browser extensions, anti-detect wrappers running the unmodified SDK, and naive proxy edits that flip `lies.*` booleans to `false` without synthesizing matching raw values. **Important boundary**: because all telemetry originates on the client, a modified SDK or custom out-of-browser script can synthesize coherent raw fields — see Threat Model below.
+   - **Cross-Browser Verified (`Chromium V8` + `Firefox SpiderMonkey` + `WebKit Safari JSC`)**: Distinguishes privacy-hardened browsers with WebGL disabled (`webgl_disabled_by_client`, `confidence = 0.75` when key-bound) from headless `SwiftShader`/`llvmpipe` farms (`confidence = 0.30`), accounts for Firefox's sanitized WebGL `MAX_TEXTURE_SIZE = 8192` on Apple Silicon, and avoids calling `Reflect.setPrototypeOf` on frozen intrinsics.
+3. **Deterministic, Persistable Orthogonal Risk Graph (`prismid-go`)**:
+   - **Colleague Isolation & Anti-Wash Spoof Decay (`DefaultSpoofEdgeTTL = 24h`, `DefaultCleanObservationsToClearSpoof = 3`, `DefaultMinCleanStreakInterval = 1h`, `DefaultSoftEdgeTTL = 7d`)**: Accounts with distinct, un-spoofed hard anchors (`d_bcn_A != d_bcn_B` or `d_nat_A != d_nat_B`) are not merged into the same identity component by shared model/network soft slices (`d_gpu_*`, `d_web_*`, `d_sys_*`, `d_gpusys_*`). Clean visits increment `CleanStreak` when arriving from the same hard anchor (or same `d_web_*`/`d_gpu_*` soft slice for stateless sessions without beacons) spaced $\ge 1\text{h}$ apart, or clear immediately via audited `POST /api/v1/risk/clear-spoof` while retaining `+1.5` `HistoricalSpoof` residual log-odds.
+   - **Deterministic $O(|E|\log|E|)$ Canonical Sort + Near-Linear Union-Find & O(1) WAL Persistence (`GraphStore` / `AuditStore`)**: Canonical sorting by `(SubjectCreatedAt, SubjectID, SliceID)` yields identical components regardless of edge arrival order. Includes `FileStateStore` (O(1) `~400B` append-only `<state-file>.wal` on the request path + debounced background `0600` atomic snapshot compaction via `-state-flush-interval`, persisting graph edges, TOFU bindings, consumed `stepup_v2` JTIs, and token revocations) and `FileAuditStore` (`0600` append-only JSONL) for single-node durability (`-state-file`, `-audit-log`), plus `GraphStore` / `ChallengeStore` interfaces for Redis/PostgreSQL multi-instance deployments.
+   - **3-Tier Capacity Eviction & Complete GDPR Erasure**: Prioritizes evicting isolated clean singletons first and unlinked single-account spoof floods second when `DefaultMaxGraphSubjects` (`50,000`) fills—preventing self-reported `canvas_noise_injected=true` floods from locking out legitimate signups—prunes expired soft edges on insert, and purges all subject edges, persistent beacon ownership, and `beaconToKey` TOFU bindings (including co-owned beacons) on `DELETE /api/v1/risk/subject`.
 
 ---
 
@@ -34,13 +36,13 @@ Traditional open-source fingerprinting libraries hash ~20 browser attributes on 
 
 To integrate PrismID responsibly in production, understand what client-side telemetry can and cannot prove:
 
-| Boundary | What PrismID Guarantees | What Requires Server / Gateway Enforcement |
+| Boundary | What PrismID Provides | What Requires Server / Gateway Enforcement |
 |---|---|---|
-| **Challenge & AEAD Envelope** | Single-use `nonce` (`GETDEL` semantics) blocks packet replay (`100%`). AES-256-GCM (`Key = SHA256("prismid-v1-aead:" + nonce)`) obfuscates wire payloads against passive inspection and naive scripts. | Because `nonce`, `render_seed`, and the GLSL math formula are visible to the client, an out-of-browser script can compute expected pixels on the CPU and seal custom JSON. Do **not** treat the shader challenge as hardware-attested silicon proof or as a replacement for TLS, WAF rate-limiting, or CAPTCHA/Turnstile. |
-| **Privacy Browsers & Anti-Wash Spoof Decay** | Raw pixel/audio noise injection is detected (`canvas_noise_injected` / `audio_noise_injected`), isolating the session without poisoning same-model clean users; disabling Shields recovers `red` $\to$ `yellow` $\to$ `green` across 3 clean sessions on the **same hard anchor** spaced $\ge 1\text{h}$ apart (or after 24h TTL / MFA step-up), while retaining `+1.5` `HistoricalSpoof` residual log-odds. | Because single-account `red` reflects a 24h/3-session risk window (and multi-account hard-anchor links stay permanently `red`), route **single-account** (`len(component_subjects) == 1`) noise-only `red` verdicts to step-up verification (e.g. CAPTCHA / Passkey / OTP) and persist application-level enforcement decisions on your backend if permanent bans are required. |
-| **Confidence Scores (`0.99 / 0.95 / 0.85 / 0.30`)** | Deterministic **rule-tier weights**: `0.99` (Native anchor), `0.95` (Clean Web), `0.85` (Spoof trap hit), `0.30` (Virtual/Software GPU like `SwiftShader`, below the `0.60` authoritative threshold). | These constants are rule-tier weights for graph filtering, **not** statistically calibrated probabilities of hardware authenticity. |
-| **Standalone HTTP Server (`cmd/prismid-server`)** | Interactive local lab & reference service with per-IP token-bucket rate limiting (`-rate-limit`). When `-demo-mode=false`, strictly enforces expiring v2 HMAC-SHA256 tokens `Bearer <subject_id>.<exp_unix>.<hmac_hex>` (`SignSubjectBearerToken`, 24h TTL; legacy non-expiring tokens disabled by default via `-allow-legacy-tokens=false`). Exposes `GET /api/v1/risk/explain`, hardened `POST /api/v1/risk/rebind-key`, `POST /api/v1/risk/clear-spoof`, and `DELETE /api/v1/risk/subject`. | In production, embed `prismid.Verifier` behind your authenticated API gateway and back `ChallengeStore` / graph storage with Redis & PostgreSQL. |
-| **Privacy & Consent Compliance** | Provides `/api/v1/risk/should-collect` gate before any probe or storage access runs, and `DELETE /api/v1/risk/subject` (`RiskGraph.RemoveSubject`) for right-to-erasure requests. | The 5-silo self-healing beacon writes persistent identifiers across browser storage APIs. In GDPR/ePrivacy jurisdictions, gate `prism.identify()` via `should-collect` or user consent for fraud-prevention/security purposes. |
+| **Challenge, Nonce Quota & AEAD Envelope** | Single-use `nonce` (`GETDEL` semantics) blocks packet replay, explicit per-IP (`DefaultMaxChallengesPerIP = 64`) and per-`/24` (`DefaultMaxChallengesPerIPSub = 1024`) quotas return HTTP `429` (`CHALLENGE_RATE_LIMITED`) without evicting active neighbor nonces, and AES-256-GCM (`Key = SHA256("prismid-v1-aead:" + nonce)`) obfuscates wire payloads against passive inspection. | Because `nonce`, `render_seed`, and the GLSL math formula are visible to the client, a custom out-of-browser client can compute expected pixels on CPU and synthesize coherent raw fields. Do **not** treat the shader challenge or raw-measurement checks as hardware-attested silicon proof or as a substitute for TLS, WAF rate-limiting, or Turnstile (`-require-turnstile` + `-turnstile-secret`, which fails closed if secret is omitted). |
+| **TOFU Beacon & Key Ownership Boundary** | `d_key_*` private keys are non-extractable in normal browsers (`extractable: false`). Proactive key rotation requires a cryptographic signature from the previous key (`previous_device_key`), and lost-key recovery requires both persistent `d_bcn_*` co-ownership and a single-use `stepup_v2` MFA token. | Raw `beacon_id` is stored in client storage silos. An attacker with XSS or local disk access who steals raw `beacon_id` before TOFU first-bind (or pairs a known `beacon_id` with compromised MFA) falls outside TOFU guarantees. Enforce strict CSP and strong phishing-resistant MFA (WebAuthn/Passkey) before minting step-up tokens. |
+| **Shared Devices & Anti-Wash Spoof Decay** | Default `shared_step_up` policy elevates 2–3 clean accounts on a shared browser profile to `yellow + risk_pending` rather than immediate `red`. Spoof decay requires 3 clean sessions $\ge 1\text{h}$ apart on the same anchor (or 24h TTL / audited `clear-spoof`). | Route `yellow + risk_pending` and single-account (`len(component_subjects) == 1`) noise-only `red` verdicts to step-up verification rather than irreversible account termination, or opt into `strict_1to1` for strict one-account-per-device promos. |
+| **Standalone HTTP Server (`cmd/prismid-server`)** | Defaults to `-demo-mode=false` and loopback `-addr=127.0.0.1:8090`, enforces expiring v2 HMAC bearer tokens, supports independent rotatable `-auth-secret` / `-stepup-secret`, crash-persisted single-use JTI replay & revocation guards, O(1) WAL + async snapshot `-state-file` / `-audit-log` durability (with `persist_errors` exposed on `/healthz`), and `-admin-secret` token/maintenance endpoints. | `FileStateStore` / `MemoryChallengeStore` target **single-instance** deployments. For horizontally scaled multi-instance clusters, implement shared Redis/PostgreSQL `ChallengeStore`, `BeaconOwnerStore`, and graph storage (see `docs/INTEGRATION_GUIDE.md`). |
+| **Privacy & Consent Compliance** | `/api/v1/risk/should-collect` gates probe & storage access (`{ accepted: false, skipped: true, code: "COLLECTION_SKIPPED" }`), and `DELETE /api/v1/risk/subject` purges graph edges, persistent ownership, and TOFU key bindings. | In GDPR/ePrivacy jurisdictions, gate `prism.identify()` via `should-collect` or user consent where persistent storage access requires consent. |
 
 ---
 
@@ -48,48 +50,55 @@ To integrate PrismID responsibly in production, understand what client-side tele
 
 ```text
 prismid/
-├── README.md                        # Bilingual overview, threat model & quickstart
+├── README.md                        # Bilingual overview, threat model & quickstart (v1.1.0)
 ├── LICENSE                          # MIT License
+├── Makefile                         # Unified test, lint, build & bench targets
 ├── docs/
 │   ├── ARCHITECTURE.md              # Hard vs. soft slices, threat boundaries & 5-layer engine
-│   ├── PROTOCOL_SPEC.md             # Challenge-Identify AEAD wire protocol & byte-level specification
+│   ├── PROTOCOL_SPEC.md             # v1.1.0 byte-level wire protocol, rebind, clear-spoof & admin APIs
 │   ├── ANTI_SPOOFING_MATRIX.md      # Adversarial attack vectors, defense matrix & boundaries
-│   └── INTEGRATION_GUIDE.md         # Web, Tauri 2 Rust, Go & PostgreSQL integration guide
+│   └── INTEGRATION_GUIDE.md         # Web, Tauri 2 Rust, Go, persistence & PostgreSQL guide
 ├── packages/
-│   └── web-sdk/                     # Zero-dependency TypeScript Browser & WebView SDK (prismid-js v1.0.1)
+│   └── web-sdk/                     # Zero-dependency TypeScript Browser & WebView SDK (prismid-js v1.1.0)
 │       ├── package.json
+│       ├── README.md
+│       ├── LICENSE
+│       ├── scripts/bundle.mjs       # TypeScript AST-validated browser bundle builder
 │       ├── src/
-│       │   ├── index.ts             # createPrismClient with full header+body deadline & strict schema check
+│       │   ├── index.ts             # createPrismClient (identify, identifyDetailed, rebindKey, clearSpoof, deleteSubject)
 │       │   ├── probes/
-│       │   │   ├── webgl.ts         # 11 canonical hardware register limits + static 3D hash + dynamic shader
-│       │   │   ├── storageBeacon.ts # Bounded-timeout (350ms) 5-silo self-healing storage beacon
-│       │   │   ├── workerLie.ts     # Inline Blob Web Worker + OffscreenCanvas cross-thread lie detector
-│       │   │   ├── audio.ts         # OfflineAudioContext compressor hash + raw copyFromChannel telemetry
-│       │   │   ├── fontsCanvas.ts   # TextMetrics sub-pixel float boxes + raw control-pixel RGBA telemetry
-│       │   │   └── lieDetector.ts   # Cyclic __proto__ Proxy detection + descriptor & iframe checks
+│       │   │   ├── webgl.ts         # 11 canonical hardware register limits + 64x64 non-AA static hash + shader
+│       │   │   ├── storageBeacon.ts # Bounded-timeout (350ms) 5-silo self-healing CSPRNG beacon
+│       │   │   ├── workerLie.ts     # Inline Blob Web Worker + 64x64 OffscreenCanvas cross-thread probe
+│       │   │   ├── audio.ts         # OfflineAudioContext compressor hash + muted-aware copyFromChannel
+│       │   │   ├── fontsCanvas.ts   # Session-memoized font hash + 256-pixel spatial uniformity check
+│       │   │   └── lieDetector.ts   # V8/SpiderMonkey/JSC math engine, extensible Proxy check & iframe probe
 │       │   └── crypto/
-│       │       ├── aead.ts          # WebCrypto AES-256-GCM sealing + pure TypeScript fallback
-│       │       └── deviceKey.ts     # Non-extractable WebCrypto ECDSA P-256 keypair + challenge signing
-│       └── test/                    # Unit, regression & real Chrome E2E integration tests
+│       │       ├── aead.ts          # WebCrypto AES-256-GCM sealing + strict CSPRNG fallback
+│       │       └── deviceKey.ts     # Read-first ECDSA P-256 keystore, rotation proof & cache reset
+│       └── test/                    # Unit, regression & real 3-browser (Chromium + Firefox + WebKit) E2E tests
 ├── crates/
-│   └── prismid-native/              # Rust native hardware anchor crate (prismid-native v1.0.1)
+│   └── prismid-native/              # Rust native hardware anchor crate & CLI (prismid-native v1.1.0)
 │       ├── Cargo.toml
 │       └── src/
-│           ├── lib.rs               # collect_native_anchor() + OnceLock cache + unit tests
-│           ├── macos.rs             # ioreg IOPlatformUUID + Serial + macOS Keychain + hv_vmm_present
-│           ├── windows.rs           # MachineGuid + BIOS Serial + SMBIOS UUID + HKCU Registry anchor
+│           ├── lib.rs               # collect_native_anchor(), bounded cmd timeout, 0600 files & JSON escaping
+│           ├── bin/main.rs          # prismid-anchor CLI binary
+│           ├── macos.rs             # ioreg IOPlatformUUID + 0600 file fast-path + 120ms Keychain fallback
+│           ├── windows.rs           # MachineGuid + BIOS/SMBIOS + VBS-safe Model VM check + BCryptGenRandom
 │           └── linux.rs             # /etc/machine-id + product_uuid + Hypervisor check
 └── server/
-    └── go/                          # Go verification & orthogonal slice risk graph engine (prismid-go v1.0.1)
+    └── go/                          # Go verification, persistence & orthogonal risk graph (prismid-go v1.1.0)
         ├── go.mod
-        ├── engine.go                # Challenge issuer, AEAD opener, ECDSA P-256 verifier & raw inference
-        ├── graph.go                 # Deterministic O(N) Union-Find risk graph + EvidenceChain + RemoveSubject
+        ├── engine.go                # Challenge issuer, per-/24 quota, AEAD opener, ECDSA P-256 & dual-path rebind
+        ├── graph.go                 # Shared-step-up / strict hard-anchor graph, key retirement & soft eviction
+        ├── persistence.go           # GraphStore, AuditStore, FileStateStore (0600) & FileAuditStore (JSONL)
         ├── shader_math.go           # GLSL-aligned (+0.5 pixel center) spot-pixel math verifier
-        ├── gpu_laws.go              # GPU architecture register laws & SwiftShader/VMware virtual GPU check
-        ├── engine_test.go           # Unit & audit regression tests (DeepSeek + GPT R1-R5 vectors)
+        ├── gpu_laws.go              # GPU register laws (Firefox-sanitized-aware) & virtual GPU check
+        ├── engine_test.go           # Unit & adversarial regression tests
+        ├── fuzz_test.go             # Go native fuzz targets (FuzzRecordVerification & FuzzVerifyAndDerive)
         ├── internal/bench/          # 1,000-case synthetic rule-regression confusion matrix suite
         └── cmd/
-            ├── prismid-server/      # Standalone HTTP server, /explain, DELETE /subject & demo console
+            ├── prismid-server/      # Hardened HTTP server (-demo-mode=false default), single-use stepup_v2 & admin API
             └── prismid-bench/       # CLI runner for the 1,000-case synthetic rule regression report
 ```
 
@@ -97,13 +106,27 @@ prismid/
 
 ## Quick Start / 快速开始
 
-### 1. Run Go Verification & Audit Regression Tests (`server/go`)
+### 1. Run Go Verification, Race Tests & Standalone Server (`server/go`)
 
 ```bash
 cd server/go
-go test -v -race ./...
+go test -race -shuffle=on ./...
 go run ./cmd/prismid-bench
-go run ./cmd/prismid-server -addr :8090
+
+# Local interactive demo console (explicitly opt into -demo-mode on loopback):
+go run ./cmd/prismid-server -demo-mode=true -addr 127.0.0.1:8090
+
+# Single-instance production service with separated secrets, O(1) WAL state & JSONL audit log:
+PRISMID_HMAC_SECRET="$(openssl rand -hex 32)" \
+PRISMID_AUTH_SECRET="$(openssl rand -hex 32)" \
+PRISMID_STEPUP_SECRET="$(openssl rand -hex 32)" \
+PRISMID_ADMIN_SECRET="$(openssl rand -hex 32)" \
+go run ./cmd/prismid-server \
+  -demo-mode=false \
+  -addr 127.0.0.1:8090 \
+  -state-file ./prismid-state.json \
+  -state-flush-interval 30s \
+  -audit-log ./prismid-audit.jsonl
 ```
 
 ### 2. Install & Test Web SDK (`prismid-js`)
@@ -115,21 +138,23 @@ npm install prismid-js
 Or from the repository:
 ```bash
 cd packages/web-sdk
-npm install
-npm test
-npm run build
+pnpm install
+pnpm typecheck
+pnpm build
+pnpm test
 ```
 
-### 3. Run Rust Native Crate Tests (`crates/prismid-native`)
+### 3. Run Rust Native Crate & CLI (`crates/prismid-native`)
 
 ```bash
 cd crates/prismid-native
-cargo test
+cargo test --locked
+cargo run --locked --bin prismid-anchor
 ```
 
 ---
 
-## 3-Line SDK Integration / 三行代码极简接入
+## SDK Integration / 极简接入示例
 
 ### Browser Web Application (`prismid-js`)
 
@@ -138,11 +163,18 @@ import { createPrismClient } from 'prismid-js'
 
 const prism = createPrismClient({
   baseUrl: 'https://api.example.com',
-  getAccessToken: () => localStorage.getItem('access_token'),
+  getAccessToken: () => sessionStorage.getItem('prismid_bearer_token'),
   requestTimeoutMs: 5000,
+  probeTimeoutMs: 800,
+  onError: (err) => console.warn('[PrismID]', err.code, err.message),
 })
 
+// Standard risk evaluation (or prism.identifyDetailed() for structured error reasons):
 const result = await prism.identify()
+
+// Proactive key rotation (no MFA needed) or MFA step-up recovery:
+// await prism.rebindKey({ rotate: true })
+// await prism.rebindKey({ stepUpToken })
 ```
 
 ### Desktop Application (Tauri 2 + `prismid-native` + `prismid-js`)

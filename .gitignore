@@ -1,9 +1,12 @@
 node_modules/
 dist/
 target/
-Cargo.lock
 *.tsbuildinfo
 .DS_Store
 coverage/
 .env
 .env.*
+*.wal
+*.wal.compacting
+prismid-state.json
+prismid-audit.jsonl
