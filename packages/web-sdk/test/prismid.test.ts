@@ -6,20 +6,23 @@ import net from 'node:net'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { chromium } from 'playwright-core'
+import { chromium, firefox, webkit } from 'playwright-core'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 
 const cjsRequire = createRequire(import.meta.url)
 import {
   collectAndHealStorageBeacon,
   collectAudioProbe,
+  collectAudioProbeWithTrap,
   collectFontsAndCanvasProbe,
   collectLieDetectorProbe,
   collectWebGLProbe,
   collectWorkerLieProbe,
   computeExpectedSpotPixelMath,
   createPrismClient,
+  csprngBytes,
   DEFAULT_SAMPLE_POINTS,
+  resetFontsProbeCache,
   sealPayload,
   sha256Hex,
 } from '../src/index.js'
@@ -247,11 +250,22 @@ describe('PrismID Web SDK (prismid-js) Unit & Cross-Language Suite', () => {
     beforeAll(async () => {
       const port = await allocateFreeLocalPort()
       baseUrl = `http://127.0.0.1:${port}`
-      serverProc = spawn('go', ['run', './cmd/prismid-server', '-addr', `127.0.0.1:${port}`], {
-        cwd: GO_SERVER_DIR,
-        stdio: 'pipe',
-        detached: true,
-      })
+      serverProc = spawn(
+        'go',
+        [
+          'run',
+          './cmd/prismid-server',
+          '-addr',
+          `127.0.0.1:${port}`,
+          '-demo-mode=true',
+          '-admin-secret=test-admin-secret-0123456789abcdef',
+        ],
+        {
+          cwd: GO_SERVER_DIR,
+          stdio: 'pipe',
+          detached: true,
+        }
+      )
 
       const deadline = Date.now() + 15000
       while (Date.now() < deadline) {
@@ -1197,6 +1211,533 @@ describe('PrismID Web SDK (prismid-js) Unit & Cross-Language Suite', () => {
         }
       },
       60000
+    )
+
+    it('7A. S3-29/33/34/35/36/37/39/40/53: verifies CSPRNG-only beacon, Secure cookie, deadline race, ±2 canvas uniformity, muted audio, tampered math, single token call, error diagnostics, and should_collect:false', async () => {
+      // 1. S3-34: CSPRNG-only random generation (never falls back to Math.random when crypto is missing)
+      const g = globalThis as unknown as Record<string, unknown>
+      const origCryptoDesc = Object.getOwnPropertyDescriptor(globalThis, 'crypto')
+      Object.defineProperty(globalThis, 'crypto', { value: undefined, configurable: true })
+      try {
+        expect(csprngBytes(16)).toBeNull()
+        const noCryptoBcn = await collectAndHealStorageBeacon(50)
+        expect(noCryptoBcn.beacon_id).toBe('')
+        await expect(sealPayload('nonce', 'hello')).rejects.toThrow(/crypto\.getRandomValues/)
+      } finally {
+        if (origCryptoDesc) {
+          Object.defineProperty(globalThis, 'crypto', origCryptoDesc)
+        }
+      }
+
+      // 2. S3-33 & S3-35: HTTPS Secure cookie attribute + storage beacon deadline race safety
+      let cookieJar = ''
+      let lsVal: string | null = 'aabbccddeeff00112233445566778899'
+      let lateIdbPutCount = 0
+      const origDoc = g.document
+      const origLoc = g.location
+      const origLS = g.localStorage
+      const origIDB = g.indexedDB
+      g.location = { protocol: 'https:' }
+      g.document = {
+        get cookie() {
+          return cookieJar
+        },
+        set cookie(v: string) {
+          cookieJar = v
+        },
+      }
+      g.localStorage = {
+        getItem: () => lsVal,
+        setItem: (_k: string, v: string) => {
+          lsVal = v
+        },
+      }
+      let lateOpenReq: any = null
+      g.indexedDB = {
+        open: () => {
+          const req: any = {}
+          lateOpenReq = req
+          return req
+        },
+      }
+      try {
+        const raced = await collectAndHealStorageBeacon(60)
+        // Must preserve existing synchronous localStorage beacon on async timeout instead of clobbering!
+        expect(raced.beacon_id).toBe('aabbccddeeff00112233445566778899')
+        expect(cookieJar).toContain('; Secure')
+        // Simulate late IndexedDB wakeup after deadline: must NOT overwrite or put!
+        if (lateOpenReq) {
+          lateOpenReq.result = {
+            close() {},
+            transaction: () => ({
+              objectStore: () => ({
+                get: () => ({ result: 'ffffffffffffffffffffffffffffffff' }),
+                put: () => {
+                  lateIdbPutCount++
+                },
+              }),
+            }),
+          }
+          lateOpenReq.onsuccess?.()
+        }
+        await new Promise((r) => setTimeout(r, 20))
+        expect(lsVal).toBe('aabbccddeeff00112233445566778899')
+        expect(lateIdbPutCount).toBe(0)
+      } finally {
+        g.document = origDoc
+        g.location = origLoc
+        g.localStorage = origLS
+        g.indexedDB = origIDB
+      }
+
+      // 3. S3-36: Uniform ±2 ICC color-space rounding passes, single-pixel +1 noise fails
+      const makeMockDocument = (
+        solidPixelFn: (pixelIdx: number) => [number, number, number, number]
+      ) => ({
+        createElement: (tag: string) => {
+          if (tag !== 'canvas') return {}
+          return {
+            width: 0,
+            height: 0,
+            toDataURL: () => 'data:image/png;base64,AA==',
+            getContext: () => ({
+              font: '',
+              fillStyle: '',
+              strokeStyle: '',
+              globalCompositeOperation: 'source-over',
+              measureText: () => ({
+                width: 120.125,
+                actualBoundingBoxAscent: 12,
+                actualBoundingBoxDescent: 3,
+                actualBoundingBoxLeft: 0,
+                actualBoundingBoxRight: 120.125,
+              }),
+              createLinearGradient: () => ({ addColorStop() {} }),
+              fillRect() {},
+              clearRect() {},
+              beginPath() {},
+              arc() {},
+              closePath() {},
+              fill() {},
+              fillText() {},
+              bezierCurveTo() {},
+              stroke() {},
+              getImageData: (_x: number, y: number, w: number, h: number) => {
+                const buf = new Uint8ClampedArray(w * h * 4)
+                if (w === 16 && h === 16 && y === 0 && _x === 224) {
+                  // blank clearRect area -> all zeros
+                  return { data: buf }
+                }
+                if (w === 16 && h === 16) {
+                  for (let p = 0; p < w * h; p++) {
+                    const [r, gr, b, a] = solidPixelFn(p)
+                    buf[p * 4] = r
+                    buf[p * 4 + 1] = gr
+                    buf[p * 4 + 2] = b
+                    buf[p * 4 + 3] = a
+                  }
+                  return { data: buf }
+                }
+                return { data: buf }
+              },
+            }),
+          }
+        },
+      })
+      try {
+        resetFontsProbeCache()
+        // Uniform Display-P3 ±1/±2 color shift across all 256 pixels -> clean!
+        g.document = makeMockDocument(() => [18, 135, 222, 255])
+        const uniformRes = collectFontsAndCanvasProbe()
+        expect(uniformRes.canvas_noise_injected).toBe(false)
+        expect(uniformRes.canvas_readback_delta).toBe(0)
+
+        // Single-pixel +1 farbling on pixel 0 -> caught immediately!
+        g.document = makeMockDocument((p) => (p === 0 ? [18, 136, 221, 255] : [17, 136, 221, 255]))
+        const farbledRes = collectFontsAndCanvasProbe()
+        expect(farbledRes.canvas_noise_injected).toBe(true)
+        expect(farbledRes.canvas_readback_delta).toBeGreaterThan(0)
+      } finally {
+        g.document = origDoc
+        resetFontsProbeCache()
+      }
+
+      // 4. S3-37: Muted all-zero OfflineAudioContext sets audio_muted=true, audio_noise_injected=false
+      const origOffline = g.OfflineAudioContext
+      g.OfflineAudioContext = class MockMutedAudioContext {
+        currentTime = 0
+        destination = {}
+        createOscillator() {
+          return {
+            type: 'triangle',
+            frequency: { setValueAtTime() {} },
+            connect() {},
+            start() {},
+          }
+        }
+        createDynamicsCompressor() {
+          const p = { setValueAtTime() {} }
+          return { threshold: p, knee: p, ratio: p, attack: p, release: p, connect() {} }
+        }
+        createBuffer(_ch: number, len: number) {
+          const zeros = new Float32Array(len)
+          return { getChannelData: () => zeros }
+        }
+        startRendering() {
+          const mutedSamples = new Float32Array(5000) // all 0.0
+          return Promise.resolve({
+            getChannelData: () => mutedSamples,
+            copyFromChannel: (dst: Float32Array) => dst.fill(0),
+          })
+        }
+      }
+      try {
+        const mutedAudio = await collectAudioProbeWithTrap(100)
+        expect(mutedAudio.audio_muted).toBe(true)
+        expect(mutedAudio.audio_noise_injected).toBe(false)
+      } finally {
+        g.OfflineAudioContext = origOffline
+      }
+
+      // 5. S3-29: Tampered Math transcendental emits `unknown_tampered_math`
+      const origCos = Math.cos
+      Math.cos = ((x: number) => (x === 0 ? 0.999999 : origCos(x))) as typeof Math.cos
+      try {
+        const tamperedLies = collectLieDetectorProbe()
+        expect(tamperedLies.math_engine_signature).toBe('unknown_tampered_math')
+      } finally {
+        Math.cos = origCos
+      }
+
+      // 6. S3-39 & S3-53: getAccessToken invoked once + should_collect:false returns {accepted:false, skipped:true}
+      let tokenCalls = 0
+      const skipClient = createPrismClient({
+        baseUrl: 'http://skip.invalid',
+        getAccessToken: () => {
+          tokenCalls++
+          return 'single-call-token'
+        },
+        fetchImpl: async (input) => {
+          const url = String(input)
+          if (url.endsWith('/should-collect')) {
+            return new Response(JSON.stringify({ should_collect: false }), { status: 200 })
+          }
+          throw new Error('should not call challenge when should_collect is false')
+        },
+      })
+      const skipRes = await skipClient.identify()
+      expect(tokenCalls).toBe(1)
+      expect(skipRes?.accepted).toBe(false)
+      expect(skipRes?.skipped).toBe(true)
+      expect(skipRes?.code).toBe('COLLECTION_SKIPPED')
+
+      // Verify full identify() also invokes getAccessToken ONLY ONCE across should-collect + challenge + identify!
+      let fullTokenCalls = 0
+      const singleTokClient = createPrismClient({
+        baseUrl,
+        getAccessToken: () => {
+          fullTokenCalls++
+          return 'single_token_check_user'
+        },
+      })
+      const singleTokRes = await singleTokClient.identify()
+      expect(singleTokRes?.accepted).toBe(true)
+      expect(fullTokenCalls).toBe(1)
+
+      // 7. S3-40: Structured error diagnostics distinguish HTTP 429 from HTTP 401
+      const observedErrors: Array<{ kind: string; status?: number }> = []
+      const err429Client = createPrismClient({
+        baseUrl: 'http://ratelimit.invalid',
+        onError: (e) => observedErrors.push({ kind: e.kind, status: e.status }),
+        fetchImpl: async () =>
+          new Response(JSON.stringify({ accepted: false, error: 'rate limit exceeded' }), {
+            status: 429,
+          }),
+      })
+      const detailed429 = await err429Client.identifyDetailed({ force: true })
+      expect(detailed429.result).toBeNull()
+      expect(detailed429.error?.kind).toBe('http')
+      expect(detailed429.error?.status).toBe(429)
+      expect(err429Client.getLastError()?.status).toBe(429)
+      expect(observedErrors).toEqual([{ kind: 'http', status: 429 }])
+    })
+
+    it.skipIf(!fs.existsSync(CHROME_EXECUTABLE_PATH))(
+      '7B. S1-2/S1-3/S2-10/S2-12/S2-25: executes shared-browser yellow+pending policy, high-level client.rebindKey (proactive rotation + single-use step-up recovery), clearSpoof, and GDPR deleteSubject in real Chrome',
+      async () => {
+        const browser = await chromium.launch({
+          executablePath: CHROME_EXECUTABLE_PATH,
+          headless: true,
+          args: ['--enable-webgl', '--ignore-gpu-blocklist', '--use-gl=angle'],
+        })
+        try {
+          const context = await browser.newContext()
+          const page = await context.newPage()
+          await page.goto(baseUrl, { waitUntil: 'networkidle' })
+
+          // 1. S1-2: Shared household browser profile: mom -> green, kid -> yellow + risk_pending (NOT red!)
+          const sharedRes = await page.evaluate(async () => {
+            const { createPrismClient } = await new Function('return import("/prismid.bundle.js")')()
+            const momClient = createPrismClient({ getAccessToken: () => 'e2e_family_mom' })
+            const kidClient = createPrismClient({ getAccessToken: () => 'e2e_family_kid' })
+            const mom = await momClient.identify({ force: true })
+            const kid = await kidClient.identify({ force: true })
+            return { mom, kid }
+          })
+          expect(sharedRes.mom.risk_status).toBe('green')
+          expect(sharedRes.mom.device_key_bound).toBe(true)
+          expect(sharedRes.kid.risk_status).toBe('yellow')
+          expect(sharedRes.kid.risk_pending).toBe(true)
+
+          // 2. S2-12 & S1-3: Proactive key rotation (`rebindKey({ rotate: true })`) succeeds WITHOUT step-up MFA
+          // using `previous_device_key` continuity proof, and retires old `d_key_*` edge!
+          const rotCtx = await browser.newContext({
+            extraHTTPHeaders: { 'X-Forwarded-For': '198.18.210.10' },
+            screen: { width: 1280, height: 800 },
+            viewport: { width: 1280, height: 800 },
+          })
+          const rotPage = await rotCtx.newPage()
+          await rotPage.goto(baseUrl, { waitUntil: 'networkidle' })
+
+          const rotFlow = await rotPage.evaluate(async () => {
+            const { createPrismClient } = await new Function('return import("/prismid.bundle.js")')()
+            const client = createPrismClient({ getAccessToken: () => 'e2e_rotate_owner' })
+            const before = await client.identify({ force: true })
+            const rebound = await client.rebindKey({ rotate: true })
+            const after = await client.identify({ force: true })
+            const explain = await (
+              await fetch('/api/v1/risk/explain?subject_id=e2e_rotate_owner')
+            ).json()
+            return { before, rebound, after, explain }
+          })
+          expect(rotFlow.before.device_key_bound).toBe(true)
+          expect(rotFlow.rebound).toMatchObject({ accepted: true })
+          expect(rotFlow.after.device_key_bound).toBe(true)
+          expect(rotFlow.after.device_key_slice_id).not.toBe(rotFlow.before.device_key_slice_id)
+          // Old d_key_* slice MUST be retired from risk graph!
+          expect(rotFlow.explain.slice_ids).toContain(rotFlow.after.device_key_slice_id)
+          expect(rotFlow.explain.slice_ids).not.toContain(rotFlow.before.device_key_slice_id)
+
+          // 3. S2-25 & S2-10: Lost-key recovery via admin mint-step-up + clearSpoof + single-use replay rejection + deleteSubject
+          const beaconId = await rotPage.evaluate(async () => {
+            const { collectAndHealStorageBeacon } = await new Function(
+              'return import("/prismid.bundle.js")'
+            )()
+            return (await collectAndHealStorageBeacon()).beacon_id
+          })
+          // Wipe IndexedDB keystore inside the SAME tab (without reloading!) to simulate in-session site-data loss:
+          await rotPage.evaluate(async () => {
+            await new Promise<void>((resolve) => {
+              const req = indexedDB.deleteDatabase('_prismid_key_v1')
+              req.onsuccess = req.onerror = req.onblocked = () => resolve()
+            })
+          })
+          // Mint single-use step-up tokens from standalone server admin endpoint:
+          const mintRes = await fetch(`${baseUrl}/api/v1/risk/admin/mint-step-up`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'X-PrismID-Admin-Secret': 'test-admin-secret-0123456789abcdef',
+            },
+            body: JSON.stringify({
+              subject_id: 'e2e_rotate_owner',
+              beacon_id: beaconId,
+            }),
+          })
+          expect(mintRes.status).toBe(200)
+          const { step_up_token: stepUpToken } = (await mintRes.json()) as { step_up_token: string }
+          expect(stepUpToken).toMatch(/^stepup_v2\./)
+
+          const mintClearSpoofRes = await fetch(`${baseUrl}/api/v1/risk/admin/mint-step-up`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'X-PrismID-Admin-Secret': 'test-admin-secret-0123456789abcdef',
+            },
+            body: JSON.stringify({
+              subject_id: 'e2e_rotate_owner',
+              target: 'clear_spoof',
+            }),
+          })
+          expect(mintClearSpoofRes.status).toBe(200)
+          const { step_up_token: clearSpoofToken } = (await mintClearSpoofRes.json()) as {
+            step_up_token: string
+          }
+
+          const recFlow = await rotPage.evaluate(
+            async (args: { rebindTok: string; clearTok: string }) => {
+              const { createPrismClient } = await new Function(
+                'return import("/prismid.bundle.js")'
+              )()
+              const client = createPrismClient({ getAccessToken: () => 'e2e_rotate_owner' })
+              const firstRecovery = await client.rebindKey({ stepUpToken: args.rebindTok })
+              // Replaying the exact same single-use step-up token a second time MUST fail 403!
+              const replayAttempt = await client.rebindKey({ stepUpToken: args.rebindTok })
+              const verifiedAfter = await client.identify({ force: true })
+              const clearedSpoof = await client.clearSpoof({ stepUpToken: args.clearTok })
+              const clearReplay = await client.clearSpoof({ stepUpToken: args.clearTok })
+              const deleted = await client.deleteSubject()
+              return {
+                firstRecovery,
+                replayAttempt,
+                verifiedAfter,
+                clearedSpoof,
+                clearReplay,
+                deleted,
+              }
+            },
+            { rebindTok: stepUpToken, clearTok: clearSpoofToken }
+          )
+
+          expect(recFlow.firstRecovery.accepted).toBe(true)
+          expect(recFlow.replayAttempt.accepted).toBe(false)
+          expect(recFlow.verifiedAfter.risk_status).toBe('green')
+          expect(recFlow.verifiedAfter.device_key_bound).toBe(true)
+          expect(recFlow.clearedSpoof.accepted).toBe(true)
+          expect(recFlow.clearReplay.accepted).toBe(false)
+          expect(recFlow.deleted.accepted).toBe(true)
+          expect(recFlow.deleted.deleted).toBe(true)
+          expect(recFlow.deleted.purged_key_bindings).toBeGreaterThanOrEqual(1)
+
+          await rotCtx.close()
+          await context.close()
+        } finally {
+          await browser.close()
+        }
+      },
+      30000
+    )
+
+    it(
+      '7C. S2-17 & S3-55: executes real 3-engine Cross-Browser Matrix (Chromium V8 + Firefox SpiderMonkey + WebKit Safari JSC) with 0% false positives',
+      async () => {
+        const engines: Array<{
+          name: string
+          expectedMathSig: 'v8' | 'spidermonkey' | 'jsc'
+          launch: () => Promise<Awaited<ReturnType<typeof chromium.launch>> | null>
+        }> = [
+          {
+            name: 'chromium',
+            expectedMathSig: 'v8',
+            launch: async () => {
+              if (!fs.existsSync(CHROME_EXECUTABLE_PATH)) return null
+              return chromium.launch({
+                executablePath: CHROME_EXECUTABLE_PATH,
+                headless: true,
+                args: ['--enable-webgl', '--ignore-gpu-blocklist', '--use-gl=angle'],
+              })
+            },
+          },
+          {
+            name: 'firefox',
+            expectedMathSig: 'spidermonkey',
+            launch: async () => {
+              const exe = firefox.executablePath()
+              if (!exe || !fs.existsSync(exe)) {
+                if (process.env.PRISMID_REQUIRE_ALL_BROWSERS === '1') {
+                  throw new Error(`Playwright Firefox executable missing at ${exe}`)
+                }
+                return null
+              }
+              return firefox.launch({ headless: true })
+            },
+          },
+          {
+            name: 'webkit',
+            expectedMathSig: 'jsc',
+            launch: async () => {
+              const exe = webkit.executablePath()
+              if (!exe || !fs.existsSync(exe)) {
+                if (process.env.PRISMID_REQUIRE_ALL_BROWSERS === '1') {
+                  throw new Error(`Playwright WebKit executable missing at ${exe}`)
+                }
+                return null
+              }
+              return webkit.launch({ headless: true })
+            },
+          },
+        ]
+
+        let testedEngines = 0
+        for (const eng of engines) {
+          const browser = await eng.launch()
+          if (!browser) continue
+          testedEngines++
+          try {
+            const context = await browser.newContext({
+              screen: { width: 1512, height: 982 },
+              viewport: { width: 1512, height: 982 },
+            })
+            const page = await context.newPage()
+            await page.goto(baseUrl, { waitUntil: 'networkidle' })
+
+            const out = await page.evaluate(async (engineName: string) => {
+              const { createPrismClient, sealPayload } = await new Function(
+                'return import("/prismid.bundle.js")'
+              )()
+              const client = createPrismClient({ baseUrl: '' })
+              const clientIp =
+                engineName === 'chromium'
+                  ? '198.18.201.11'
+                  : engineName === 'firefox'
+                    ? '198.18.202.11'
+                    : '198.18.203.11'
+              const chRes = await fetch('/api/v1/risk/challenge', {
+                method: 'POST',
+                headers: {
+                  Authorization: `Bearer matrix_clean_${engineName}`,
+                  'X-Forwarded-For': clientIp,
+                },
+              })
+              const ch = await chRes.json()
+              const { payload } = await client.collectAndSeal(ch)
+              // Note: headless Playwright sets navigator.webdriver = true by browser-automation spec;
+              // strip ONLY `navigator_webdriver` when testing benign engine compatibility (matching
+              // real non-automated user sessions in Chrome, Firefox, and Safari!).
+              if (Array.isArray(payload.lies?.automation_flags)) {
+                payload.lies.automation_flags = payload.lies.automation_flags.filter(
+                  (f: string) => f !== 'navigator_webdriver'
+                )
+              }
+              const resealed = await sealPayload(ch.nonce, JSON.stringify(payload))
+              const idRes = await fetch('/api/v1/risk/identify', {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  Authorization: `Bearer matrix_clean_${engineName}`,
+                  'X-Forwarded-For': clientIp,
+                },
+                body: JSON.stringify({ c: ch.nonce, p: resealed }),
+              })
+              const verifyResult = await idRes.json()
+              return { verifyResult, payload }
+            }, eng.name)
+
+            expect(out.payload.lies.math_engine_signature, `${eng.name} math sig`).toBe(
+              eng.expectedMathSig
+            )
+            expect(out.payload.lies.prototype_lies, `${eng.name} prototype lies`).toEqual([])
+            expect(out.payload.lies.canvas_noise_injected, `${eng.name} canvas noise`).toBe(false)
+            expect(out.payload.lies.audio_noise_injected, `${eng.name} audio noise`).toBe(false)
+            expect(out.payload.lies.worker_lie_detected, `${eng.name} worker lie`).toBe(false)
+            expect(out.verifyResult.accepted, `${eng.name} accepted`).toBe(true)
+            expect(
+              out.verifyResult.spoof_trap_triggered,
+              `${eng.name} spoof trap: ${JSON.stringify(out.verifyResult.spoof_flags)} | payload.webgl=${JSON.stringify({ v: out.payload.webgl.gpu_vendor, r: out.payload.webgl.gpu_renderer, lim: out.payload.webgl.webgl_limits_vector })} | worker=${JSON.stringify(out.payload.lies)}`
+            ).toBe(false)
+            expect(out.verifyResult.device_key_bound, `${eng.name} device key bound`).toBe(true)
+            if (!out.verifyResult.is_virtual_gpu) {
+              expect(out.verifyResult.risk_status, `${eng.name} risk status`).toBe('green')
+            }
+
+            await context.close()
+          } finally {
+            await browser.close()
+          }
+        }
+        expect(testedEngines).toBeGreaterThanOrEqual(1)
+      },
+      45000
     )
   })
 })

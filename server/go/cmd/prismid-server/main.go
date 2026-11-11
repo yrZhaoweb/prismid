@@ -1,20 +1,27 @@
 package main
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	_ "embed"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
+	"fmt"
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	prismid "github.com/yrZhaoweb/prismid/server/go"
@@ -24,6 +31,7 @@ import (
 var embeddedPrismBundleJS []byte
 
 const (
+	serverVersion         = "1.1.0"
 	maxRequestBodyBytes   = 64 << 10 // 64 KiB
 	DefaultBearerTokenTTL = 24 * time.Hour
 	DefaultStepUpTokenTTL = 5 * time.Minute
@@ -98,24 +106,268 @@ func (rl *ipRateLimiter) allow(ip string, now time.Time) bool {
 	return true
 }
 
+// replayAndRevocationGuard enforces single-use step-up token consumption (DeepSeek S2-10)
+// and bearer/subject token revocation (DeepSeek S3-52).
+type replayAndRevocationGuard struct {
+	mu              sync.Mutex
+	consumedStepUp  map[string]int64
+	revokedTokenSHA map[[32]byte]int64
+	revokedSubjects map[string]int64
+}
+
+func newReplayAndRevocationGuard() *replayAndRevocationGuard {
+	return &replayAndRevocationGuard{
+		consumedStepUp:  make(map[string]int64),
+		revokedTokenSHA: make(map[[32]byte]int64),
+		revokedSubjects: make(map[string]int64),
+	}
+}
+
+func (g *replayAndRevocationGuard) consumeStepUpJTI(jti string, expUnix int64, nowUnix int64) bool {
+	if jti == "" {
+		return false
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if len(g.consumedStepUp) >= 16384 {
+		for k, exp := range g.consumedStepUp {
+			if nowUnix > exp {
+				delete(g.consumedStepUp, k)
+			}
+		}
+		for len(g.consumedStepUp) >= 16384 {
+			for k := range g.consumedStepUp {
+				delete(g.consumedStepUp, k)
+				break
+			}
+		}
+	}
+	if prevExp, used := g.consumedStepUp[jti]; used && nowUnix <= prevExp {
+		return false
+	}
+	g.consumedStepUp[jti] = expUnix
+	return true
+}
+
+func (g *replayAndRevocationGuard) revokeToken(rawToken string, expUnix int64) string {
+	rawToken = strings.TrimSpace(rawToken)
+	if rawToken == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(rawToken))
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if len(g.revokedTokenSHA) >= 16384 {
+		now := time.Now().UTC().Unix()
+		for k, exp := range g.revokedTokenSHA {
+			if now > exp {
+				delete(g.revokedTokenSHA, k)
+			}
+		}
+	}
+	g.revokedTokenSHA[sum] = expUnix
+	return hex.EncodeToString(sum[:])
+}
+
+func (g *replayAndRevocationGuard) exportSnapshot(nowUnix int64) *prismid.ReplayGuardSnapshot {
+	if g == nil {
+		return nil
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	snap := &prismid.ReplayGuardSnapshot{
+		ConsumedStepUp:  make(map[string]int64, len(g.consumedStepUp)),
+		RevokedTokenSHA: make(map[string]int64, len(g.revokedTokenSHA)),
+		RevokedSubjects: make(map[string]int64, len(g.revokedSubjects)),
+	}
+	for jti, exp := range g.consumedStepUp {
+		if nowUnix <= exp {
+			snap.ConsumedStepUp[jti] = exp
+		}
+	}
+	for sum, exp := range g.revokedTokenSHA {
+		if nowUnix <= exp {
+			snap.RevokedTokenSHA[hex.EncodeToString(sum[:])] = exp
+		}
+	}
+	for sid, until := range g.revokedSubjects {
+		if nowUnix <= until {
+			snap.RevokedSubjects[sid] = until
+		}
+	}
+	return snap
+}
+
+func (g *replayAndRevocationGuard) importSnapshot(snap *prismid.ReplayGuardSnapshot, nowUnix int64) {
+	if g == nil || snap == nil {
+		return
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	for jti, exp := range snap.ConsumedStepUp {
+		if jti != "" && nowUnix <= exp {
+			g.consumedStepUp[jti] = exp
+		}
+	}
+	for shaHex, exp := range snap.RevokedTokenSHA {
+		if nowUnix > exp {
+			continue
+		}
+		raw, err := hex.DecodeString(strings.TrimSpace(shaHex))
+		if err == nil && len(raw) == 32 {
+			var sum [32]byte
+			copy(sum[:], raw)
+			g.revokedTokenSHA[sum] = exp
+		}
+	}
+	for sid, until := range snap.RevokedSubjects {
+		if sid != "" && nowUnix <= until {
+			g.revokedSubjects[sid] = until
+		}
+	}
+}
+
+func (g *replayAndRevocationGuard) revokeSubject(subjectID string, untilUnix int64) {
+	subjectID = strings.TrimSpace(subjectID)
+	if subjectID == "" {
+		return
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if len(g.revokedSubjects) >= 16384 {
+		now := time.Now().UTC().Unix()
+		for k, exp := range g.revokedSubjects {
+			if now > exp {
+				delete(g.revokedSubjects, k)
+			}
+		}
+	}
+	g.revokedSubjects[subjectID] = untilUnix
+}
+
+func (g *replayAndRevocationGuard) isRevoked(rawToken, subjectID string, nowUnix int64) bool {
+	if g == nil {
+		return false
+	}
+	sum := sha256.Sum256([]byte(strings.TrimSpace(rawToken)))
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if exp, ok := g.revokedTokenSHA[sum]; ok {
+		if nowUnix <= exp {
+			return true
+		}
+		delete(g.revokedTokenSHA, sum)
+	}
+	if subjectID != "" {
+		if until, ok := g.revokedSubjects[subjectID]; ok {
+			if nowUnix <= until {
+				return true
+			}
+			delete(g.revokedSubjects, subjectID)
+		}
+	}
+	return false
+}
+
+type serverHandlerConfig struct {
+	hmacSecret        []byte
+	authSecret        []byte
+	authSecretPrev    []byte
+	stepUpSecret      []byte
+	stepUpSecretPrev  []byte
+	adminSecret       []byte
+	demoMode          bool
+	trustProxy        bool
+	corsOrigin        string
+	ratePerSec        float64
+	burst             float64
+	allowLegacyTokens bool
+	stateStore        *prismid.FileStateStore
+	memStore          *prismid.MemoryChallengeStore
+	replayGuard       *replayAndRevocationGuard
+}
+
+func envOrFlag(flagVal, envKey string) string {
+	if v := strings.TrimSpace(flagVal); v != "" {
+		return v
+	}
+	return strings.TrimSpace(os.Getenv(envKey))
+}
+
+// validateStartupConfig fails closed on unsafe/incomplete production CLI/env combinations (DeepSeek P2-2).
+func validateStartupConfig(demoMode bool, hmacSecret string, requireTurnstile bool, turnstileSecret string) error {
+	if !demoMode && strings.TrimSpace(hmacSecret) == "" {
+		return errors.New("PRISMID_HMAC_SECRET (or -secret flag) is required when -demo-mode=false")
+	}
+	if requireTurnstile && strings.TrimSpace(turnstileSecret) == "" {
+		return errors.New("-require-turnstile=true requires -turnstile-secret or PRISMID_TURNSTILE_SECRET")
+	}
+	return nil
+}
+
+func buildCloudflareTurnstileVerifier(secret string) func(ctx context.Context, token, clientIP string) (bool, error) {
+	httpClient := &http.Client{Timeout: 3 * time.Second}
+	return func(ctx context.Context, token, clientIP string) (bool, error) {
+		form := url.Values{}
+		form.Set("secret", secret)
+		form.Set("response", token)
+		if clientIP != "" {
+			form.Set("remoteip", clientIP)
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://challenges.cloudflare.com/turnstile/v0/siteverify", strings.NewReader(form.Encode()))
+		if err != nil {
+			return false, err
+		}
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		resp, err := httpClient.Do(req)
+		if err != nil {
+			return false, fmt.Errorf("turnstile verify request failed: %w", err)
+		}
+		defer resp.Body.Close()
+		var out struct {
+			Success bool `json:"success"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+			return false, fmt.Errorf("decode turnstile response: %w", err)
+		}
+		return out.Success, nil
+	}
+}
+
 func main() {
-	addr := flag.String("addr", ":8090", "HTTP listen address")
-	hmacSecret := flag.String("secret", "", "HMAC secret key (or PRISMID_HMAC_SECRET env)")
-	demoMode := flag.Bool("demo-mode", true, "Enable standalone lab playground UI and demo identity/IP simulation headers")
+	// S3-51: Safe production defaults — loopback listen address and demo-mode OFF by default!
+	addr := flag.String("addr", "127.0.0.1:8090", "HTTP listen address")
+	hmacSecret := flag.String("secret", "", "Primary slice HMAC secret (or PRISMID_HMAC_SECRET)")
+	authSecretFlag := flag.String("auth-secret", "", "Independent Bearer auth HMAC secret (or PRISMID_AUTH_SECRET)")
+	authSecretPrevFlag := flag.String("auth-secret-prev", "", "Previous Bearer auth HMAC secret during rotation (or PRISMID_AUTH_SECRET_PREV)")
+	stepUpSecretFlag := flag.String("stepup-secret", "", "Independent Step-Up token HMAC secret (or PRISMID_STEPUP_SECRET)")
+	stepUpSecretPrevFlag := flag.String("stepup-secret-prev", "", "Previous Step-Up token HMAC secret during rotation (or PRISMID_STEPUP_SECRET_PREV)")
+	adminSecretFlag := flag.String("admin-secret", "", "Admin API secret for minting/revoking tokens (or PRISMID_ADMIN_SECRET)")
+	turnstileSecretFlag := flag.String("turnstile-secret", "", "Cloudflare Turnstile secret key (or PRISMID_TURNSTILE_SECRET)")
+	requireTurnstile := flag.Bool("require-turnstile", false, "Require valid Turnstile token on /api/v1/risk/identify")
+	enforceChallengeIP := flag.Bool("enforce-challenge-ip", false, "Reject /identify if client /24 (/48) subnet differs from /challenge")
+	hardAnchorPolicyStr := flag.String("hard-anchor-policy", string(prismid.HardAnchorPolicySharedStepUp), "Hard-anchor multi-account policy: shared_step_up, step_up_all, strict_1to1, or disabled")
+	stateFileFlag := flag.String("state-file", "", "Optional WAL + background-compacted snapshot file path to persist RiskGraph & TOFU bindings (or PRISMID_STATE_FILE)")
+	stateFlushInterval := flag.Duration("state-flush-interval", 30*time.Second, "Minimum interval between background state snapshot compactions when -state-file is enabled")
+	auditLogFlag := flag.String("audit-log", "", "Optional append-only JSONL file path for durable security audit events (or PRISMID_AUDIT_LOG)")
+	demoMode := flag.Bool("demo-mode", false, "Enable standalone lab playground UI and demo identity/IP simulation headers (NEVER enable in production)")
 	trustProxy := flag.Bool("trust-proxy", false, "Trust X-Forwarded-For and X-Real-IP headers from reverse proxy")
 	corsOrigin := flag.String("cors-origin", "", "Allowed CORS Origin (defaults to request origin only in -demo-mode)")
 	rateLimit := flag.Float64("rate-limit", 60, "Per-IP API rate limit in requests/sec (0 to disable)")
 	allowLegacyTokens := flag.Bool("allow-legacy-tokens", false, "Accept deprecated non-expiring <subject_id>.<hmac> bearer tokens")
 	flag.Parse()
 
-	secret := strings.TrimSpace(*hmacSecret)
-	if secret == "" {
-		secret = strings.TrimSpace(os.Getenv("PRISMID_HMAC_SECRET"))
+	hardPolicy, err := prismid.ParseHardAnchorPolicy(*hardAnchorPolicyStr)
+	if err != nil {
+		log.Fatalf("invalid -hard-anchor-policy: %v", err)
+	}
+
+	secret := envOrFlag(*hmacSecret, "PRISMID_HMAC_SECRET")
+	tsSecret := envOrFlag(*turnstileSecretFlag, "PRISMID_TURNSTILE_SECRET")
+	if err := validateStartupConfig(*demoMode, secret, *requireTurnstile, tsSecret); err != nil {
+		log.Fatalf("invalid server configuration: %v", err)
 	}
 	if secret == "" {
-		if !*demoMode {
-			log.Fatalf("PRISMID_HMAC_SECRET (or -secret flag) is required when -demo-mode=false")
-		}
 		var randKey [32]byte
 		if _, err := rand.Read(randKey[:]); err != nil {
 			log.Fatalf("failed to generate ephemeral HMAC secret: %v", err)
@@ -124,17 +376,93 @@ func main() {
 		log.Printf("[WARN] Running in demo-mode with ephemeral per-process HMAC secret; pass -secret or PRISMID_HMAC_SECRET for persistent slice IDs")
 	}
 
-	verifier := prismid.NewVerifier(prismid.Config{
-		HMACSecret:   []byte(secret),
-		ChallengeTTL: 60 * time.Second,
-		OnKeyRebindAudit: func(ev prismid.KeyRebindAuditEvent) {
-			log.Printf("[AUDIT] key_rebind audit_id=%s outcome=%s subject_id=%s beacon_slice_id=%s new_key_slice_id=%s prev_present=%v ip=%s",
-				ev.AuditID, ev.Outcome, ev.SubjectID, ev.BeaconSliceID, ev.NewDeviceKeySliceID, ev.PreviousKeyPresent, ev.ClientIP)
-		},
-	}, prismid.NewMemoryChallengeStore())
-	riskGraph := prismid.NewRiskGraphWithClock(prismid.AuthoritativeConfidenceThreshold, time.Now)
+	var auditStore prismid.AuditStore
+	if auditPath := envOrFlag(*auditLogFlag, "PRISMID_AUDIT_LOG"); auditPath != "" {
+		fa, err := prismid.NewFileAuditStore(auditPath)
+		if err != nil {
+			log.Fatalf("failed to open audit log %q: %v", auditPath, err)
+		}
+		auditStore = fa
+	}
 
-	handler := newHTTPHandlerWithOptions(verifier, riskGraph, []byte(secret), *demoMode, *trustProxy, *corsOrigin, *rateLimit, *rateLimit*2, *allowLegacyTokens)
+	memStore := prismid.NewMemoryChallengeStore()
+	riskGraph := prismid.NewRiskGraphWithOptions(prismid.GraphOptions{
+		MinConfidence:    prismid.AuthoritativeConfidenceThreshold,
+		HardAnchorPolicy: hardPolicy,
+		NowFunc:          time.Now,
+		Store:            memStore,
+	})
+	guard := newReplayAndRevocationGuard()
+
+	var stateStore *prismid.FileStateStore
+	if statePath := envOrFlag(*stateFileFlag, "PRISMID_STATE_FILE"); statePath != "" {
+		fs, err := prismid.NewFileStateStore(statePath)
+		if err != nil {
+			log.Fatalf("failed to initialize state file %q: %v", statePath, err)
+		}
+		fs.SetErrorHandler(func(pErr error) {
+			log.Printf("[ERROR] state persistence failed (%s): %v", statePath, pErr)
+		})
+		restoredGuard, hadState, err := fs.RestoreInto(context.Background(), riskGraph, memStore)
+		if err != nil {
+			log.Fatalf("failed to restore state file %q: %v", statePath, err)
+		}
+		riskGraph.SetHardAnchorPolicy(hardPolicy)
+		if restoredGuard != nil {
+			guard.importSnapshot(restoredGuard, time.Now().UTC().Unix())
+		}
+		if hadState {
+			log.Printf("Restored persisted RiskGraph (%d subjects), TOFU bindings, and replay guard from %s", riskGraph.Stats().ActiveSubjects, statePath)
+		}
+		fs.StartBackgroundWorker(
+			riskGraph,
+			memStore,
+			func() *prismid.ReplayGuardSnapshot {
+				return guard.exportSnapshot(time.Now().UTC().Unix())
+			},
+			250*time.Millisecond,
+			*stateFlushInterval,
+		)
+		stateStore = fs
+	}
+
+	vCfg := prismid.Config{
+		HMACSecret:         []byte(secret),
+		ChallengeTTL:       60 * time.Second,
+		EnforceChallengeIP: *enforceChallengeIP,
+		RequireTurnstile:   *requireTurnstile,
+		AuditStore:         auditStore,
+		OnKeyRebindAudit: func(ev prismid.KeyRebindAuditEvent) {
+			log.Printf("[AUDIT] action=%s audit_id=%s outcome=%s subject_id=%s beacon_slice_id=%s new_key_slice_id=%s prev_present=%v retired_prev=%v ip=%s",
+				ev.Action, ev.AuditID, ev.Outcome, ev.SubjectID, ev.BeaconSliceID, ev.NewDeviceKeySliceID, ev.PreviousKeyPresent, ev.RetiredPreviousKey, ev.ClientIP)
+		},
+	}
+	if tsSecret != "" {
+		vCfg.TurnstileVerifier = buildCloudflareTurnstileVerifier(tsSecret)
+	}
+
+	verifier := prismid.NewVerifier(vCfg, memStore)
+	verifier.BindRiskGraph(riskGraph)
+
+	hCfg := serverHandlerConfig{
+		hmacSecret:        []byte(secret),
+		authSecret:        []byte(envOrFlag(*authSecretFlag, "PRISMID_AUTH_SECRET")),
+		authSecretPrev:    []byte(envOrFlag(*authSecretPrevFlag, "PRISMID_AUTH_SECRET_PREV")),
+		stepUpSecret:      []byte(envOrFlag(*stepUpSecretFlag, "PRISMID_STEPUP_SECRET")),
+		stepUpSecretPrev:  []byte(envOrFlag(*stepUpSecretPrevFlag, "PRISMID_STEPUP_SECRET_PREV")),
+		adminSecret:       []byte(envOrFlag(*adminSecretFlag, "PRISMID_ADMIN_SECRET")),
+		demoMode:          *demoMode,
+		trustProxy:        *trustProxy,
+		corsOrigin:        *corsOrigin,
+		ratePerSec:        *rateLimit,
+		burst:             *rateLimit * 2,
+		allowLegacyTokens: *allowLegacyTokens,
+		stateStore:        stateStore,
+		memStore:          memStore,
+		replayGuard:       guard,
+	}
+
+	handler := newHTTPHandlerWithConfig(verifier, riskGraph, hCfg)
 
 	srv := &http.Server{
 		Addr:              *addr,
@@ -145,7 +473,22 @@ func main() {
 		IdleTimeout:       60 * time.Second,
 	}
 
-	log.Printf("PrismID standalone verification server v1.0.1 listening on %s (demo-mode=%v, trust-proxy=%v, rate-limit=%.0f/s)", *addr, *demoMode, *trustProxy, *rateLimit)
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-sigCh
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(ctx)
+		if stateStore != nil {
+			if err := stateStore.FlushAndClose(ctx, riskGraph, memStore, guard.exportSnapshot(time.Now().UTC().Unix())); err != nil {
+				log.Printf("[ERROR] failed to flush state on shutdown: %v", err)
+			}
+		}
+	}()
+
+	log.Printf("PrismID standalone verification server v%s listening on %s (demo-mode=%v, policy=%s, trust-proxy=%v, rate-limit=%.0f/s)",
+		serverVersion, *addr, *demoMode, hardPolicy, *trustProxy, *rateLimit)
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("server error: %v", err)
 	}
@@ -160,16 +503,52 @@ func newHTTPHandlerWithRateLimit(verifier *prismid.Verifier, riskGraph *prismid.
 }
 
 func newHTTPHandlerWithOptions(verifier *prismid.Verifier, riskGraph *prismid.RiskGraph, secret []byte, demoMode, trustProxy bool, corsOrigin string, ratePerSec, burst float64, allowLegacyTokens bool) http.Handler {
-	allowProxyHeaders := trustProxy || demoMode
-	limiter := newIPRateLimiter(ratePerSec, burst)
+	return newHTTPHandlerWithConfig(verifier, riskGraph, serverHandlerConfig{
+		hmacSecret:        secret,
+		demoMode:          demoMode,
+		trustProxy:        trustProxy,
+		corsOrigin:        corsOrigin,
+		ratePerSec:        ratePerSec,
+		burst:             burst,
+		allowLegacyTokens: allowLegacyTokens,
+	})
+}
+
+func newHTTPHandlerWithConfig(verifier *prismid.Verifier, riskGraph *prismid.RiskGraph, cfg serverHandlerConfig) http.Handler {
+	verifier.BindRiskGraph(riskGraph)
+	authPrimary := cfg.authSecret
+	if len(authPrimary) == 0 {
+		authPrimary = cfg.hmacSecret
+	}
+	stepUpPrimary := cfg.stepUpSecret
+	if len(stepUpPrimary) == 0 {
+		stepUpPrimary = cfg.hmacSecret
+	}
+
+	allowProxyHeaders := cfg.trustProxy || cfg.demoMode
+	limiter := newIPRateLimiter(cfg.ratePerSec, cfg.burst)
+	guard := cfg.replayGuard
+	if guard == nil {
+		guard = newReplayAndRevocationGuard()
+	}
+	appendWAL := func(rec prismid.StateWALRecord, syncImmediate bool) {
+		if cfg.stateStore != nil {
+			_ = cfg.stateStore.AppendWAL(rec, syncImmediate)
+		}
+	}
+
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		stats := riskGraph.Stats()
 		writeJSON(w, http.StatusOK, map[string]any{
-			"status":    "ok",
-			"engine":    "prismid-go",
-			"version":   "1.0.1",
-			"demo_mode": demoMode,
+			"status":             "ok",
+			"engine":             "prismid-go",
+			"version":            serverVersion,
+			"demo_mode":          cfg.demoMode,
+			"hard_anchor_policy": stats.HardAnchorPolicy,
+			"active_subjects":    stats.ActiveSubjects,
+			"persist_errors":     cfg.stateStore.PersistErrors(),
 		})
 	})
 
@@ -180,7 +559,7 @@ func newHTTPHandlerWithOptions(verifier *prismid.Verifier, riskGraph *prismid.Ri
 	})
 
 	mux.HandleFunc("/api/v1/risk/should-collect", func(w http.ResponseWriter, r *http.Request) {
-		enableCORS(w, r, demoMode, corsOrigin)
+		enableCORS(w, r, cfg.demoMode, cfg.corsOrigin)
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return
@@ -191,7 +570,7 @@ func newHTTPHandlerWithOptions(verifier *prismid.Verifier, riskGraph *prismid.Ri
 	})
 
 	mux.HandleFunc("/api/v1/risk/challenge", func(w http.ResponseWriter, r *http.Request) {
-		enableCORS(w, r, demoMode, corsOrigin)
+		enableCORS(w, r, cfg.demoMode, cfg.corsOrigin)
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return
@@ -200,17 +579,26 @@ func newHTTPHandlerWithOptions(verifier *prismid.Verifier, riskGraph *prismid.Ri
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
 			return
 		}
-		subjectID, authErr := extractVerifiedSubjectIDWithLegacy(r, demoMode, secret, allowLegacyTokens)
-		if authErr || (!demoMode && subjectID == "") {
+		subjectID, authErr := extractVerifiedSubjectIDMultiKey(r, cfg.demoMode, authPrimary, cfg.authSecretPrev, cfg.allowLegacyTokens, guard)
+		if authErr || (!cfg.demoMode && subjectID == "") {
 			writeJSON(w, http.StatusUnauthorized, map[string]any{
 				"accepted": false,
-				"error":    "invalid or unverified bearer token; when -demo-mode=false, Authorization must be Bearer <subject_id>.<exp_unix>.<hmac_sha256_hex>",
+				"error":    "invalid, expired, or revoked bearer token",
 			})
 			return
 		}
 		r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
 		ch, err := verifier.IssueChallenge(r.Context(), extractClientIP(r, allowProxyHeaders))
 		if err != nil {
+			var vErr *prismid.VerificationError
+			if errors.As(err, &vErr) && vErr.Code == prismid.ErrCodeChallengeRateLimited {
+				writeJSON(w, http.StatusTooManyRequests, map[string]any{
+					"accepted": false,
+					"code":     vErr.Code,
+					"error":    vErr.Detail,
+				})
+				return
+			}
 			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 			return
 		}
@@ -218,7 +606,7 @@ func newHTTPHandlerWithOptions(verifier *prismid.Verifier, riskGraph *prismid.Ri
 	})
 
 	mux.HandleFunc("/api/v1/risk/identify", func(w http.ResponseWriter, r *http.Request) {
-		enableCORS(w, r, demoMode, corsOrigin)
+		enableCORS(w, r, cfg.demoMode, cfg.corsOrigin)
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return
@@ -227,11 +615,11 @@ func newHTTPHandlerWithOptions(verifier *prismid.Verifier, riskGraph *prismid.Ri
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
 			return
 		}
-		subjectID, authErr := extractVerifiedSubjectIDWithLegacy(r, demoMode, secret, allowLegacyTokens)
-		if authErr || (!demoMode && subjectID == "") {
+		subjectID, authErr := extractVerifiedSubjectIDMultiKey(r, cfg.demoMode, authPrimary, cfg.authSecretPrev, cfg.allowLegacyTokens, guard)
+		if authErr || (!cfg.demoMode && subjectID == "") {
 			writeJSON(w, http.StatusUnauthorized, map[string]any{
 				"accepted": false,
-				"error":    "invalid or unverified bearer token; when -demo-mode=false, Authorization must be Bearer <subject_id>.<exp_unix>.<hmac_sha256_hex>",
+				"error":    "invalid, expired, or revoked bearer token",
 			})
 			return
 		}
@@ -245,8 +633,11 @@ func newHTTPHandlerWithOptions(verifier *prismid.Verifier, riskGraph *prismid.Ri
 		if err != nil {
 			status := http.StatusBadRequest
 			if vErr, ok := err.(*prismid.VerificationError); ok {
-				if vErr.Code == prismid.ErrCodeChallengeInvalid {
+				switch vErr.Code {
+				case prismid.ErrCodeChallengeInvalid:
 					status = http.StatusConflict
+				case prismid.ErrCodeTurnstileFailed, prismid.ErrCodeChallengeIPMismatch:
+					status = http.StatusForbidden
 				}
 				writeJSON(w, status, map[string]any{
 					"accepted": false,
@@ -260,7 +651,16 @@ func newHTTPHandlerWithOptions(verifier *prismid.Verifier, riskGraph *prismid.Ri
 		}
 
 		if subjectID != "" {
-			snap := riskGraph.RecordVerification(subjectID, time.Now().UTC(), res)
+			ownerRecorded := verifier.RecordVerifiedBeaconOwner(r.Context(), subjectID, res)
+			nowUTC := time.Now().UTC()
+			snap := riskGraph.RecordVerification(subjectID, nowUTC, res)
+			appendWAL(prismid.StateWALRecord{
+				Op:            prismid.WALOpIdentify,
+				At:            nowUTC,
+				SubjectID:     subjectID,
+				OwnerRecorded: ownerRecorded,
+				VerifyResult:  res,
+			}, false)
 			writeJSON(w, http.StatusOK, map[string]any{
 				"accepted":                     res.Accepted,
 				"confidence":                   res.Confidence,
@@ -294,15 +694,12 @@ func newHTTPHandlerWithOptions(verifier *prismid.Verifier, riskGraph *prismid.Ri
 		writeJSON(w, http.StatusOK, res)
 	})
 
-	// Audited TOFU device-key recovery endpoint (DeepSeek v1.0.1 P1 #1):
-	// Requires:
-	//  1. Authenticated subject bearer token.
-	//  2. Independent expiring HMAC step-up token (`step_up_token` or `X-PrismID-StepUp-Token`) bound to `(subject_id, beacon_slice_id)`.
-	//  3. Exclusive ownership of `beacon_slice_id` by `subject_id` in the risk graph (verified BEFORE nonce consumption).
-	//  4. Single-use `challenge_nonce` + ECDSA P-256 signature over `"prismid-v2-rebind|<nonce>|<subject_id>|<beacon_id>"`.
-	//  5. Structured audit event emission and zero leakage of previous device-key slice IDs.
+	// Audited TOFU device-key recovery & rotation endpoint (S1-1, S1-3, S2-10, S2-11, S2-12):
+	// Supports two cryptographic authorization paths:
+	//  Path A (Loss Recovery): Single-use `step_up_token` bound to `(subject_id, beacon_slice_id)`.
+	//  Path B (Key Rotation):  `previous_device_key` ECDSA signature proving possession of the currently bound device key.
 	mux.HandleFunc("/api/v1/risk/rebind-key", func(w http.ResponseWriter, r *http.Request) {
-		enableCORS(w, r, demoMode, corsOrigin)
+		enableCORS(w, r, cfg.demoMode, cfg.corsOrigin)
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return
@@ -311,7 +708,7 @@ func newHTTPHandlerWithOptions(verifier *prismid.Verifier, riskGraph *prismid.Ri
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
 			return
 		}
-		subjectID, authErr := extractVerifiedSubjectIDWithLegacy(r, demoMode, secret, allowLegacyTokens)
+		subjectID, authErr := extractVerifiedSubjectIDMultiKey(r, cfg.demoMode, authPrimary, cfg.authSecretPrev, cfg.allowLegacyTokens, guard)
 		if authErr || subjectID == "" {
 			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "verified subject identity required"})
 			return
@@ -336,21 +733,37 @@ func newHTTPHandlerWithOptions(verifier *prismid.Verifier, riskGraph *prismid.Ri
 			return
 		}
 
-		stepUpTok := strings.TrimSpace(req.StepUpToken)
-		if stepUpTok == "" {
-			stepUpTok = strings.TrimSpace(r.Header.Get("X-PrismID-StepUp-Token"))
-		}
-		if !VerifyStepUpToken(stepUpTok, subjectID, bcnSlice, secret) {
-			verifier.RecordDeniedRebindAudit(subjectID, bcnSlice, clientIP, "denied_invalid_stepup")
+		// Verify ownership FIRST before consuming any single-use step-up token or challenge nonce:
+		ownerCheck := verifier.BeaconOwnerCheck(riskGraph)
+		if !ownerCheck(subjectID, bcnSlice) {
+			verifier.RecordDeniedRebindAudit(subjectID, bcnSlice, clientIP, "denied_not_owner")
 			writeJSON(w, http.StatusForbidden, map[string]any{
 				"accepted": false,
 				"code":     prismid.ErrCodeRebindForbidden,
-				"error":    "valid step_up_token bound to subject_id and beacon_slice_id is required",
+				"error":    "beacon is not owned by authenticated subject",
 			})
 			return
 		}
 
-		res, err := verifier.RebindDeviceKeyWithProof(r.Context(), req, riskGraph.SubjectOwnsBeaconExclusively, clientIP)
+		// Dual-path authorization (S2-10 single-use step-up OR S2-12 previous-key continuity proof):
+		authorizedByPrevKey := verifier.HasValidPreviousKeyProof(r.Context(), req)
+		if !authorizedByPrevKey {
+			stepUpTok := strings.TrimSpace(req.StepUpToken)
+			if stepUpTok == "" {
+				stepUpTok = strings.TrimSpace(r.Header.Get("X-PrismID-StepUp-Token"))
+			}
+			if !verifyAndConsumeStepUpToken(stepUpTok, subjectID, bcnSlice, stepUpPrimary, cfg.stepUpSecretPrev, guard, cfg.stateStore) {
+				verifier.RecordDeniedRebindAudit(subjectID, bcnSlice, clientIP, "denied_invalid_stepup")
+				writeJSON(w, http.StatusForbidden, map[string]any{
+					"accepted": false,
+					"code":     prismid.ErrCodeRebindForbidden,
+					"error":    "valid single-use step_up_token (or previous_device_key proof) bound to subject_id and beacon_slice_id is required",
+				})
+				return
+			}
+		}
+
+		res, err := verifier.RebindDeviceKeyWithProof(r.Context(), req, ownerCheck, clientIP)
 		if err != nil {
 			status := http.StatusBadRequest
 			if vErr, ok := err.(*prismid.VerificationError); ok {
@@ -370,14 +783,19 @@ func newHTTPHandlerWithOptions(verifier *prismid.Verifier, riskGraph *prismid.Ri
 			writeJSON(w, status, map[string]any{"accepted": false, "error": err.Error()})
 			return
 		}
+		appendWAL(prismid.StateWALRecord{
+			Op:            prismid.WALOpRebind,
+			At:            time.Now().UTC(),
+			SubjectID:     subjectID,
+			BeaconSliceID: res.BeaconSliceID,
+			KeySliceID:    res.DeviceKeySliceID,
+		}, true)
 		writeJSON(w, http.StatusOK, res)
 	})
 
-	// Step-up authenticated spoof cooldown clearance endpoint (DeepSeek v1.0.1 P1 #2):
-	// Allows an account that passed out-of-band MFA/Passkey step-up to clear single-account spoof
-	// cooldown immediately while preserving permanent `HistoricalSpoof` (+1.5 log-odds) audit memory.
+	// Audited step-up spoof cooldown clearance endpoint (S2-10 single-use + S2-20 audit):
 	mux.HandleFunc("/api/v1/risk/clear-spoof", func(w http.ResponseWriter, r *http.Request) {
-		enableCORS(w, r, demoMode, corsOrigin)
+		enableCORS(w, r, cfg.demoMode, cfg.corsOrigin)
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return
@@ -386,11 +804,12 @@ func newHTTPHandlerWithOptions(verifier *prismid.Verifier, riskGraph *prismid.Ri
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
 			return
 		}
-		subjectID, authErr := extractVerifiedSubjectIDWithLegacy(r, demoMode, secret, allowLegacyTokens)
+		subjectID, authErr := extractVerifiedSubjectIDMultiKey(r, cfg.demoMode, authPrimary, cfg.authSecretPrev, cfg.allowLegacyTokens, guard)
 		if authErr || subjectID == "" {
 			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "verified subject identity required"})
 			return
 		}
+		clientIP := extractClientIP(r, allowProxyHeaders)
 		r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
 		var body struct {
 			StepUpToken string `json:"step_up_token"`
@@ -400,14 +819,23 @@ func newHTTPHandlerWithOptions(verifier *prismid.Verifier, riskGraph *prismid.Ri
 		if stepUpTok == "" {
 			stepUpTok = strings.TrimSpace(r.Header.Get("X-PrismID-StepUp-Token"))
 		}
-		if !VerifyStepUpToken(stepUpTok, subjectID, "clear_spoof", secret) {
+		if !verifyAndConsumeStepUpToken(stepUpTok, subjectID, "clear_spoof", stepUpPrimary, cfg.stepUpSecretPrev, guard, cfg.stateStore) {
+			verifier.RecordClearSpoofAudit(subjectID, clientIP, "denied_invalid_stepup")
 			writeJSON(w, http.StatusForbidden, map[string]any{
 				"accepted": false,
-				"error":    "valid step_up_token for clear_spoof is required",
+				"error":    "valid single-use step_up_token for clear_spoof is required",
 			})
 			return
 		}
-		cleared := riskGraph.ClearSubjectSpoofAfterStepUp(subjectID, time.Now().UTC())
+		clearedAt := time.Now().UTC()
+		cleared := verifier.ClearSubjectSpoofAudited(riskGraph, subjectID, clientIP, clearedAt)
+		if cleared {
+			appendWAL(prismid.StateWALRecord{
+				Op:        prismid.WALOpClearSpoof,
+				At:        clearedAt,
+				SubjectID: subjectID,
+			}, true)
+		}
 		writeJSON(w, http.StatusOK, map[string]any{
 			"subject_id":         subjectID,
 			"cleared":            cleared,
@@ -415,10 +843,8 @@ func newHTTPHandlerWithOptions(verifier *prismid.Verifier, riskGraph *prismid.Ri
 		})
 	})
 
-	// Explainability endpoint (DeepSeek #6): returns the full ComponentSnapshot, calibrated
-	// LogOddsScore, SharedSliceIDs, and human-readable EvidenceChain for a subject.
 	mux.HandleFunc("/api/v1/risk/explain", func(w http.ResponseWriter, r *http.Request) {
-		enableCORS(w, r, demoMode, corsOrigin)
+		enableCORS(w, r, cfg.demoMode, cfg.corsOrigin)
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return
@@ -427,7 +853,7 @@ func newHTTPHandlerWithOptions(verifier *prismid.Verifier, riskGraph *prismid.Ri
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
 			return
 		}
-		subjectID, authErr := extractVerifiedSubjectIDWithLegacy(r, demoMode, secret, allowLegacyTokens)
+		subjectID, authErr := extractVerifiedSubjectIDMultiKey(r, cfg.demoMode, authPrimary, cfg.authSecretPrev, cfg.allowLegacyTokens, guard)
 		if authErr || subjectID == "" {
 			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "verified subject identity required"})
 			return
@@ -436,10 +862,9 @@ func newHTTPHandlerWithOptions(verifier *prismid.Verifier, riskGraph *prismid.Ri
 		writeJSON(w, http.StatusOK, snap)
 	})
 
-	// Privacy erasure endpoint (DeepSeek #6 GDPR/CCPA): removes all graph edges AND TOFU key bindings
-	// for exclusively owned storage beacons of the subject.
+	// Complete GDPR/CCPA erasure endpoint (S2-21): purges graph edges, persistent ownership, AND TOFU bindings.
 	mux.HandleFunc("/api/v1/risk/subject", func(w http.ResponseWriter, r *http.Request) {
-		enableCORS(w, r, demoMode, corsOrigin)
+		enableCORS(w, r, cfg.demoMode, cfg.corsOrigin)
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return
@@ -448,13 +873,19 @@ func newHTTPHandlerWithOptions(verifier *prismid.Verifier, riskGraph *prismid.Ri
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
 			return
 		}
-		subjectID, authErr := extractVerifiedSubjectIDWithLegacy(r, demoMode, secret, allowLegacyTokens)
+		subjectID, authErr := extractVerifiedSubjectIDMultiKey(r, cfg.demoMode, authPrimary, cfg.authSecretPrev, cfg.allowLegacyTokens, guard)
 		if authErr || subjectID == "" {
 			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "verified subject identity required"})
 			return
 		}
-		removed, beacons := riskGraph.RemoveSubjectAndCollectBeacons(subjectID)
-		purgedBindings := verifier.ForgetBeacons(r.Context(), beacons...)
+		removed, purgedBindings := verifier.EraseSubject(r.Context(), riskGraph, subjectID, extractClientIP(r, allowProxyHeaders))
+		if removed || purgedBindings > 0 {
+			appendWAL(prismid.StateWALRecord{
+				Op:        prismid.WALOpEraseSubject,
+				At:        time.Now().UTC(),
+				SubjectID: subjectID,
+			}, true)
+		}
 		writeJSON(w, http.StatusOK, map[string]any{
 			"subject_id":          subjectID,
 			"deleted":             removed,
@@ -462,8 +893,198 @@ func newHTTPHandlerWithOptions(verifier *prismid.Verifier, riskGraph *prismid.Ri
 		})
 	})
 
+	// Admin endpoints for standalone deployments (S2-25, S3-52, S1-5): protected by X-PrismID-Admin-Secret.
+	requireAdmin := func(w http.ResponseWriter, r *http.Request) bool {
+		if len(cfg.adminSecret) == 0 {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "admin API disabled; configure -admin-secret or PRISMID_ADMIN_SECRET"})
+			return false
+		}
+		provided := strings.TrimSpace(r.Header.Get("X-PrismID-Admin-Secret"))
+		if provided == "" {
+			auth := strings.TrimSpace(r.Header.Get("Authorization"))
+			if strings.HasPrefix(strings.ToLower(auth), "bearer ") {
+				provided = strings.TrimSpace(auth[7:])
+			}
+		}
+		if len(provided) == 0 || subtle.ConstantTimeCompare([]byte(provided), cfg.adminSecret) != 1 {
+			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "invalid admin secret"})
+			return false
+		}
+		return true
+	}
+
+	mux.HandleFunc("/api/v1/risk/admin/mint-bearer", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
+			return
+		}
+		if !requireAdmin(w, r) {
+			return
+		}
+		r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
+		var body struct {
+			SubjectID  string `json:"subject_id"`
+			TTLSeconds int64  `json:"ttl_seconds"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || strings.TrimSpace(body.SubjectID) == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "subject_id is required"})
+			return
+		}
+		ttl := DefaultBearerTokenTTL
+		if body.TTLSeconds > 0 && body.TTLSeconds <= 30*86400 {
+			ttl = time.Duration(body.TTLSeconds) * time.Second
+		}
+		exp := time.Now().UTC().Add(ttl)
+		tok := SignSubjectBearerTokenWithExpiry(strings.TrimSpace(body.SubjectID), exp, authPrimary)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"subject_id": strings.TrimSpace(body.SubjectID),
+			"token":      tok,
+			"expires_at": exp.Unix(),
+		})
+	})
+
+	mux.HandleFunc("/api/v1/risk/admin/mint-step-up", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
+			return
+		}
+		if !requireAdmin(w, r) {
+			return
+		}
+		r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
+		var body struct {
+			SubjectID  string `json:"subject_id"`
+			Target     string `json:"target"`
+			BeaconID   string `json:"beacon_id"`
+			TTLSeconds int64  `json:"ttl_seconds"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || strings.TrimSpace(body.SubjectID) == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "subject_id is required"})
+			return
+		}
+		target := strings.TrimSpace(body.Target)
+		if target == "" && strings.TrimSpace(body.BeaconID) != "" {
+			target = strings.TrimSpace(body.BeaconID)
+		}
+		if target != "clear_spoof" && !strings.HasPrefix(target, "d_bcn_") {
+			derived, err := verifier.DeriveBeaconSliceID(target)
+			if err != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]any{"error": "target must be 'clear_spoof', a d_bcn_* slice ID, or a 32-char hex beacon_id"})
+				return
+			}
+			target = derived
+		}
+		ttl := DefaultStepUpTokenTTL
+		if body.TTLSeconds > 0 && body.TTLSeconds <= 3600 {
+			ttl = time.Duration(body.TTLSeconds) * time.Second
+		}
+		exp := time.Now().UTC().Add(ttl)
+		tok := SignStepUpTokenWithExpiry(strings.TrimSpace(body.SubjectID), target, exp, stepUpPrimary)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"subject_id":    strings.TrimSpace(body.SubjectID),
+			"target":        target,
+			"step_up_token": tok,
+			"expires_at":    exp.Unix(),
+			"single_use":    true,
+		})
+	})
+
+	mux.HandleFunc("/api/v1/risk/admin/revoke-token", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
+			return
+		}
+		if !requireAdmin(w, r) {
+			return
+		}
+		r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
+		var body struct {
+			Token      string `json:"token"`
+			SubjectID  string `json:"subject_id"`
+			TTLSeconds int64  `json:"ttl_seconds"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid request body"})
+			return
+		}
+		ttl := DefaultBearerTokenTTL
+		if body.TTLSeconds > 0 && body.TTLSeconds <= 30*86400 {
+			ttl = time.Duration(body.TTLSeconds) * time.Second
+		}
+		until := time.Now().UTC().Add(ttl).Unix()
+		var tokSHA string
+		if strings.TrimSpace(body.Token) != "" {
+			tokSHA = guard.revokeToken(body.Token, until)
+		}
+		revSub := strings.TrimSpace(body.SubjectID)
+		if revSub != "" {
+			guard.revokeSubject(revSub, until)
+		}
+		if tokSHA != "" || revSub != "" {
+			appendWAL(prismid.StateWALRecord{
+				Op:          prismid.WALOpRevokeToken,
+				At:          time.Now().UTC(),
+				SubjectID:   revSub,
+				TokenSHAHex: tokSHA,
+				ExpUnix:     until,
+			}, true)
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"revoked": true, "until_unix": until})
+	})
+
+	mux.HandleFunc("/api/v1/risk/admin/prune-graph", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
+			return
+		}
+		if !requireAdmin(w, r) {
+			return
+		}
+		prunedAt := time.Now().UTC()
+		pruned := riskGraph.PruneExpired(prunedAt)
+		if cfg.stateStore != nil {
+			if err := cfg.stateStore.Compact(r.Context(), riskGraph, cfg.memStore, guard.exportSnapshot(prunedAt.Unix())); err != nil {
+				writeJSON(w, http.StatusInternalServerError, map[string]any{
+					"pruned_subjects": pruned,
+					"error":           "state compaction failed: " + err.Error(),
+				})
+				return
+			}
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"pruned_subjects": pruned,
+			"stats":           riskGraph.Stats(),
+		})
+	})
+
+	mux.HandleFunc("/api/v1/risk/admin/flush-state", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
+			return
+		}
+		if !requireAdmin(w, r) {
+			return
+		}
+		if cfg.stateStore == nil {
+			writeJSON(w, http.StatusOK, map[string]any{"flushed": false, "reason": "no state_file configured"})
+			return
+		}
+		if err := cfg.stateStore.Compact(r.Context(), riskGraph, cfg.memStore, guard.exportSnapshot(time.Now().UTC().Unix())); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{
+				"flushed":        false,
+				"persist_errors": cfg.stateStore.PersistErrors(),
+				"error":          err.Error(),
+			})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"flushed":        true,
+			"persist_errors": cfg.stateStore.PersistErrors(),
+		})
+	})
+
 	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
-		if !demoMode {
+		if !cfg.demoMode {
 			writeJSON(w, http.StatusNotFound, map[string]any{"error": "demo console disabled"})
 			return
 		}
@@ -475,7 +1096,7 @@ func newHTTPHandlerWithOptions(verifier *prismid.Verifier, riskGraph *prismid.Ri
 		if strings.HasPrefix(r.URL.Path, "/api/") && r.Method != http.MethodOptions {
 			clientIP := extractClientIP(r, allowProxyHeaders)
 			if !limiter.allow(clientIP, time.Now()) {
-				enableCORS(w, r, demoMode, corsOrigin)
+				enableCORS(w, r, cfg.demoMode, cfg.corsOrigin)
 				writeJSON(w, http.StatusTooManyRequests, map[string]any{
 					"accepted": false,
 					"error":    "rate limit exceeded",
@@ -516,74 +1137,122 @@ func deriveStepUpAuthKey(secret []byte) []byte {
 	return sum[:]
 }
 
-// SignStepUpTokenWithExpiry creates a short-lived domain-separated HMAC-SHA256 step-up token
-// bound to a specific `(subjectID, target)` pair (e.g. `target = d_bcn_*` or `"clear_spoof"`).
-func SignStepUpTokenWithExpiry(subjectID, target string, expiresAt time.Time, secret []byte) string {
-	expStr := strconv.FormatInt(expiresAt.UTC().Unix(), 10)
-	mac := hmac.New(sha256.New, deriveStepUpAuthKey(secret))
-	mac.Write([]byte("prismid-stepup-v1|" + subjectID + "|" + target + "|" + expStr))
-	return "stepup_v1." + expStr + "." + hex.EncodeToString(mac.Sum(nil))
+func canonicalStepUpPayloadV2(subjectID, target, jtiHex, expStr string) []byte {
+	// S2-22: Length-prefixed encoding eliminates delimiter ambiguity even when subjectID contains '|' or '.'.
+	return []byte(fmt.Sprintf("prismid-stepup-v2|%d:%s|%d:%s|%s|%s", len(subjectID), subjectID, len(target), target, jtiHex, expStr))
 }
 
-// SignStepUpToken creates a 5-minute (`DefaultStepUpTokenTTL`) step-up token for `(subjectID, target)`.
+// SignStepUpTokenWithExpiry creates a short-lived, single-use, length-prefixed HMAC-SHA256 step-up
+// token bound to `(subjectID, target)` with a 128-bit random JTI (`stepup_v2.<jti>.<exp>.<hmac>`).
+func SignStepUpTokenWithExpiry(subjectID, target string, expiresAt time.Time, secret []byte) string {
+	var jtiBytes [16]byte
+	_, _ = rand.Read(jtiBytes[:])
+	jtiHex := hex.EncodeToString(jtiBytes[:])
+	expStr := strconv.FormatInt(expiresAt.UTC().Unix(), 10)
+	mac := hmac.New(sha256.New, deriveStepUpAuthKey(secret))
+	mac.Write(canonicalStepUpPayloadV2(subjectID, target, jtiHex, expStr))
+	return "stepup_v2." + jtiHex + "." + expStr + "." + hex.EncodeToString(mac.Sum(nil))
+}
+
+// SignStepUpToken creates a 5-minute (`DefaultStepUpTokenTTL`) single-use step-up token for `(subjectID, target)`.
 func SignStepUpToken(subjectID, target string, secret []byte) string {
 	return SignStepUpTokenWithExpiry(subjectID, target, time.Now().UTC().Add(DefaultStepUpTokenTTL), secret)
 }
 
-// VerifyStepUpToken validates a domain-separated step-up token's HMAC signature, expiration,
-// subject binding, and action/beacon target binding.
-func VerifyStepUpToken(token, expectedSubjectID, expectedTarget string, secret []byte) bool {
+func parseAndVerifyStepUpToken(token, expectedSubjectID, expectedTarget string, secret []byte, nowUnix int64) (jti string, expUnix int64, ok bool) {
 	trimmed := strings.TrimSpace(token)
-	if !strings.HasPrefix(trimmed, "stepup_v1.") || expectedSubjectID == "" || expectedTarget == "" {
-		return false
+	if !strings.HasPrefix(trimmed, "stepup_v2.") || expectedSubjectID == "" || expectedTarget == "" || len(secret) == 0 {
+		return "", 0, false
 	}
-	rest := trimmed[len("stepup_v1."):]
-	dot := strings.IndexByte(rest, '.')
-	if dot <= 0 || dot >= len(rest)-1 {
-		return false
+	parts := strings.Split(trimmed, ".")
+	if len(parts) != 4 {
+		return "", 0, false
 	}
-	expStr := rest[:dot]
-	sigHex := rest[dot+1:]
-	expUnix, err := strconv.ParseInt(expStr, 10, 64)
-	if err != nil || time.Now().UTC().Unix() > expUnix {
-		return false
+	jtiHex, expStr, sigHex := parts[1], parts[2], parts[3]
+	if len(jtiHex) < 16 {
+		return "", 0, false
+	}
+	exp, err := strconv.ParseInt(expStr, 10, 64)
+	if err != nil || nowUnix > exp {
+		return "", 0, false
 	}
 	sigBytes, err := hex.DecodeString(sigHex)
 	if err != nil {
-		return false
+		return "", 0, false
 	}
 	mac := hmac.New(sha256.New, deriveStepUpAuthKey(secret))
-	mac.Write([]byte("prismid-stepup-v1|" + expectedSubjectID + "|" + expectedTarget + "|" + expStr))
-	return hmac.Equal(sigBytes, mac.Sum(nil))
+	mac.Write(canonicalStepUpPayloadV2(expectedSubjectID, expectedTarget, jtiHex, expStr))
+	if !hmac.Equal(sigBytes, mac.Sum(nil)) {
+		return "", 0, false
+	}
+	return jtiHex, exp, true
 }
 
-// SignSubjectBearerTokenWithExpiry creates an expiring HMAC-SHA256 authenticated bearer token:
-// `<subject_id>.<exp_unix_sec>.<hex(HMAC_SHA256(subkey, "prismid-auth-v2|" + subject_id + "|" + exp_unix_sec))>`.
+// VerifyStepUpToken validates a step-up token's HMAC signature, expiration, and length-prefixed `(subjectID, target)` binding.
+func VerifyStepUpToken(token, expectedSubjectID, expectedTarget string, secret []byte) bool {
+	_, _, ok := parseAndVerifyStepUpToken(token, expectedSubjectID, expectedTarget, secret, time.Now().UTC().Unix())
+	return ok
+}
+
+func verifyAndConsumeStepUpToken(token, expectedSubjectID, expectedTarget string, primarySecret, prevSecret []byte, guard *replayAndRevocationGuard, stateStore *prismid.FileStateStore) bool {
+	nowUnix := time.Now().UTC().Unix()
+	jti, expUnix, ok := parseAndVerifyStepUpToken(token, expectedSubjectID, expectedTarget, primarySecret, nowUnix)
+	if !ok && len(prevSecret) > 0 {
+		jti, expUnix, ok = parseAndVerifyStepUpToken(token, expectedSubjectID, expectedTarget, prevSecret, nowUnix)
+	}
+	if !ok {
+		return false
+	}
+	if guard != nil && !guard.consumeStepUpJTI(jti, expUnix, nowUnix) {
+		return false
+	}
+	if stateStore != nil {
+		_ = stateStore.AppendWAL(prismid.StateWALRecord{
+			Op:      prismid.WALOpConsumeStepUp,
+			At:      time.Unix(nowUnix, 0).UTC(),
+			JTI:     jti,
+			ExpUnix: expUnix,
+		}, true)
+	}
+	return true
+}
+
+func canonicalBearerPayloadV2(subjectID, expStr string) []byte {
+	return []byte(fmt.Sprintf("prismid-auth-v2|%d:%s|%s", len(subjectID), subjectID, expStr))
+}
+
+// SignSubjectBearerTokenWithExpiry creates an expiring, length-prefixed HMAC-SHA256 bearer token:
+// `<subject_id>.<exp_unix_sec>.<hex(HMAC_SHA256)>`.
 func SignSubjectBearerTokenWithExpiry(subjectID string, expiresAt time.Time, secret []byte) string {
 	expStr := strconv.FormatInt(expiresAt.UTC().Unix(), 10)
 	mac := hmac.New(sha256.New, deriveBearerAuthKey(secret))
-	mac.Write([]byte("prismid-auth-v2|" + subjectID + "|" + expStr))
+	mac.Write(canonicalBearerPayloadV2(subjectID, expStr))
 	return subjectID + "." + expStr + "." + hex.EncodeToString(mac.Sum(nil))
 }
 
-// SignSubjectBearerToken creates an HMAC-SHA256 authenticated bearer token for a subject
-// with a default 24-hour expiration TTL (`DefaultBearerTokenTTL`).
+// SignSubjectBearerToken creates an HMAC-SHA256 authenticated bearer token for a subject (24h TTL).
 func SignSubjectBearerToken(subjectID string, secret []byte) string {
 	return SignSubjectBearerTokenWithExpiry(subjectID, time.Now().UTC().Add(DefaultBearerTokenTTL), secret)
 }
 
-// extractVerifiedSubjectID extracts and authenticates the caller's subject identifier,
-// rejecting legacy non-expiring `<subject_id>.<hmac>` tokens by default (DeepSeek v1.0.1 P2 #5).
 func extractVerifiedSubjectID(r *http.Request, demoMode bool, hmacSecret []byte) (string, bool) {
 	return extractVerifiedSubjectIDWithLegacy(r, demoMode, hmacSecret, false)
 }
 
-// extractVerifiedSubjectIDWithLegacy extracts and authenticates the caller's subject identifier.
-//   - When demoMode=true: accepts ?subject_id= or Bearer tokens for interactive lab testing.
-//   - When demoMode=false: ignores ?subject_id= and strictly requires Authorization to be a valid,
-//     unexpired HMAC-SHA256 signed v2 token `Bearer <subject_id>.<exp_unix>.<hmac_sha256_hex>`.
-//     Legacy static `<subject_id>.<hmac_sha256_hex>` tokens are rejected unless allowLegacyTokens=true.
 func extractVerifiedSubjectIDWithLegacy(r *http.Request, demoMode bool, hmacSecret []byte, allowLegacyTokens bool) (string, bool) {
+	return extractVerifiedSubjectIDMultiKey(r, demoMode, hmacSecret, nil, allowLegacyTokens, nil)
+}
+
+func verifyBearerV2WithSecret(sid, expStr string, sigBytes, secret []byte) bool {
+	if len(secret) == 0 {
+		return false
+	}
+	mac := hmac.New(sha256.New, deriveBearerAuthKey(secret))
+	mac.Write(canonicalBearerPayloadV2(sid, expStr))
+	return hmac.Equal(sigBytes, mac.Sum(nil))
+}
+
+func extractVerifiedSubjectIDMultiKey(r *http.Request, demoMode bool, primarySecret, prevSecret []byte, allowLegacyTokens bool, guard *replayAndRevocationGuard) (string, bool) {
 	if demoMode {
 		if q := strings.TrimSpace(r.URL.Query().Get("subject_id")); q != "" {
 			return q, false
@@ -606,31 +1275,32 @@ func extractVerifiedSubjectIDWithLegacy(r *http.Request, demoMode bool, hmacSecr
 		}
 		return "", true
 	}
+	nowUnix := time.Now().UTC().Unix()
 	if lastDot := strings.LastIndexByte(rawToken, '.'); lastDot > 0 && lastDot < len(rawToken)-1 {
 		prefix := rawToken[:lastDot]
 		sigHex := rawToken[lastDot+1:]
 		sigBytes, err := hex.DecodeString(sigHex)
 		if err == nil {
-			// Check v2 expiring token format: <subject_id>.<exp_unix>.<hmac>
 			if expDot := strings.LastIndexByte(prefix, '.'); expDot > 0 && expDot < len(prefix)-1 {
 				sid := prefix[:expDot]
 				expStr := prefix[expDot+1:]
 				if expUnix, parseErr := strconv.ParseInt(expStr, 10, 64); parseErr == nil {
-					mac := hmac.New(sha256.New, deriveBearerAuthKey(hmacSecret))
-					mac.Write([]byte("prismid-auth-v2|" + sid + "|" + expStr))
-					if hmac.Equal(sigBytes, mac.Sum(nil)) {
-						if time.Now().UTC().Unix() > expUnix {
+					if verifyBearerV2WithSecret(sid, expStr, sigBytes, primarySecret) ||
+						verifyBearerV2WithSecret(sid, expStr, sigBytes, prevSecret) {
+						if nowUnix > expUnix || guard.isRevoked(rawToken, sid, nowUnix) {
 							return "", true
 						}
 						return sid, false
 					}
 				}
 			}
-			// Legacy static HMAC format: <subject_id>.<hmac> (disabled by default in v1.0.1+)
 			if allowLegacyTokens {
-				mac := hmac.New(sha256.New, deriveBearerAuthKey(hmacSecret))
+				mac := hmac.New(sha256.New, deriveBearerAuthKey(primarySecret))
 				mac.Write([]byte("prismid-auth|" + prefix))
 				if hmac.Equal(sigBytes, mac.Sum(nil)) {
+					if guard.isRevoked(rawToken, prefix, nowUnix) {
+						return "", true
+					}
 					return prefix, false
 				}
 			}
@@ -653,7 +1323,7 @@ func enableCORS(w http.ResponseWriter, r *http.Request, demoMode bool, configure
 		w.Header().Set("Access-Control-Allow-Origin", origin)
 	}
 	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Forwarded-For, X-PrismID-StepUp-Token")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Forwarded-For, X-PrismID-StepUp-Token, X-PrismID-Admin-Secret")
 }
 
 func writeJSON(w http.ResponseWriter, status int, payload any) {
@@ -742,7 +1412,7 @@ const standaloneIndexHTML = `<!DOCTYPE html>
       const verifyResult = await idRes.json();
       document.getElementById('server-out').textContent = JSON.stringify({
         simulated_proxy_ip: randomIp,
-        note: 'Notice that gpu_audio_slice_id (d_gpu_*) remains 100% identical despite new IP & mutated Canvas/Fonts/Screen!',
+        note: 'Notice that gpu_audio_slice_id (d_gpu_*) remains identical despite new IP & mutated Canvas/Fonts/Screen!',
         result: verifyResult,
       }, null, 2);
     };

@@ -15,6 +15,7 @@ export interface AudioProbeResult {
   audio_copy_hash: string
   audio_silent_delta: number
   audio_noise_injected: boolean
+  audio_muted: boolean
 }
 
 export async function collectAudioProbeWithTrap(timeoutMs = 400): Promise<AudioProbeResult> {
@@ -36,6 +37,7 @@ export async function collectAudioProbeWithTrap(timeoutMs = 400): Promise<AudioP
       audio_copy_hash: fallbackHash,
       audio_silent_delta: 0,
       audio_noise_injected: false,
+      audio_muted: false,
     }
   }
 
@@ -54,6 +56,7 @@ export async function collectAudioProbeWithTrap(timeoutMs = 400): Promise<AudioP
         audio_copy_hash: timeoutHash,
         audio_silent_delta: 0,
         audio_noise_injected: false,
+        audio_muted: false,
       })
     }, timeoutMs)
 
@@ -70,13 +73,6 @@ export async function collectAudioProbeWithTrap(timeoutMs = 400): Promise<AudioP
       comp.attack.setValueAtTime(0, ctx.currentTime)
       comp.release.setValueAtTime(0.25, ctx.currentTime)
 
-      // Start oscillator at sample ~44 (t = 0.001s) so frames [0..16) are a mathematically
-      // guaranteed silent prefix (0.0), while [4500..5000) is fully steady-state compressed!
-      // Wait: to keep 100% hash compatibility for [4500..5000), we keep osc.start(0) on ctx
-      // and check:
-      //  1) Repeat-read determinism: buffer.getChannelData(0) read twice
-      //  2) Cross-surface readback: buffer.getChannelData(0) vs buffer.copyFromChannel()
-      //  3) Unconnected tail / silent channel check via a 2-channel context where channel 1 is silent!
       osc.connect(comp)
       comp.connect(ctx.destination)
       osc.start(0)
@@ -89,6 +85,7 @@ export async function collectAudioProbeWithTrap(timeoutMs = 400): Promise<AudioP
         }
 
         let noiseInjected = false
+        let copyMismatch = false
         let copyAcc = ''
         let silentDelta = 0
 
@@ -100,6 +97,7 @@ export async function collectAudioProbeWithTrap(timeoutMs = 400): Promise<AudioP
             for (let i = 0; i < 500; i++) {
               if (copySlice[i] !== sliceA[i]) {
                 noiseInjected = true
+                copyMismatch = true
               }
               copyAcc += copySlice[i].toFixed(7) + ','
             }
@@ -132,7 +130,10 @@ export async function collectAudioProbeWithTrap(timeoutMs = 400): Promise<AudioP
           // ignore
         }
 
-        // Trap 4: Realistic magnitude & NaN/Infinity check
+        // Trap 4: Realistic magnitude & NaN/Infinity check.
+        // Note: An all-zero buffer (`nonZeroCount === 0`) occurs legitimately on muted enterprise
+        // policies, Lockdown Mode, or privacy-hardened browsers; record `audio_muted: true`
+        // instead of falsely accusing the user of audio noise injection (S3-37).
         let nonZeroCount = 0
         let acc = ''
         for (let i = 0; i < 500; i++) {
@@ -143,18 +144,23 @@ export async function collectAudioProbeWithTrap(timeoutMs = 400): Promise<AudioP
           if (v !== 0) nonZeroCount++
           acc += v.toFixed(7) + ','
         }
-        if (nonZeroCount === 0) {
-          noiseInjected = true
-        }
 
-        const primaryHash = sha256Hex(acc)
-        const copyHash = copyAcc ? sha256Hex(copyAcc) : primaryHash
+        const audioMuted = nonZeroCount === 0 && !noiseInjected
+        const primaryHash = audioMuted
+          ? sha256Hex('prismid-audio-output-muted')
+          : sha256Hex(acc)
+        const copyHash = audioMuted && !copyMismatch
+          ? primaryHash
+          : copyAcc
+            ? sha256Hex(copyAcc)
+            : primaryHash
 
         return {
           audio_compressor_hash: primaryHash,
           audio_copy_hash: copyHash,
           audio_silent_delta: silentDelta,
           audio_noise_injected: noiseInjected,
+          audio_muted: audioMuted,
         }
       }
 
@@ -173,6 +179,7 @@ export async function collectAudioProbeWithTrap(timeoutMs = 400): Promise<AudioP
               audio_copy_hash: rejHash,
               audio_silent_delta: 0,
               audio_noise_injected: false,
+              audio_muted: false,
             })
           })
       } else {
@@ -189,6 +196,7 @@ export async function collectAudioProbeWithTrap(timeoutMs = 400): Promise<AudioP
         audio_copy_hash: excHash,
         audio_silent_delta: 0,
         audio_noise_injected: false,
+        audio_muted: false,
       })
     }
   })

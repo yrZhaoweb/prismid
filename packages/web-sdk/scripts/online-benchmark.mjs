@@ -9,7 +9,7 @@ import { chromium } from 'playwright-core'
 const CHROME_MAC_PATH = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
 
 async function startLocalPrismServer(port) {
-  const proc = spawn('go', ['run', './cmd/prismid-server', '-addr', `127.0.0.1:${port}`], {
+  const proc = spawn('go', ['run', './cmd/prismid-server', '-addr', `127.0.0.1:${port}`, '-demo-mode=true'], {
     cwd: new URL('../../../server/go', import.meta.url).pathname,
     stdio: ['ignore', 'pipe', 'pipe'],
     detached: true,

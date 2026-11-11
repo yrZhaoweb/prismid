@@ -122,7 +122,13 @@ func VerifyGPURegisterLaws(payload *ProbePayload) []string {
 		if lineWidthRange != "1,1" {
 			violations = append(violations, "gpu_register_law_violation:apple_gpu_invalid_line_width")
 		}
-		if maxTexSize < 16384 {
+		// Mozilla Firefox (Gecko `dom.webgl.sanitize-Capabilities`) clamps WebGL1 MAX_TEXTURE_SIZE
+		// to 8192 on Apple Silicon (`"Apple M1, or similar"`), whereas Chromium/WebKit report 16384 (S2-17).
+		minAppleTexSize := 16384
+		if strings.Contains(uaLower, "firefox/") || strings.Contains(uaLower, "fxios/") || strings.Contains(rendererLower, "or similar") {
+			minAppleTexSize = 8192
+		}
+		if maxTexSize < minAppleTexSize {
 			violations = append(violations, "gpu_register_law_violation:apple_gpu_texture_size_below_16384")
 		}
 		if strings.Contains(rendererLower, "direct3d") || strings.Contains(rendererLower, "d3d11") {

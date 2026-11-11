@@ -1063,9 +1063,17 @@ func TestDeepSeek_6_ExplainabilityEvidenceChainAndPrivacyDeletion(t *testing.T) 
 	}
 	graph.RecordVerification("user_del_1", t0, res)
 	snap2 := graph.RecordVerification("user_del_2", t0.Add(time.Minute), res)
-	if snap2.RiskStatus != RiskStatusRed || len(snap2.EvidenceChain) == 0 || snap2.LogOddsScore <= 0 {
-		t.Fatalf("expected red verdict with positive LogOddsScore and non-empty EvidenceChain, got %+v", snap2)
+	// S1-2: Default HardAnchorPolicySharedStepUp elevates clean 2-user Web profile to yellow+pending with full EvidenceChain
+	if snap2.RiskStatus != RiskStatusYellow || !snap2.RiskPending || len(snap2.EvidenceChain) == 0 || snap2.LogOddsScore <= 0 {
+		t.Fatalf("expected yellow+pending verdict under default shared_step_up policy with positive LogOddsScore and EvidenceChain, got %+v", snap2)
 	}
+	// Under strict_1to1 policy, 2nd account on shared beacon is red:
+	graph.SetHardAnchorPolicy(HardAnchorPolicyStrictOneToOne)
+	snap2Strict := graph.EvaluateSubject("user_del_2")
+	if snap2Strict.RiskStatus != RiskStatusRed || len(snap2Strict.EvidenceChain) == 0 || snap2Strict.LogOddsScore <= 0 {
+		t.Fatalf("expected red verdict under strict_1to1 policy with positive LogOddsScore and non-empty EvidenceChain, got %+v", snap2Strict)
+	}
+	graph.SetHardAnchorPolicy(HardAnchorPolicySharedStepUp)
 
 	// Erase user_del_1 via GDPR/CCPA RemoveSubject:
 	if !graph.RemoveSubject("user_del_1") {

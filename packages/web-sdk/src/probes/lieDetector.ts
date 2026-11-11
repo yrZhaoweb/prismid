@@ -2,25 +2,26 @@
  * PrismID JS Engine FDLIBM `Math` Constants & Prototype Chain Lie Detector
  *
  * 1. Evaluates boundary floating-point transcendental functions (`Math.acos`, `Math.acosh`,
- *    `Math.sinh`, `Math.tan`, `Math.expm1`, `Math.cbrt`) to identify the underlying JS engine
- *    (V8 vs. JavaScriptCore vs. SpiderMonkey) in 0.01ms, catching spoofed User-Agent headers.
+ *    `Math.sinh`, `Math.tan`, `Math.expm1`, `Math.cbrt`), verifies IEEE-754 exactness and
+ *    repeat-call determinism (`unknown_tampered_math`), and identifies the underlying JS engine
+ *    (V8 vs. JavaScriptCore vs. SpiderMonkey), catching spoofed User-Agent headers.
  * 2. Uses `Function.prototype.toString.call(fn)` and `Object.getOwnPropertyDescriptor`
- *    to detect monkey-patched browser APIs and `Proxy` wrappers.
+ *    to detect monkey-patched browser APIs and `Proxy` wrappers while staying compatible with
+ *    frozen-intrinsic (SES/Lockdown) environments.
  * 3. Checks `navigator.webdriver` and CDP/automation globals.
  */
 
 import { sha256Hex } from '../crypto/aead.js'
 
 export interface LieDetectorResult {
-  math_engine_signature: 'v8' | 'jsc' | 'spidermonkey' | 'unknown'
+  math_engine_signature: 'v8' | 'jsc' | 'spidermonkey' | 'unknown_tampered_math' | 'unknown'
   math_constants_hash: string
   prototype_lies: string[]
   automation_flags: string[]
 }
 
-export function collectLieDetectorProbe(): LieDetectorResult {
-  // 1. FDLIBM Math floating-point boundary fingerprint
-  const mValues = [
+function sampleMathConstants(): number[] {
+  return [
     Math.acos(0.12345678910111213),
     Math.acosh(1e300),
     Math.asin(0.12345678910111213),
@@ -34,45 +35,74 @@ export function collectLieDetectorProbe(): LieDetectorResult {
     Math.sinh(1),
     Math.tan(-1e300),
   ]
+}
+
+export function collectLieDetectorProbe(): LieDetectorResult {
+  // 1. FDLIBM Math floating-point boundary fingerprint + active tamper check (S3-29)
+  const mValues = sampleMathConstants()
+  const mValuesRepeat = sampleMathConstants()
   const mathConstantsHash = sha256Hex(mValues.map((n) => String(n)).join('|')).slice(0, 32)
 
-  // Determine JS engine family from runtime intrinsics & error formatting
-  let mathEngineSignature: 'v8' | 'jsc' | 'spidermonkey' | 'unknown' = 'unknown'
+  let mathTampered =
+    Math.cos(0) !== 1 ||
+    Math.sin(0) !== 0 ||
+    Math.atan2(0, 1) !== 0 ||
+    Math.expm1(0) !== 0 ||
+    Math.log1p(0) !== 0 ||
+    mValues.some((v) => !Number.isFinite(v))
+
+  if (!mathTampered) {
+    for (let i = 0; i < mValues.length; i++) {
+      if (mValues[i] !== mValuesRepeat[i]) {
+        mathTampered = true
+        break
+      }
+    }
+  }
+
+  // Determine JS engine family from stack-frame grammar & engine-exclusive intrinsics.
+  // Note: Safari 18.2+ (JSC) and Firefox 135+ (SpiderMonkey) also expose `Error.captureStackTrace`,
+  // so we NEVER rely on `'captureStackTrace' in Error` alone (S2-17)!
+  let mathEngineSignature: LieDetectorResult['math_engine_signature'] = 'unknown'
   try {
     const errStack = new Error().stack || ''
-    if ('captureStackTrace' in Error) {
+    const hasV8AtFrames = /^\s*(?:Error|TypeError)\b[\s\S]*\n\s+at\s+/m.test(errStack)
+    const g = globalThis as Record<string, unknown>
+    if (hasV8AtFrames) {
       mathEngineSignature = 'v8'
-    } else if (errStack.includes('@') && typeof (globalThis as Record<string, unknown>).mozInnerScreenX !== 'undefined') {
+    } else if (
+      typeof g.InternalError === 'function' ||
+      typeof g.mozInnerScreenX !== 'undefined'
+    ) {
       mathEngineSignature = 'spidermonkey'
     } else if (errStack.includes('@')) {
       mathEngineSignature = 'jsc'
-    } else {
+    } else if ('captureStackTrace' in Error) {
       mathEngineSignature = 'v8'
     }
   } catch {
     mathEngineSignature = 'unknown'
   }
 
-  // 2. Prototype chain & native function integrity inspection (CreepJS `getPrototypeLies` grade)
+  // 2. Prototype chain & native function integrity inspection
   const prototypeLies: string[] = []
   const fnToString = Function.prototype.toString
 
-  const checkNativeFunction = (fn: unknown, label: string, expectedName?: string) => {
-    if (typeof fn !== 'function') return
+  const checkNativeFunction = (fn: unknown, label: string, expectedName?: string): boolean => {
+    if (typeof fn !== 'function') return false
+    const beforeLen = prototypeLies.length
     try {
       const str = fnToString.call(fn)
       if (!/\{\s*\[native code\]\s*\}/.test(str)) {
         prototypeLies.push(`${label}:non_native_toString`)
       }
-      // Check if function itself has an own `toString` or `name` override
       if (Object.prototype.hasOwnProperty.call(fn, 'toString')) {
         prototypeLies.push(`${label}:own_toString_override`)
       }
-      // Native WebIDL methods & getters never have a `.prototype` property (`'prototype' in fn === false`)
+      // Native WebIDL methods, getters & Math functions do not have a `.prototype` property
       if ('prototype' in fn) {
         prototypeLies.push(`${label}:has_prototype_property`)
       }
-      // Check expected function `.name` (e.g. `'get userAgent'` or `'userAgent'` for native getters)
       if (
         expectedName &&
         fn.name !== expectedName &&
@@ -80,54 +110,57 @@ export function collectLieDetectorProbe(): LieDetectorResult {
       ) {
         prototypeLies.push(`${label}:unexpected_name_${fn.name || 'empty'}`)
       }
-      // Native function .toString reference identity invariant:
-      // Apify fingerprint-injector's redirectToString attaches a `get(target, 'toString')` trap
-      // that returns a freshly allocated `new Proxy(target.toString, ...)` on each access.
       if (fn.toString !== fnToString || fn.toString !== fn.toString) {
         prototypeLies.push(`${label}:toString_proxy_getter`)
       }
-      // Non-cyclic prototype identity invariant:
-      // Setting a native function's prototype to its own current prototype (`origProto`) MUST
-      // succeed (`Reflect.setPrototypeOf(fn, origProto) === true`) and NEVER throw.
-      // Apify fingerprint-injector's `redirectToString` unconditionally throws `Cyclic __proto__ value`
-      // or returns `false` inside its `setPrototypeOf` trap even for non-cyclic `origProto`!
-      const origProto = Object.getPrototypeOf(fn)
-      try {
-        if (Reflect.setPrototypeOf(fn, origProto) !== true) {
-          prototypeLies.push(`${label}:non_cyclic_setPrototypeOf_rejected`)
-        }
-        Object.setPrototypeOf(fn, origProto)
-      } catch {
-        prototypeLies.push(`${label}:fake_cyclic_proto_trap`)
-      }
-      // ECMAScript §10.1.2.1 OrdinarySetPrototypeOf cyclic __proto__ invariant:
-      // Calling `Object.setPrototypeOf(fn, Object.create(fn))` on any genuine function MUST
-      // throw `TypeError: Cyclic __proto__ value` because `SameValue(p, O)` matches `fn`.
-      // On an ES6 `new Proxy(target, handler)`, `[[SetPrototypeOf]]` forwards to `target` while
-      // `Object.create(proxy)` links to `proxy` (`SameValue(proxy, target) === false`), so it
-      // succeeds without throwing (or triggers a custom `setPrototypeOf` trap)!
-      try {
-        Object.setPrototypeOf(fn, Object.create(fn))
-        prototypeLies.push(`${label}:es6_proxy_detected`)
-      } catch (err) {
-        const stack = (err as Error)?.stack || ''
-        if (stack.includes('Proxy.')) {
-          prototypeLies.push(`${label}:proxy_setPrototypeOf_trap`)
-        }
-      } finally {
+      // Guard setPrototypeOf probes with `Object.isExtensible(fn)` so SES / Lockdown
+      // frozen-intrinsics environments never suffer false positives (S2-17).
+      if (Object.isExtensible(fn)) {
+        const origProto = Object.getPrototypeOf(fn)
         try {
+          if (Reflect.setPrototypeOf(fn, origProto) !== true) {
+            prototypeLies.push(`${label}:non_cyclic_setPrototypeOf_rejected`)
+          }
           Object.setPrototypeOf(fn, origProto)
         } catch {
-          // ignore
+          prototypeLies.push(`${label}:fake_cyclic_proto_trap`)
+        }
+        try {
+          Object.setPrototypeOf(fn, Object.create(fn))
+          prototypeLies.push(`${label}:es6_proxy_detected`)
+        } catch (err) {
+          const stack = (err as Error)?.stack || ''
+          if (stack.includes('Proxy.')) {
+            prototypeLies.push(`${label}:proxy_setPrototypeOf_trap`)
+          }
+        } finally {
+          try {
+            Object.setPrototypeOf(fn, origProto)
+          } catch {
+            // ignore
+          }
         }
       }
     } catch {
       prototypeLies.push(`${label}:proxy_toString_trap`)
     }
+    return prototypeLies.length > beforeLen
   }
 
   try {
     checkNativeFunction(Function.prototype.toString, 'Function.toString', 'toString')
+
+    // Verify Math transcendental functions have not been monkey-patched or proxied (S3-29)
+    if (
+      checkNativeFunction(Math.acos, 'Math.acos', 'acos') ||
+      checkNativeFunction(Math.sin, 'Math.sin', 'sin') ||
+      checkNativeFunction(Math.cos, 'Math.cos', 'cos') ||
+      checkNativeFunction(Math.tan, 'Math.tan', 'tan') ||
+      checkNativeFunction(Math.expm1, 'Math.expm1', 'expm1')
+    ) {
+      mathTampered = true
+    }
+
     if (typeof HTMLCanvasElement !== 'undefined') {
       checkNativeFunction(HTMLCanvasElement.prototype.toDataURL, 'HTMLCanvasElement.toDataURL', 'toDataURL')
       checkNativeFunction(HTMLCanvasElement.prototype.getContext, 'HTMLCanvasElement.getContext', 'getContext')
@@ -198,7 +231,7 @@ export function collectLieDetectorProbe(): LieDetectorResult {
     if (typeof AudioBuffer !== 'undefined') {
       checkNativeFunction(
         AudioBuffer.prototype.getChannelData,
-        'AudioBuffer.getChannelData',
+        'AudioBuffer.prototype.getChannelData',
         'getChannelData'
       )
       if (typeof AudioBuffer.prototype.copyFromChannel === 'function') {
@@ -227,8 +260,6 @@ export function collectLieDetectorProbe(): LieDetectorResult {
       for (const prop of navProps) {
         const desc = Object.getOwnPropertyDescriptor(Navigator.prototype, prop)
         if (!desc) {
-          // Standard cross-browser WebIDL Navigator properties (excluding Chromium-only deviceMemory)
-          // exist on Navigator.prototype unless deleted (e.g. stealth `delete Navigator.prototype.webdriver`).
           if (prop !== 'deviceMemory') {
             prototypeLies.push(`Navigator.${prop}:descriptor_deleted`)
           }
@@ -236,8 +267,6 @@ export function collectLieDetectorProbe(): LieDetectorResult {
           prototypeLies.push(`Navigator.${prop}:data_descriptor_override`)
         } else {
           checkNativeFunction(desc.get, `Navigator.${prop}.get`, `get ${prop}`)
-          // Getter Arity Probe (catches Apify fingerprint-injector `getterValue` proxy which returns
-          // spoofed value only when `args.length === 0` and falls back to native when `args.length > 0`).
           if (
             typeof navigator !== 'undefined' &&
             prop !== 'plugins' &&
@@ -283,6 +312,10 @@ export function collectLieDetectorProbe(): LieDetectorResult {
     }
   } catch {
     // ignore
+  }
+
+  if (mathTampered) {
+    mathEngineSignature = 'unknown_tampered_math'
   }
 
   // 3. Automation / WebDriver / CDP flags

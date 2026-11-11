@@ -5,12 +5,10 @@
  * 1. Uses `CanvasRenderingContext2D.measureText()` across 45 baseline fonts to capture
  *    64-bit sub-pixel floating-point metrics (`width`, `actualBoundingBoxAscent/Descent/Left/Right`).
  * 2. Renders a composite 2D scene for `canvas_2d_hash`.
- * 3. **Solid-Patch Exactness Trap + Dual-Canvas Consistency Check**:
- *    Anti-detect browsers (AdsPower, BitBrowser, Multilogin, CanvasBlocker) inject random or
- *    per-context noise into `getImageData` / `toDataURL`. By filling a 16x16 region with a pure
- *    solid RGB color `rgb(17, 136, 221)` using `globalCompositeOperation = 'copy'` and verifying
- *    every pixel equals `[17, 136, 221, 255]`, plus comparing two independent canvases, we detect
- *    Canvas noise injection with 100% precision and 0% false positives!
+ * 3. **Solid-Patch Spatial Uniformity + ±2 ICC Tolerance + Dual-Canvas Consistency Check**:
+ *    Verifies that a 16x16 pure solid `rgb(17, 136, 221)` patch has 100% spatial uniformity across
+ *    all 256 pixels while allowing up to ±2 channel delta for legitimate Display-P3 / OS ICC color
+ *    management profiles (matching `server/go/engine.go`), and verifies repeat-read determinism.
  */
 
 import { sha256Hex } from '../crypto/aead.js'
@@ -73,6 +71,12 @@ export interface FontsCanvasProbeResult {
   canvas_readback_delta: number
 }
 
+let cachedFontsBitmapHash: string | null = null
+
+export function resetFontsProbeCache(): void {
+  cachedFontsBitmapHash = null
+}
+
 function renderCompositeScene(canvas: HTMLCanvasElement): string {
   canvas.width = 240
   canvas.height = 60
@@ -106,6 +110,49 @@ function renderCompositeScene(canvas: HTMLCanvasElement): string {
   return canvas.toDataURL()
 }
 
+function inspectSolidPatch(data: Uint8ClampedArray): {
+  tampered: boolean
+  sampleRgba: [number, number, number, number]
+  nonUniformDelta: number
+} {
+  if (data.length < 4) {
+    return { tampered: false, sampleRgba: [17, 136, 221, 255], nonUniformDelta: 0 }
+  }
+  const r0 = data[0]
+  const g0 = data[1]
+  const b0 = data[2]
+  const a0 = data[3]
+
+  // Allow ±2 uniform ICC / wide-gamut color management rounding (matching server/go/engine.go S3-36).
+  if (
+    Math.abs(r0 - 17) > 2 ||
+    Math.abs(g0 - 136) > 2 ||
+    Math.abs(b0 - 221) > 2 ||
+    Math.abs(a0 - 255) > 2
+  ) {
+    return { tampered: true, sampleRgba: [r0, g0, b0, a0], nonUniformDelta: 0 }
+  }
+
+  // Every pixel in a pure solid fillRect MUST be identical across all 256 pixels;
+  // catches per-pixel farbling or single-pixel +1 noise hooks.
+  for (let i = 4; i < data.length; i += 4) {
+    const diff =
+      Math.abs(data[i] - r0) +
+      Math.abs(data[i + 1] - g0) +
+      Math.abs(data[i + 2] - b0) +
+      Math.abs(data[i + 3] - a0)
+    if (diff !== 0) {
+      return {
+        tampered: true,
+        sampleRgba: [data[i], data[i + 1], data[i + 2], data[i + 3]],
+        nonUniformDelta: diff,
+      }
+    }
+  }
+
+  return { tampered: false, sampleRgba: [r0, g0, b0, a0], nonUniformDelta: 0 }
+}
+
 function detectCanvasNoiseWithRawMeasurements(): {
   noiseInjected: boolean
   controlRgba: number[]
@@ -116,7 +163,7 @@ function detectCanvasNoiseWithRawMeasurements(): {
   let readbackDelta = 0
 
   try {
-    // Trap 1: 16x16 Pure Solid-Color Exactness Trap
+    // Trap 1: 16x16 Pure Solid-Color Uniformity + ±2 ICC Tolerance Trap
     const trapCanvas = document.createElement('canvas')
     trapCanvas.width = 16
     trapCanvas.height = 16
@@ -129,17 +176,11 @@ function detectCanvasNoiseWithRawMeasurements(): {
     trapCtx.fillStyle = 'rgb(17, 136, 221)'
     trapCtx.fillRect(0, 0, 16, 16)
     const imgData = trapCtx.getImageData(0, 0, 16, 16).data
-    for (let i = 0; i < imgData.length; i += 4) {
-      if (
-        imgData[i] !== 17 ||
-        imgData[i + 1] !== 136 ||
-        imgData[i + 2] !== 221 ||
-        imgData[i + 3] !== 255
-      ) {
-        noiseInjected = true
-        controlRgba = [0, 0, 0, 0, imgData[i], imgData[i + 1], imgData[i + 2], imgData[i + 3]]
-        break
-      }
+    const patch1 = inspectSolidPatch(imgData)
+    if (patch1.tampered) {
+      noiseInjected = true
+      controlRgba = [0, 0, 0, 0, ...patch1.sampleRgba]
+      readbackDelta += patch1.nonUniformDelta
     }
 
     // Trap 2: In-Scene Complex Text+Arc Deterministic Seed Trap
@@ -161,15 +202,14 @@ function detectCanvasNoiseWithRawMeasurements(): {
 
       const blankData = ctx1.getImageData(224, 0, 16, 16).data
       const solidInScene = ctx1.getImageData(224, 16, 16, 16).data
+      const patch2 = inspectSolidPatch(solidInScene)
+
       controlRgba = [
         blankData[0] ?? 0,
         blankData[1] ?? 0,
         blankData[2] ?? 0,
         blankData[3] ?? 0,
-        solidInScene[0] ?? 17,
-        solidInScene[1] ?? 136,
-        solidInScene[2] ?? 221,
-        solidInScene[3] ?? 255,
+        ...patch2.sampleRgba,
       ]
 
       for (let i = 0; i < blankData.length; i++) {
@@ -180,20 +220,9 @@ function detectCanvasNoiseWithRawMeasurements(): {
         }
       }
 
-      for (let i = 0; i < solidInScene.length; i += 4) {
-        if (
-          solidInScene[i] !== 17 ||
-          solidInScene[i + 1] !== 136 ||
-          solidInScene[i + 2] !== 221 ||
-          solidInScene[i + 3] !== 255
-        ) {
-          noiseInjected = true
-          controlRgba[4] = solidInScene[i]
-          controlRgba[5] = solidInScene[i + 1]
-          controlRgba[6] = solidInScene[i + 2]
-          controlRgba[7] = solidInScene[i + 3]
-          break
-        }
+      if (patch2.tampered) {
+        noiseInjected = true
+        readbackDelta += patch2.nonUniformDelta
       }
 
       // Trap 3: Stateful PRNG Seed Advance Trap
@@ -229,7 +258,7 @@ export function collectFontsAndCanvasProbe(): FontsCanvasProbeResult {
   }
 
   let canvas2dHash = ''
-  let fontsBitmapHash = ''
+  let fontsBitmapHash = cachedFontsBitmapHash || ''
   let canvasNoiseInjected = false
   let canvasControlRgba: number[] = [0, 0, 0, 0, 17, 136, 221, 255]
   let canvasReadbackDelta = 0
@@ -240,23 +269,26 @@ export function collectFontsAndCanvasProbe(): FontsCanvasProbeResult {
     canvas.height = 60
     const ctx = canvas.getContext('2d')
     if (ctx) {
-      // 1. Sub-pixel TextMetrics bounding box probe across 45 fonts
-      const fontMetricsParts: string[] = []
-      for (const fontName of BASELINE_FONTS) {
-        ctx.font = `16px "${fontName}", monospace`
-        const m = ctx.measureText(PROBE_GLYPHS)
-        fontMetricsParts.push(
-          [
-            fontName,
-            Number(m.width || 0).toFixed(4),
-            Number(m.actualBoundingBoxAscent || 0).toFixed(4),
-            Number(m.actualBoundingBoxDescent || 0).toFixed(4),
-            Number(m.actualBoundingBoxLeft || 0).toFixed(4),
-            Number(m.actualBoundingBoxRight || 0).toFixed(4),
-          ].join(':')
-        )
+      // 1. Sub-pixel TextMetrics bounding box probe across 45 fonts (memoized per session, S3-41)
+      if (!fontsBitmapHash) {
+        const fontMetricsParts: string[] = []
+        for (const fontName of BASELINE_FONTS) {
+          ctx.font = `16px "${fontName}", monospace`
+          const m = ctx.measureText(PROBE_GLYPHS)
+          fontMetricsParts.push(
+            [
+              fontName,
+              Number(m.width || 0).toFixed(4),
+              Number(m.actualBoundingBoxAscent || 0).toFixed(4),
+              Number(m.actualBoundingBoxDescent || 0).toFixed(4),
+              Number(m.actualBoundingBoxLeft || 0).toFixed(4),
+              Number(m.actualBoundingBoxRight || 0).toFixed(4),
+            ].join(':')
+          )
+        }
+        fontsBitmapHash = sha256Hex(fontMetricsParts.join('|'))
+        cachedFontsBitmapHash = fontsBitmapHash
       }
-      fontsBitmapHash = sha256Hex(fontMetricsParts.join('|'))
 
       // 2. Composite Canvas 2D rendering
       const dataUrl = renderCompositeScene(canvas)

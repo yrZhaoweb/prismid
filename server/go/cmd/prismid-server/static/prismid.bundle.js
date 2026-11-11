@@ -1,4 +1,4 @@
-// PrismID Web SDK (prismid-js) Standalone ES Module Bundle
+// PrismID Web SDK (prismid-js v1.1.0) Standalone ES Module Bundle
 
 // --- crypto/aead.js ---
 /**
@@ -117,14 +117,18 @@ export function sha256Hex(input) {
 export function deriveAEADKeyBytes(nonce) {
     return sha256Bytes(AEAD_KEY_DOMAIN_PREFIX + nonce);
 }
-export function randomBytes(length) {
-    const buf = new Uint8Array(length);
+export function csprngBytes(length) {
     if (typeof globalThis.crypto !== 'undefined' && typeof globalThis.crypto.getRandomValues === 'function') {
+        const buf = new Uint8Array(length);
         globalThis.crypto.getRandomValues(buf);
         return buf;
     }
-    for (let i = 0; i < length; i++) {
-        buf[i] = Math.floor(Math.random() * 256);
+    return null;
+}
+export function randomBytes(length) {
+    const buf = csprngBytes(length);
+    if (!buf) {
+        throw new Error('Cryptographically secure PRNG (crypto.getRandomValues) is unavailable');
     }
     return buf;
 }
@@ -359,6 +363,13 @@ const KEY_STORE_NAME = 'keystore';
 const KEY_RECORD_ID = 'hw_ecdsa_p256';
 const IDB_KEY_TIMEOUT_MS = 150;
 let memoryCachedKey = null;
+/**
+ * Clears the in-memory `CryptoKey` cache so subsequent operations re-read `IndexedDB`
+ * (e.g. after in-page site-data clearing or explicit key recovery/rotation).
+ */
+export function resetDeviceKeyCache() {
+    memoryCachedKey = null;
+}
 function bytesToHex(bytes) {
     let out = '';
     for (let i = 0; i < bytes.length; i++) {
@@ -384,9 +395,84 @@ function isStoredKey(value) {
         Array.isArray(rec.privateKey.usages) && rec.privateKey.usages.includes('sign') && typeof rec.pubKeyHex === 'string' &&
         /^04[0-9a-f]{128}$/.test(rec.pubKeyHex);
 }
-// The read and conditional insert share one readwrite transaction. IndexedDB serializes
-// these transactions across tabs, so concurrent first visits all use the committed winner.
-function loadOrCreatePersistedKey(candidate) {
+// Fast read-only lookup BEFORE generating an ECDSA P-256 keypair so warm page loads
+// never waste CPU/WebCrypto keygen work when a persisted key already exists (S2-23).
+function readExistingPersistedKey() {
+    if (typeof indexedDB === 'undefined' || !indexedDB) {
+        return Promise.resolve({ status: 'error' });
+    }
+    return new Promise((resolve) => {
+        let settled = false;
+        let db;
+        const finish = (outcome) => {
+            if (settled)
+                return;
+            settled = true;
+            clearTimeout(timer);
+            try {
+                db?.close();
+            }
+            catch { }
+            resolve(outcome);
+        };
+        const timer = setTimeout(() => finish({ status: 'error' }), IDB_KEY_TIMEOUT_MS);
+        try {
+            const req = indexedDB.open(KEY_DB_NAME, 1);
+            req.onblocked = req.onerror = () => finish({ status: 'error' });
+            req.onupgradeneeded = () => {
+                if (settled) {
+                    req.transaction?.abort();
+                    return;
+                }
+                if (!req.result.objectStoreNames.contains(KEY_STORE_NAME)) {
+                    req.result.createObjectStore(KEY_STORE_NAME);
+                }
+            };
+            req.onsuccess = () => {
+                db = req.result;
+                if (settled) {
+                    db.close();
+                    return;
+                }
+                db.onversionchange = () => db?.close();
+                try {
+                    if (db.objectStoreNames && typeof db.objectStoreNames.contains === 'function' && !db.objectStoreNames.contains(KEY_STORE_NAME)) {
+                        finish({ status: 'missing' });
+                        return;
+                    }
+                    const tx = db.transaction(KEY_STORE_NAME, 'readonly');
+                    tx.onerror = tx.onabort = () => finish({ status: 'error' });
+                    const store = tx.objectStore(KEY_STORE_NAME);
+                    const read = store.get(KEY_RECORD_ID);
+                    read.onerror = () => finish({ status: 'error' });
+                    read.onsuccess = () => {
+                        if (settled)
+                            return;
+                        if (read.result === undefined) {
+                            finish({ status: 'missing' });
+                        }
+                        else if (isStoredKey(read.result)) {
+                            finish({ status: 'found', record: read.result });
+                        }
+                        else {
+                            finish({ status: 'corrupted' });
+                        }
+                    };
+                }
+                catch {
+                    finish({ status: 'error' });
+                }
+            };
+        }
+        catch {
+            finish({ status: 'error' });
+        }
+    });
+}
+// The read and conditional insert/repair share one readwrite transaction. IndexedDB serializes
+// these transactions across tabs, so concurrent first visits all use the committed winner,
+// and corrupted records are atomically repaired instead of permanently disabling `d_key_*` (S3-32).
+function loadOrCreatePersistedKey(candidate, forceOverwrite = false) {
     if (typeof indexedDB === 'undefined' || !indexedDB)
         return Promise.resolve(null);
     return new Promise((resolve) => {
@@ -436,6 +522,16 @@ function loadOrCreatePersistedKey(candidate) {
                     let winner = null;
                     tx.oncomplete = () => finish(winner);
                     tx.onerror = tx.onabort = () => finish(null);
+                    if (forceOverwrite) {
+                        winner = candidate;
+                        if (typeof store.put === 'function') {
+                            store.put(candidate, KEY_RECORD_ID);
+                        }
+                        else {
+                            store.add(candidate, KEY_RECORD_ID);
+                        }
+                        return;
+                    }
                     const read = store.get(KEY_RECORD_ID);
                     read.onerror = () => finish(null);
                     read.onsuccess = () => {
@@ -444,11 +540,22 @@ function loadOrCreatePersistedKey(candidate) {
                         try {
                             if (read.result === undefined) {
                                 winner = candidate;
-                                // Never overwrite another page's existing key (or an unreadable record).
                                 store.add(candidate, KEY_RECORD_ID);
                             }
                             else if (isStoredKey(read.result)) {
                                 winner = read.result;
+                            }
+                            else {
+                                // Repair corrupted / schema-invalid IndexedDB record in place (S3-32).
+                                winner = candidate;
+                                if (typeof store.put === 'function') {
+                                    store.put(candidate, KEY_RECORD_ID);
+                                }
+                                else {
+                                    if (typeof store.delete === 'function')
+                                        store.delete(KEY_RECORD_ID);
+                                    store.add(candidate, KEY_RECORD_ID);
+                                }
                             }
                         }
                         catch {
@@ -466,9 +573,17 @@ function loadOrCreatePersistedKey(candidate) {
         }
     });
 }
+async function generateCandidateKeyRecord(subtle) {
+    const pair = await subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, false, ['sign', 'verify']);
+    const rawPub = await subtle.exportKey('raw', pair.publicKey);
+    return {
+        privateKey: pair.privateKey,
+        pubKeyHex: bytesToHex(new Uint8Array(rawPub)),
+    };
+}
 let keyInitialization = null;
-async function getOrCreateDeviceKeyRecord() {
-    if (memoryCachedKey)
+async function getOrCreateDeviceKeyRecord(options) {
+    if (!options?.bypassMemoryCache && memoryCachedKey)
         return memoryCachedKey;
     if (keyInitialization)
         return keyInitialization;
@@ -477,15 +592,23 @@ async function getOrCreateDeviceKeyRecord() {
         return null;
     keyInitialization = (async () => {
         try {
-            const pair = await subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, false, ['sign', 'verify']);
-            const rawPub = await subtle.exportKey('raw', pair.publicKey);
-            const persisted = await loadOrCreatePersistedKey({
-                privateKey: pair.privateKey,
-                pubKeyHex: bytesToHex(new Uint8Array(rawPub)),
-            });
+            const existing = await readExistingPersistedKey();
+            if (existing.status === 'found') {
+                memoryCachedKey = existing.record;
+                return existing.record;
+            }
+            if (existing.status === 'error') {
+                // IndexedDB blocked/timed out/errored: do not open a second transaction or cache a temporary key.
+                if (options?.bypassMemoryCache) {
+                    memoryCachedKey = null;
+                }
+                return null;
+            }
+            // status === 'missing' || status === 'corrupted': generate fresh P-256 keypair & persist atomically.
+            const candidate = await generateCandidateKeyRecord(subtle);
+            const persisted = await loadOrCreatePersistedKey(candidate, false);
             // Only a confirmed transaction commit may establish a server-side TOFU binding.
-            if (persisted)
-                memoryCachedKey = persisted;
+            memoryCachedKey = persisted;
             return persisted;
         }
         catch {
@@ -498,6 +621,13 @@ async function getOrCreateDeviceKeyRecord() {
     finally {
         keyInitialization = null;
     }
+}
+/**
+ * Preloads or initializes the persisted ECDSA P-256 device key in parallel with other probes.
+ */
+export async function preloadDeviceKey() {
+    const rec = await getOrCreateDeviceKeyRecord();
+    return rec !== null;
 }
 export function buildDeviceKeyTranscript(params) {
     return [
@@ -516,17 +646,16 @@ export function buildRebindKeyTranscript(params) {
         params.beaconId.trim().toLowerCase(),
     ].join('|');
 }
-export async function signRebindWithDeviceKey(params) {
-    const subtle = getSubtleCrypto();
-    if (!subtle) {
-        return undefined;
-    }
-    const rec = await getOrCreateDeviceKeyRecord();
-    if (!rec) {
-        return undefined;
-    }
+export function buildPreviousKeyRotationTranscript(params) {
+    return [
+        'prismid-v2-rebind-prev',
+        params.nonce.trim(),
+        params.subjectId.trim(),
+        params.beaconId.trim().toLowerCase(),
+    ].join('|');
+}
+async function signTranscript(subtle, rec, transcript) {
     try {
-        const transcript = buildRebindKeyTranscript(params);
         const msgBytes = new TextEncoder().encode(transcript);
         const sigBuf = await subtle.sign({ name: 'ECDSA', hash: { name: 'SHA-256' } }, rec.privateKey, msgBytes);
         const sigHex = bytesToHex(new Uint8Array(sigBuf));
@@ -537,6 +666,59 @@ export async function signRebindWithDeviceKey(params) {
             alg: 'ecdsa-p256',
             pub_key: rec.pubKeyHex,
             signature: sigHex,
+        };
+    }
+    catch {
+        return undefined;
+    }
+}
+export async function signRebindWithDeviceKey(params) {
+    const subtle = getSubtleCrypto();
+    if (!subtle) {
+        return undefined;
+    }
+    // Always re-verify IndexedDB on rebind so in-session site-data clearing generates a fresh key
+    // without requiring a page reload (S2-24).
+    const rec = await getOrCreateDeviceKeyRecord({ bypassMemoryCache: true });
+    if (!rec) {
+        return undefined;
+    }
+    return signTranscript(subtle, rec, buildRebindKeyTranscript(params));
+}
+/**
+ * Rotates the persisted ECDSA P-256 keypair in-place and signs both the new key PoP (`device_key`)
+ * and, when a previous key was still accessible in IndexedDB or memory, the continuity proof
+ * (`previous_device_key`) over `prismid-v2-rebind-prev|<nonce>|<subject>|<beacon>|<new_pub_key>` (S2-12).
+ */
+export async function rotateDeviceKeyAndSignRebind(params) {
+    const subtle = getSubtleCrypto();
+    if (!subtle || typeof indexedDB === 'undefined' || !indexedDB) {
+        return undefined;
+    }
+    const existing = await readExistingPersistedKey();
+    const prevRec = existing.status === 'found' ? existing.record : memoryCachedKey;
+    try {
+        const candidate = await generateCandidateKeyRecord(subtle);
+        const committed = await loadOrCreatePersistedKey(candidate, true);
+        if (!committed) {
+            return undefined;
+        }
+        memoryCachedKey = committed;
+        const newProof = await signTranscript(subtle, committed, buildRebindKeyTranscript(params));
+        if (!newProof) {
+            return undefined;
+        }
+        let prevProof;
+        if (prevRec && prevRec.pubKeyHex !== committed.pubKeyHex) {
+            prevProof = await signTranscript(subtle, prevRec, buildPreviousKeyRotationTranscript({
+                nonce: params.nonce,
+                subjectId: params.subjectId,
+                beaconId: params.beaconId,
+            }));
+        }
+        return {
+            device_key: newProof,
+            ...(prevProof ? { previous_device_key: prevProof } : {}),
         };
     }
     catch {
@@ -552,50 +734,31 @@ export async function signChallengeWithDeviceKey(params) {
     if (!rec) {
         return undefined;
     }
-    try {
-        const transcript = buildDeviceKeyTranscript(params);
-        const msgBytes = new TextEncoder().encode(transcript);
-        const sigBuf = await subtle.sign({ name: 'ECDSA', hash: { name: 'SHA-256' } }, rec.privateKey, msgBytes);
-        const sigHex = bytesToHex(new Uint8Array(sigBuf));
-        if (sigHex.length !== 128) {
-            return undefined;
-        }
-        return {
-            alg: 'ecdsa-p256',
-            pub_key: rec.pubKeyHex,
-            signature: sigHex,
-        };
-    }
-    catch {
-        return undefined;
-    }
+    return signTranscript(subtle, rec, buildDeviceKeyTranscript(params));
 }
 
 // --- probes/storageBeacon.js ---
-/**
- * PrismID 5-Silo Self-Healing Cryptographic Beacon (`storageBeacon.ts`)
- *
- * Persists a 128-bit (32 hex chars) device installation beacon across 5 browser storage silos:
- *   1. `localStorage`
- *   2. `sessionStorage`
- *   3. `IndexedDB` (`prismid_vault_v1` -> `beacons`)
- *   4. `CacheStorage` (`prismid-beacon-cache-v1` -> `https://prismid.invalid/__beacon_v1`)
- *   5. `document.cookie` (`_prismid_bcn_v1`)
- *
- * All asynchronous reads and writes enforce strict per-operation and overall deadlines
- * so blocked/corrupted browser storage engines can never hang `identify()`.
- */
-
 const STORAGE_KEY = '_prismid_bcn_v1';
 const IDB_NAME = 'prismid_vault_v1';
 const IDB_STORE = 'beacons';
 const CACHE_NAME = 'prismid-beacon-cache-v1';
 const CACHE_URL = 'https://prismid.invalid/__beacon_v1';
+export const SILO_MASK = {
+    localStorage: 1 << 0,
+    sessionStorage: 1 << 1,
+    cookie: 1 << 2,
+    indexedDB: 1 << 3,
+    cacheStorage: 1 << 4,
+};
 function isValidBeaconId(val) {
     return typeof val === 'string' && /^[0-9a-f]{32}$/.test(val.trim());
 }
 function generateBeaconId() {
-    const bytes = randomBytes(16);
+    const bytes = csprngBytes(16);
+    if (!bytes) {
+        // Never fall back to predictable Math.random() when CSPRNG is absent (S3-34).
+        return '';
+    }
     let hex = '';
     for (let i = 0; i < bytes.length; i++) {
         hex += bytes[i].toString(16).padStart(2, '0');
@@ -614,6 +777,8 @@ function readLocalStorage() {
     }
 }
 function writeLocalStorage(id) {
+    if (!id)
+        return;
     try {
         if (typeof localStorage !== 'undefined') {
             localStorage.setItem(STORAGE_KEY, id);
@@ -635,6 +800,8 @@ function readSessionStorage() {
     }
 }
 function writeSessionStorage(id) {
+    if (!id)
+        return;
     try {
         if (typeof sessionStorage !== 'undefined') {
             sessionStorage.setItem(STORAGE_KEY, id);
@@ -651,9 +818,13 @@ function readCookie() {
         }
         const parts = document.cookie.split(';');
         for (const part of parts) {
-            const [k, v] = part.trim().split('=');
+            const eqIdx = part.indexOf('=');
+            if (eqIdx < 0)
+                continue;
+            const k = part.slice(0, eqIdx).trim();
+            const v = part.slice(eqIdx + 1).trim();
             if (k === STORAGE_KEY && isValidBeaconId(v)) {
-                return { available: true, value: v.trim() };
+                return { available: true, value: v };
             }
         }
         return { available: true, value: null };
@@ -663,9 +834,13 @@ function readCookie() {
     }
 }
 function writeCookie(id) {
+    if (!id)
+        return;
     try {
         if (typeof document !== 'undefined') {
-            document.cookie = `${STORAGE_KEY}=${id}; path=/; max-age=34560000; SameSite=Lax`;
+            const isHttps = typeof globalThis.location !== 'undefined' && globalThis.location?.protocol === 'https:';
+            const secureAttr = isHttps ? '; Secure' : '';
+            document.cookie = `${STORAGE_KEY}=${id}; path=/; max-age=34560000; SameSite=Lax${secureAttr}`;
         }
     }
     catch {
@@ -673,146 +848,137 @@ function writeCookie(id) {
     }
 }
 function readIndexedDB(timeoutMs = 150) {
-    if (typeof indexedDB === 'undefined') {
+    if (typeof indexedDB === 'undefined' || !indexedDB) {
         return Promise.resolve({ available: false, value: null });
     }
     return new Promise((resolve) => {
         let settled = false;
+        let db;
         const finish = (res) => {
             if (settled)
                 return;
             settled = true;
+            clearTimeout(timer);
+            try {
+                db?.close();
+            }
+            catch { }
             resolve(res);
         };
         const timer = setTimeout(() => finish({ available: false, value: null }), timeoutMs);
         try {
             const req = indexedDB.open(IDB_NAME, 1);
-            req.onblocked = () => {
-                clearTimeout(timer);
-                finish({ available: false, value: null });
-            };
+            req.onblocked = () => finish({ available: false, value: null });
             req.onupgradeneeded = () => {
+                if (settled) {
+                    try {
+                        req.transaction?.abort();
+                    }
+                    catch { }
+                    return;
+                }
                 try {
-                    const db = req.result;
-                    if (!db.objectStoreNames.contains(IDB_STORE)) {
-                        db.createObjectStore(IDB_STORE);
+                    const upgDb = req.result;
+                    if (!upgDb.objectStoreNames.contains(IDB_STORE)) {
+                        upgDb.createObjectStore(IDB_STORE);
                     }
                 }
                 catch {
                     // ignore
                 }
             };
-            req.onerror = () => {
-                clearTimeout(timer);
-                finish({ available: false, value: null });
-            };
+            req.onerror = () => finish({ available: false, value: null });
             req.onsuccess = () => {
+                db = req.result;
+                if (settled) {
+                    try {
+                        db.close();
+                    }
+                    catch { }
+                    return;
+                }
                 try {
-                    const db = req.result;
                     const tx = db.transaction(IDB_STORE, 'readonly');
                     const store = tx.objectStore(IDB_STORE);
                     const getReq = store.get(STORAGE_KEY);
                     getReq.onsuccess = () => {
-                        clearTimeout(timer);
                         const val = getReq.result;
-                        try {
-                            db.close();
-                        }
-                        catch { }
                         finish({ available: true, value: isValidBeaconId(val) ? val.trim() : null });
                     };
                     getReq.onerror = () => {
-                        clearTimeout(timer);
-                        try {
-                            db.close();
-                        }
-                        catch { }
                         finish({ available: true, value: null });
                     };
                 }
                 catch {
-                    clearTimeout(timer);
                     finish({ available: false, value: null });
                 }
             };
         }
         catch {
-            clearTimeout(timer);
             finish({ available: false, value: null });
         }
     });
 }
-function writeIndexedDB(id, timeoutMs = 150) {
-    if (typeof indexedDB === 'undefined')
+function writeIndexedDB(id, timeoutMs = 150, isAborted) {
+    if (!id || typeof indexedDB === 'undefined' || !indexedDB || isAborted?.()) {
         return Promise.resolve();
+    }
     return new Promise((resolve) => {
         let settled = false;
+        let db;
         const finish = () => {
             if (settled)
                 return;
             settled = true;
+            clearTimeout(timer);
+            try {
+                db?.close();
+            }
+            catch { }
             resolve();
         };
         const timer = setTimeout(finish, timeoutMs);
         try {
             const req = indexedDB.open(IDB_NAME, 1);
-            req.onblocked = () => {
-                clearTimeout(timer);
-                finish();
-            };
+            req.onblocked = () => finish();
             req.onupgradeneeded = () => {
+                if (settled || isAborted?.()) {
+                    try {
+                        req.transaction?.abort();
+                    }
+                    catch { }
+                    return;
+                }
                 try {
-                    const db = req.result;
-                    if (!db.objectStoreNames.contains(IDB_STORE)) {
-                        db.createObjectStore(IDB_STORE);
+                    const upgDb = req.result;
+                    if (!upgDb.objectStoreNames.contains(IDB_STORE)) {
+                        upgDb.createObjectStore(IDB_STORE);
                     }
                 }
                 catch {
                     // ignore
                 }
             };
-            req.onerror = () => {
-                clearTimeout(timer);
-                finish();
-            };
+            req.onerror = () => finish();
             req.onsuccess = () => {
+                db = req.result;
+                if (settled || isAborted?.()) {
+                    finish();
+                    return;
+                }
                 try {
-                    const db = req.result;
                     const tx = db.transaction(IDB_STORE, 'readwrite');
                     tx.objectStore(IDB_STORE).put(id, STORAGE_KEY);
-                    tx.oncomplete = () => {
-                        clearTimeout(timer);
-                        try {
-                            db.close();
-                        }
-                        catch { }
-                        finish();
-                    };
-                    tx.onerror = () => {
-                        clearTimeout(timer);
-                        try {
-                            db.close();
-                        }
-                        catch { }
-                        finish();
-                    };
-                    tx.onabort = () => {
-                        clearTimeout(timer);
-                        try {
-                            db.close();
-                        }
-                        catch { }
-                        finish();
-                    };
+                    tx.oncomplete = () => finish();
+                    tx.onerror = () => finish();
+                    tx.onabort = () => finish();
                 }
                 catch {
-                    clearTimeout(timer);
                     finish();
                 }
             };
         }
         catch {
-            clearTimeout(timer);
             finish();
         }
     });
@@ -827,6 +993,7 @@ async function readCacheStorage(timeoutMs = 150) {
             if (settled)
                 return;
             settled = true;
+            clearTimeout(timer);
             resolve(res);
         };
         const timer = setTimeout(() => finish({ available: false, value: null }), timeoutMs);
@@ -835,115 +1002,132 @@ async function readCacheStorage(timeoutMs = 150) {
             .then((cache) => cache.match(CACHE_URL))
             .then((resp) => (resp ? resp.text() : null))
             .then((text) => {
-            clearTimeout(timer);
             finish({ available: true, value: isValidBeaconId(text) ? text.trim() : null });
         })
             .catch(() => {
-            clearTimeout(timer);
             finish({ available: false, value: null });
         });
     });
 }
-function writeCacheStorage(id, timeoutMs = 150) {
-    if (typeof caches === 'undefined' || typeof Response === 'undefined')
+function writeCacheStorage(id, timeoutMs = 150, isAborted) {
+    if (!id || typeof caches === 'undefined' || typeof Response === 'undefined' || isAborted?.()) {
         return Promise.resolve();
+    }
     return new Promise((resolve) => {
         let settled = false;
         const finish = () => {
             if (settled)
                 return;
             settled = true;
+            clearTimeout(timer);
             resolve();
         };
         const timer = setTimeout(finish, timeoutMs);
         caches
             .open(CACHE_NAME)
-            .then((cache) => cache.put(CACHE_URL, new Response(id, {
-            headers: {
-                'Content-Type': 'text/plain',
-                ETag: `"${id}"`,
-                'Cache-Control': 'max-age=31536000',
-            },
-        })))
-            .then(() => {
-            clearTimeout(timer);
-            finish();
+            .then((cache) => {
+            if (settled || isAborted?.())
+                return;
+            return cache.put(CACHE_URL, new Response(id, {
+                headers: {
+                    'Content-Type': 'text/plain',
+                    ETag: `"${id}"`,
+                    'Cache-Control': 'max-age=31536000',
+                },
+            }));
         })
-            .catch(() => {
-            clearTimeout(timer);
-            finish();
-        });
+            .then(() => finish())
+            .catch(() => finish());
     });
 }
+function evaluateSilos(silos, fallbackId) {
+    const survivingSilos = [];
+    let survivingMask = 0;
+    const freq = new Map();
+    let missingPrimarySilo = false;
+    for (const s of silos) {
+        if (s.value) {
+            survivingSilos.push(s.name);
+            survivingMask |= SILO_MASK[s.name];
+            freq.set(s.value, (freq.get(s.value) || 0) + 1);
+        }
+        else if (s.available &&
+            (s.name === 'localStorage' || s.name === 'cookie' || s.name === 'indexedDB')) {
+            missingPrimarySilo = true;
+        }
+    }
+    let canonicalId = '';
+    let storageHealed = false;
+    if (freq.size > 0) {
+        let bestCount = -1;
+        for (const [id, count] of freq.entries()) {
+            if (count > bestCount) {
+                bestCount = count;
+                canonicalId = id;
+            }
+        }
+        if (missingPrimarySilo || freq.size > 1) {
+            storageHealed = true;
+        }
+    }
+    else {
+        canonicalId = fallbackId;
+    }
+    return {
+        beacon_id: canonicalId,
+        storage_healed: storageHealed,
+        surviving_silos: survivingSilos,
+        surviving_silos_mask: survivingMask,
+    };
+}
 export async function collectAndHealStorageBeacon(timeoutMs = 350) {
+    // Read synchronous silos FIRST so even if async IndexedDB/CacheStorage hang past `timeoutMs`,
+    // we preserve the existing synchronous beacon rather than clobbering it with a random ID,
+    // and `aborted = true` stops late async tasks from overwriting storage afterwards (S3-35).
+    const ls = readLocalStorage();
+    const ss = readSessionStorage();
+    const ck = readCookie();
     const fallbackId = generateBeaconId();
+    const syncSnapshot = evaluateSilos([
+        { name: 'localStorage', ...ls },
+        { name: 'sessionStorage', ...ss },
+        { name: 'cookie', ...ck },
+    ], fallbackId);
+    let aborted = false;
     let timer;
     const work = (async () => {
-        const ls = readLocalStorage();
-        const ss = readSessionStorage();
-        const ck = readCookie();
         const perSiloMs = Math.max(40, Math.floor(timeoutMs * 0.4));
         const [idb, cs] = await Promise.all([readIndexedDB(perSiloMs), readCacheStorage(perSiloMs)]);
-        const silos = [
+        if (aborted) {
+            return syncSnapshot;
+        }
+        const resolved = evaluateSilos([
             { name: 'localStorage', ...ls },
             { name: 'sessionStorage', ...ss },
             { name: 'cookie', ...ck },
             { name: 'indexedDB', ...idb },
             { name: 'cacheStorage', ...cs },
-        ];
-        const survivingSilos = [];
-        const freq = new Map();
-        let missingPrimarySilo = false;
-        for (const s of silos) {
-            if (s.value) {
-                survivingSilos.push(s.name);
-                freq.set(s.value, (freq.get(s.value) || 0) + 1);
-            }
-            else if (s.available &&
-                (s.name === 'localStorage' || s.name === 'cookie' || s.name === 'indexedDB')) {
-                missingPrimarySilo = true;
-            }
+        ], fallbackId);
+        if (resolved.beacon_id && !aborted) {
+            writeLocalStorage(resolved.beacon_id);
+            writeSessionStorage(resolved.beacon_id);
+            writeCookie(resolved.beacon_id);
+            await Promise.all([
+                writeIndexedDB(resolved.beacon_id, perSiloMs, () => aborted),
+                writeCacheStorage(resolved.beacon_id, perSiloMs, () => aborted),
+            ]);
         }
-        let canonicalId = '';
-        let storageHealed = false;
-        if (freq.size > 0) {
-            let bestCount = -1;
-            for (const [id, count] of freq.entries()) {
-                if (count > bestCount) {
-                    bestCount = count;
-                    canonicalId = id;
-                }
-            }
-            if (missingPrimarySilo || freq.size > 1) {
-                storageHealed = true;
-            }
-        }
-        else {
-            canonicalId = fallbackId;
-        }
-        writeLocalStorage(canonicalId);
-        writeSessionStorage(canonicalId);
-        writeCookie(canonicalId);
-        await Promise.all([
-            writeIndexedDB(canonicalId, perSiloMs),
-            writeCacheStorage(canonicalId, perSiloMs),
-        ]);
-        return {
-            beacon_id: canonicalId,
-            storage_healed: storageHealed,
-            surviving_silos: survivingSilos,
-        };
+        return resolved;
     })();
     const deadline = new Promise((resolve) => {
         timer = setTimeout(() => {
-            writeLocalStorage(fallbackId);
-            writeSessionStorage(fallbackId);
-            writeCookie(fallbackId);
-            resolve({
-                beacon_id: fallbackId,
-                storage_healed: false,
-                surviving_silos: [],
-            });
+            aborted = true;
+            if (syncSnapshot.beacon_id) {
+                writeLocalStorage(syncSnapshot.beacon_id);
+                writeSessionStorage(syncSnapshot.beacon_id);
+                writeCookie(syncSnapshot.beacon_id);
+            }
+            resolve(syncSnapshot);
         }, timeoutMs);
     });
     try {
@@ -956,14 +1140,6 @@ export async function collectAndHealStorageBeacon(timeoutMs = 350) {
 }
 
 // --- probes/webgl.js ---
-/**
- * PrismID WebGL Probe:
- *   1. Unmasked GPU Vendor & Renderer (`WEBGL_debug_renderer_info`)
- *   2. 12 Hardware Register Limits Vector (`webgl_limits_vector`)
- *   3. Static 3D Multi-Frequency Anti-Aliased Geometry Scene Hash (`static_webgl_fp_hash`)
- *   4. Dynamic `render_seed` [s0, s1, s2, s3] 256x256 Fragment Shader & 8 Spot-Pixel Sampler
- */
-
 export const DEFAULT_SAMPLE_POINTS = [
     [32, 48],
     [96, 64],
@@ -1026,15 +1202,18 @@ export function computeExpectedSpotPixelMath(x, y, seed) {
     };
     return [q(r), q(g), q(b), 255];
 }
+const DETERMINISTIC_CONTEXT_ATTRS = {
+    antialias: false,
+    depth: false,
+    stencil: false,
+    preserveDrawingBuffer: true,
+};
 function createWebGLContext(width, height) {
     try {
         if (typeof OffscreenCanvas !== 'undefined') {
             const oc = new OffscreenCanvas(width, height);
-            const gl = oc.getContext('webgl', {
-                antialias: true,
-                preserveDrawingBuffer: true,
-            });
-            if (gl)
+            const gl = oc.getContext('webgl', DETERMINISTIC_CONTEXT_ATTRS);
+            if (gl && (typeof gl.isContextLost !== 'function' || !gl.isContextLost()))
                 return gl;
         }
     }
@@ -1046,21 +1225,27 @@ function createWebGLContext(width, height) {
             const canvas = document.createElement('canvas');
             canvas.width = width;
             canvas.height = height;
-            const gl = (canvas.getContext('webgl', {
-                antialias: true,
-                preserveDrawingBuffer: true,
-            }) ||
-                canvas.getContext('experimental-webgl', {
-                    antialias: true,
-                    preserveDrawingBuffer: true,
-                }));
-            return gl;
+            const gl = (canvas.getContext('webgl', DETERMINISTIC_CONTEXT_ATTRS) ||
+                canvas.getContext('experimental-webgl', DETERMINISTIC_CONTEXT_ATTRS));
+            if (gl && (typeof gl.isContextLost !== 'function' || !gl.isContextLost()))
+                return gl;
         }
     }
     catch {
         // WebGL unavailable
     }
     return null;
+}
+function releaseWebGLContext(gl) {
+    try {
+        const ext = gl.getExtension('WEBGL_lose_context');
+        if (ext && typeof ext.loseContext === 'function') {
+            ext.loseContext();
+        }
+    }
+    catch {
+        // ignore
+    }
 }
 function compileProgram(gl, vsSource, fsSource) {
     const compile = (type, src) => {
@@ -1093,18 +1278,26 @@ function compileProgram(gl, vsSource, fsSource) {
     }
     return prog;
 }
-function drawFullScreenQuad(gl, prog) {
+// Single oversized clip-space triangle avoids any diagonal 2-triangle seam across [0..W, 0..H].
+function drawFullScreenTriangle(gl, prog) {
     const buf = gl.createBuffer();
     if (!buf)
         return null;
     gl.bindBuffer(gl.ARRAY_BUFFER, buf);
-    const vertices = new Float32Array([-1, -1, 1, -1, -1, 1, -1, 1, 1, -1, 1, 1]);
+    const vertices = new Float32Array([-1, -1, 3, -1, -1, 3]);
     gl.bufferData(gl.ARRAY_BUFFER, vertices, gl.STATIC_DRAW);
     const posLoc = gl.getAttribLocation(prog, 'a_pos');
     gl.enableVertexAttribArray(posLoc);
     gl.vertexAttribPointer(posLoc, 2, gl.FLOAT, false, 0, 0);
-    gl.drawArrays(gl.TRIANGLES, 0, 6);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
     return buf;
+}
+function hasAnyNonZeroByte(buf) {
+    for (let i = 0; i < buf.length; i++) {
+        if (buf[i] !== 0)
+            return true;
+    }
+    return false;
 }
 function extractWebGLLimitsVector(gl) {
     const p = (pname) => {
@@ -1171,124 +1364,127 @@ function extractWebGLExtensionsHash(gl) {
 export function collectWebGLProbe(renderSeed, samplePoints = DEFAULT_SAMPLE_POINTS) {
     const gl = createWebGLContext(256, 256);
     if (!gl) {
-        // Headless / non-WebGL environment fallback (strictly marked webgl_available: false and SwiftShader,
-        // which server/go demotes to VirtualGPUConfidence = 0.30 / RiskPending = true)
+        // Non-WebGL environment fallback (hardened Firefox / enterprise policy / headless without GPU).
+        // Reported honestly as `webgl_available: false` and `Unavailable / WebGL Disabled` rather than
+        // impersonating `SwiftShader` so server/go can distinguish bound privacy browsers from software GPU farms (S2-18).
         return {
-            gpu_vendor: 'SwiftShader',
-            gpu_renderer: 'Google SwiftShader (Headless Fallback)',
+            gpu_vendor: 'Unavailable',
+            gpu_renderer: 'WebGL Disabled',
             webgl_limits_vector: '8192|8192|8192,8192|8192|1024|1024|30|1,1|1,1024|0|23,23,23,23',
             webgl_extensions_hash: '0000000000000000',
-            static_webgl_fp_hash: sha256Hex('headless-no-webgl-static-fallback'),
+            static_webgl_fp_hash: sha256Hex('no-webgl-disabled-static-fallback'),
             spot_pixels: samplePoints.map(([x, y]) => computeExpectedSpotPixelMath(x, y, renderSeed)),
             webgl_available: false,
             webgl_noise_injected: false,
         };
     }
-    let gpuVendor = 'Unknown';
-    let gpuRenderer = 'Unknown';
     try {
-        const dbg = gl.getExtension('WEBGL_debug_renderer_info');
-        if (dbg) {
-            gpuVendor = String(gl.getParameter(dbg.UNMASKED_VENDOR_WEBGL) || gl.getParameter(gl.VENDOR) || 'Unknown');
-            gpuRenderer = String(gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) || gl.getParameter(gl.RENDERER) || 'Unknown');
-        }
-        else {
-            gpuVendor = String(gl.getParameter(gl.VENDOR) || 'Unknown');
-            gpuRenderer = String(gl.getParameter(gl.RENDERER) || 'Unknown');
-        }
-    }
-    catch {
-        // ignore
-    }
-    const limitsVector = extractWebGLLimitsVector(gl);
-    const extensionsHash = extractWebGLExtensionsHash(gl);
-    // Step 1: Render 64x64 static fingerprint scene and hash raw pixel buffer
-    // Also perform dual readPixels determinism check to detect WebGL noise-injection extensions.
-    let staticFpHash = '';
-    let webglNoiseInjected = false;
-    try {
-        gl.viewport(0, 0, 64, 64);
-        const staticProg = compileProgram(gl, VERTEX_SHADER_SRC, STATIC_FINGERPRINT_FRAGMENT_SHADER_SRC);
-        if (staticProg) {
-            gl.useProgram(staticProg);
-            const buf = drawFullScreenQuad(gl, staticProg);
-            const pixels1 = new Uint8Array(64 * 64 * 4);
-            const pixels2 = new Uint8Array(64 * 64 * 4);
-            gl.readPixels(0, 0, 64, 64, gl.RGBA, gl.UNSIGNED_BYTE, pixels1);
-            gl.readPixels(0, 0, 64, 64, gl.RGBA, gl.UNSIGNED_BYTE, pixels2);
-            const hash1 = sha256Hex(pixels1);
-            const hash2 = sha256Hex(pixels2);
-            staticFpHash = hash1;
-            if (hash1 !== hash2) {
-                webglNoiseInjected = true;
+        let gpuVendor = 'Unknown';
+        let gpuRenderer = 'Unknown';
+        try {
+            const dbg = gl.getExtension('WEBGL_debug_renderer_info');
+            if (dbg) {
+                gpuVendor = String(gl.getParameter(dbg.UNMASKED_VENDOR_WEBGL) || gl.getParameter(gl.VENDOR) || 'Unknown');
+                gpuRenderer = String(gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) || gl.getParameter(gl.RENDERER) || 'Unknown');
             }
-            if (buf)
-                gl.deleteBuffer(buf);
-            gl.deleteProgram(staticProg);
-        }
-    }
-    catch {
-        // ignore
-    }
-    if (!staticFpHash) {
-        staticFpHash = sha256Hex(`${gpuVendor}|${gpuRenderer}|${limitsVector}`);
-    }
-    // Step 2: Render 256x256 dynamic challenge shader with u_seed = renderSeed
-    const spotPixels = [];
-    try {
-        gl.viewport(0, 0, 256, 256);
-        const dynProg = compileProgram(gl, VERTEX_SHADER_SRC, DYNAMIC_CHALLENGE_FRAGMENT_SHADER_SRC);
-        if (dynProg) {
-            gl.useProgram(dynProg);
-            const seedLoc = gl.getUniformLocation(dynProg, 'u_seed');
-            gl.uniform4f(seedLoc, renderSeed[0], renderSeed[1], renderSeed[2], renderSeed[3]);
-            const buf = drawFullScreenQuad(gl, dynProg);
-            const pixel = new Uint8Array(4);
-            for (const [x, y] of samplePoints) {
-                gl.readPixels(x, y, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, pixel);
-                spotPixels.push([pixel[0], pixel[1], pixel[2], pixel[3]]);
+            else {
+                gpuVendor = String(gl.getParameter(gl.VENDOR) || 'Unknown');
+                gpuRenderer = String(gl.getParameter(gl.RENDERER) || 'Unknown');
             }
-            if (buf)
-                gl.deleteBuffer(buf);
-            gl.deleteProgram(dynProg);
         }
+        catch {
+            // ignore
+        }
+        const limitsVector = extractWebGLLimitsVector(gl);
+        const extensionsHash = extractWebGLExtensionsHash(gl);
+        // Step 1: Render 64x64 static fingerprint scene on a matching 64x64 non-MSAA context
+        // so main-thread and Worker OffscreenCanvas(64, 64) produce bit-identical buffers across
+        // Chromium, Firefox (Gecko), and Safari (WebKit) (S2-17, S3-38).
+        let staticFpHash = '';
+        let webglNoiseInjected = false;
+        const staticGl = createWebGLContext(64, 64);
+        if (staticGl) {
+            try {
+                staticGl.viewport(0, 0, 64, 64);
+                const staticProg = compileProgram(staticGl, VERTEX_SHADER_SRC, STATIC_FINGERPRINT_FRAGMENT_SHADER_SRC);
+                if (staticProg) {
+                    staticGl.useProgram(staticProg);
+                    const buf = drawFullScreenTriangle(staticGl, staticProg);
+                    const pixels1 = new Uint8Array(64 * 64 * 4);
+                    const pixels2 = new Uint8Array(64 * 64 * 4);
+                    staticGl.readPixels(0, 0, 64, 64, staticGl.RGBA, staticGl.UNSIGNED_BYTE, pixels1);
+                    const err1 = typeof staticGl.getError === 'function' ? staticGl.getError() : 0;
+                    staticGl.readPixels(0, 0, 64, 64, staticGl.RGBA, staticGl.UNSIGNED_BYTE, pixels2);
+                    const err2 = typeof staticGl.getError === 'function' ? staticGl.getError() : 0;
+                    const lost = typeof staticGl.isContextLost === 'function' && staticGl.isContextLost();
+                    if (!lost && err1 === 0 && err2 === 0 && hasAnyNonZeroByte(pixels1)) {
+                        const hash1 = sha256Hex(pixels1);
+                        const hash2 = sha256Hex(pixels2);
+                        staticFpHash = hash1;
+                        if (hash1 !== hash2) {
+                            webglNoiseInjected = true;
+                        }
+                    }
+                    if (buf)
+                        staticGl.deleteBuffer(buf);
+                    staticGl.deleteProgram(staticProg);
+                }
+            }
+            catch {
+                // ignore
+            }
+            finally {
+                releaseWebGLContext(staticGl);
+            }
+        }
+        if (!staticFpHash) {
+            staticFpHash = sha256Hex(`${gpuVendor}|${gpuRenderer}|${limitsVector}`);
+        }
+        // Step 2: Render 256x256 dynamic challenge shader with u_seed = renderSeed
+        const spotPixels = [];
+        try {
+            gl.viewport(0, 0, 256, 256);
+            const dynProg = compileProgram(gl, VERTEX_SHADER_SRC, DYNAMIC_CHALLENGE_FRAGMENT_SHADER_SRC);
+            if (dynProg) {
+                gl.useProgram(dynProg);
+                const seedLoc = gl.getUniformLocation(dynProg, 'u_seed');
+                gl.uniform4f(seedLoc, renderSeed[0], renderSeed[1], renderSeed[2], renderSeed[3]);
+                const buf = drawFullScreenTriangle(gl, dynProg);
+                const pixel = new Uint8Array(4);
+                for (const [x, y] of samplePoints) {
+                    gl.readPixels(x, y, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, pixel);
+                    spotPixels.push([pixel[0], pixel[1], pixel[2], pixel[3]]);
+                }
+                if (buf)
+                    gl.deleteBuffer(buf);
+                gl.deleteProgram(dynProg);
+            }
+        }
+        catch {
+            // Fallback if shader compilation was blocked
+        }
+        // Do NOT fall back to CPU math when a WebGL context exists but failed/blocked shader rendering:
+        // fill with [0,0,0,0] so broken/stubbed WebGL mocks fail spot-pixel verification honestly.
+        while (spotPixels.length < samplePoints.length) {
+            spotPixels.push([0, 0, 0, 0]);
+        }
+        return {
+            gpu_vendor: gpuVendor,
+            gpu_renderer: gpuRenderer,
+            webgl_limits_vector: limitsVector,
+            webgl_extensions_hash: extensionsHash,
+            static_webgl_fp_hash: staticFpHash,
+            spot_pixels: spotPixels,
+            webgl_available: true,
+            webgl_noise_injected: webglNoiseInjected,
+        };
     }
-    catch {
-        // Fallback if shader compilation was blocked
+    finally {
+        releaseWebGLContext(gl);
     }
-    // Do NOT fall back to CPU math when a WebGL context exists but failed/blocked shader rendering:
-    // fill with [0,0,0,0] so broken/stubbed WebGL mocks fail spot-pixel verification honestly.
-    while (spotPixels.length < samplePoints.length) {
-        spotPixels.push([0, 0, 0, 0]);
-    }
-    return {
-        gpu_vendor: gpuVendor,
-        gpu_renderer: gpuRenderer,
-        webgl_limits_vector: limitsVector,
-        webgl_extensions_hash: extensionsHash,
-        static_webgl_fp_hash: staticFpHash,
-        spot_pixels: spotPixels,
-        webgl_available: true,
-        webgl_noise_injected: webglNoiseInjected,
-    };
 }
 
 // --- probes/workerLie.js ---
-/**
- * PrismID Cross-Thread Lie Detector (`Web Worker + OffscreenCanvas`)
- *
- * Spawns an inline `Blob` Web Worker (`WorkerGlobalScope`) with a 300ms timeout guard.
- * Inside the Worker thread (which escapes main-thread DOM/window tampering extensions):
- *   - Reads `self.navigator.userAgent`, `platform`, `hardwareConcurrency`
- *   - Reads `Intl.DateTimeFormat().resolvedOptions().timeZone` (catches timezone-spoofing proxy plugins!)
- *   - Creates `new OffscreenCanvas(64, 64).getContext('webgl')` to read `UNMASKED_RENDERER_WEBGL`
- *     and render the exact same static 3D hardware fingerprint scene.
- *
- * If CSP or the environment blocks `Blob` Workers, gracefully falls back (`worker_unavailable = true`)
- * without throwing or breaking the SDK.
- */
-
-
 export async function collectWorkerLieProbe(mainThread, timeoutMs = 300) {
     const emptyUnavailable = {
         worker_unavailable: true,
@@ -1324,38 +1520,58 @@ export async function collectWorkerLieProbe(mainThread, timeoutMs = 300) {
 
         if (typeof OffscreenCanvas !== 'undefined') {
           var oc = new OffscreenCanvas(64, 64);
-          var gl = oc.getContext('webgl', { antialias: true, preserveDrawingBuffer: true });
-          if (gl) {
-            var dbg = gl.getExtension('WEBGL_debug_renderer_info');
-            renderer = String(
-              (dbg && gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL)) ||
-              gl.getParameter(gl.RENDERER) ||
-              ''
-            );
-            var vs = gl.createShader(gl.VERTEX_SHADER);
-            gl.shaderSource(vs, 'attribute vec2 a_pos; void main() { gl_Position = vec4(a_pos, 0.0, 1.0); }');
-            gl.compileShader(vs);
-            var fs = gl.createShader(gl.FRAGMENT_SHADER);
-            gl.shaderSource(fs, ${JSON.stringify(STATIC_FINGERPRINT_FRAGMENT_SHADER_SRC)});
-            gl.compileShader(fs);
-            var prog = gl.createProgram();
-            gl.attachShader(prog, vs);
-            gl.attachShader(prog, fs);
-            gl.linkProgram(prog);
-            if (gl.getProgramParameter(prog, gl.LINK_STATUS)) {
-              gl.viewport(0, 0, 64, 64);
-              gl.useProgram(prog);
-              var buf = gl.createBuffer();
-              gl.bindBuffer(gl.ARRAY_BUFFER, buf);
-              gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, -1,1, 1,-1, 1,1]), gl.STATIC_DRAW);
-              var loc = gl.getAttribLocation(prog, 'a_pos');
-              gl.enableVertexAttribArray(loc);
-              gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
-              gl.drawArrays(gl.TRIANGLES, 0, 6);
-              var px = new Uint8Array(64 * 64 * 4);
-              gl.readPixels(0, 0, 64, 64, gl.RGBA, gl.UNSIGNED_BYTE, px);
-              pixelsArray = px.buffer;
-              webglOk = true;
+          var gl = oc.getContext('webgl', {
+            antialias: false,
+            depth: false,
+            stencil: false,
+            preserveDrawingBuffer: true
+          });
+          if (gl && (typeof gl.isContextLost !== 'function' || !gl.isContextLost())) {
+            try {
+              var dbg = gl.getExtension('WEBGL_debug_renderer_info');
+              renderer = String(
+                (dbg && gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL)) ||
+                gl.getParameter(gl.RENDERER) ||
+                ''
+              );
+              var vs = gl.createShader(gl.VERTEX_SHADER);
+              gl.shaderSource(vs, 'attribute vec2 a_pos; void main() { gl_Position = vec4(a_pos, 0.0, 1.0); }');
+              gl.compileShader(vs);
+              var fs = gl.createShader(gl.FRAGMENT_SHADER);
+              gl.shaderSource(fs, ${JSON.stringify(STATIC_FINGERPRINT_FRAGMENT_SHADER_SRC)});
+              gl.compileShader(fs);
+              var prog = gl.createProgram();
+              gl.attachShader(prog, vs);
+              gl.attachShader(prog, fs);
+              gl.linkProgram(prog);
+              if (gl.getProgramParameter(prog, gl.LINK_STATUS)) {
+                gl.viewport(0, 0, 64, 64);
+                gl.useProgram(prog);
+                var buf = gl.createBuffer();
+                gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+                gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+                var loc = gl.getAttribLocation(prog, 'a_pos');
+                gl.enableVertexAttribArray(loc);
+                gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+                gl.drawArrays(gl.TRIANGLES, 0, 3);
+                var px = new Uint8Array(64 * 64 * 4);
+                gl.readPixels(0, 0, 64, 64, gl.RGBA, gl.UNSIGNED_BYTE, px);
+                var glErr = typeof gl.getError === 'function' ? gl.getError() : 0;
+                var lost = typeof gl.isContextLost === 'function' && gl.isContextLost();
+                var nonZero = false;
+                for (var i = 0; i < px.length; i++) {
+                  if (px[i] !== 0) { nonZero = true; break; }
+                }
+                if (!lost && glErr === 0 && nonZero) {
+                  pixelsArray = px.buffer;
+                  webglOk = true;
+                }
+              }
+            } finally {
+              try {
+                var loseExt = gl.getExtension('WEBGL_lose_context');
+                if (loseExt && typeof loseExt.loseContext === 'function') loseExt.loseContext();
+              } catch (_) {}
             }
           }
         }
@@ -1410,27 +1626,41 @@ export async function collectWorkerLieProbe(mainThread, timeoutMs = 300) {
                     finish(emptyUnavailable);
                     return;
                 }
-                const workerRenderer = String(data.renderer || '');
                 const workerCores = Number(data.cores || 0);
                 const workerPlat = String(data.plat || '');
                 const workerUA = String(data.ua || '');
                 const workerTZ = String(data.tz || '');
-                const workerFpHash = data.pixelsBuffer instanceof ArrayBuffer
+                const rawWorkerWebglOk = Boolean(data.webglOk) && data.pixelsBuffer instanceof ArrayBuffer;
+                const workerFpHash = rawWorkerWebglOk
                     ? sha256Hex(new Uint8Array(data.pixelsBuffer))
                     : '';
+                // Only expose worker_gpu_renderer / worker_static_webgl_fp_hash when Worker WebGL actually
+                // completed cleanly AND main-thread WebGL was also enabled (avoids false positives on GPU reset, S3-38).
+                const mainWebglAvailable = mainThread.webglAvailable !== false;
+                const workerRenderer = rawWorkerWebglOk ? String(data.renderer || '') : '';
                 const isGenericMaskedRenderer = (r) => {
                     const low = r.trim().toLowerCase();
-                    return low === '' || low === 'webkit webgl' || low === 'mozilla' || low === 'webgl' || low === 'unknown';
+                    return (low === '' ||
+                        low === 'webkit webgl' ||
+                        low === 'mozilla' ||
+                        low === 'webgl' ||
+                        low === 'unknown' ||
+                        low === 'unavailable' ||
+                        low === 'webgl disabled');
                 };
                 let lieDetected = false;
-                if (workerRenderer &&
+                if (mainWebglAvailable &&
+                    rawWorkerWebglOk &&
+                    workerRenderer &&
                     mainThread.gpuRenderer &&
                     !isGenericMaskedRenderer(workerRenderer) &&
                     !isGenericMaskedRenderer(mainThread.gpuRenderer) &&
                     workerRenderer.toLowerCase() !== mainThread.gpuRenderer.toLowerCase()) {
                     lieDetected = true;
                 }
-                if (workerFpHash &&
+                if (mainWebglAvailable &&
+                    rawWorkerWebglOk &&
+                    workerFpHash &&
                     mainThread.staticWebGLFpHash &&
                     workerFpHash.toLowerCase() !== mainThread.staticWebGLFpHash.toLowerCase()) {
                     lieDetected = true;
@@ -1451,10 +1681,10 @@ export async function collectWorkerLieProbe(mainThread, timeoutMs = 300) {
                 }
                 finish({
                     worker_unavailable: false,
-                    worker_webgl_available: Boolean(data.webglOk) && workerFpHash.length > 0,
+                    worker_webgl_available: rawWorkerWebglOk,
                     worker_lie_detected: lieDetected,
-                    worker_gpu_renderer: workerRenderer,
-                    worker_static_webgl_fp_hash: workerFpHash,
+                    worker_gpu_renderer: mainWebglAvailable ? workerRenderer : '',
+                    worker_static_webgl_fp_hash: mainWebglAvailable ? workerFpHash : '',
                     worker_cpu_cores: workerCores,
                     worker_platform: workerPlat,
                     worker_user_agent: workerUA,
@@ -1471,16 +1701,6 @@ export async function collectWorkerLieProbe(mainThread, timeoutMs = 300) {
 }
 
 // --- probes/audio.js ---
-/**
- * PrismID OfflineAudioContext Oscillator + DynamicsCompressor Integral Probe
- *
- * Drives a 10,000 Hz triangle wave through a hardware/OS-specific DynamicsCompressorNode
- * in a 1-channel, 44,100 Hz OfflineAudioContext, then computes the SHA-256 hash over
- * the floating-point audio samples [4500..5000).
- *
- * Completely immune to IP changes, screen size changes, and Canvas 2D noise extensions.
- */
-
 export async function collectAudioProbeWithTrap(timeoutMs = 400) {
     const OfflineCtx = typeof globalThis !== 'undefined'
         ? globalThis.OfflineAudioContext ||
@@ -1493,6 +1713,7 @@ export async function collectAudioProbeWithTrap(timeoutMs = 400) {
             audio_copy_hash: fallbackHash,
             audio_silent_delta: 0,
             audio_noise_injected: false,
+            audio_muted: false,
         };
     }
     return new Promise((resolve) => {
@@ -1510,6 +1731,7 @@ export async function collectAudioProbeWithTrap(timeoutMs = 400) {
                 audio_copy_hash: timeoutHash,
                 audio_silent_delta: 0,
                 audio_noise_injected: false,
+                audio_muted: false,
             });
         }, timeoutMs);
         try {
@@ -1523,13 +1745,6 @@ export async function collectAudioProbeWithTrap(timeoutMs = 400) {
             comp.ratio.setValueAtTime(12, ctx.currentTime);
             comp.attack.setValueAtTime(0, ctx.currentTime);
             comp.release.setValueAtTime(0.25, ctx.currentTime);
-            // Start oscillator at sample ~44 (t = 0.001s) so frames [0..16) are a mathematically
-            // guaranteed silent prefix (0.0), while [4500..5000) is fully steady-state compressed!
-            // Wait: to keep 100% hash compatibility for [4500..5000), we keep osc.start(0) on ctx
-            // and check:
-            //  1) Repeat-read determinism: buffer.getChannelData(0) read twice
-            //  2) Cross-surface readback: buffer.getChannelData(0) vs buffer.copyFromChannel()
-            //  3) Unconnected tail / silent channel check via a 2-channel context where channel 1 is silent!
             osc.connect(comp);
             comp.connect(ctx.destination);
             osc.start(0);
@@ -1540,6 +1755,7 @@ export async function collectAudioProbeWithTrap(timeoutMs = 400) {
                     sliceA[i] = ch0A[4500 + i];
                 }
                 let noiseInjected = false;
+                let copyMismatch = false;
                 let copyAcc = '';
                 let silentDelta = 0;
                 // Trap 1: Cross-Surface `copyFromChannel` vs `getChannelData` consistency
@@ -1550,6 +1766,7 @@ export async function collectAudioProbeWithTrap(timeoutMs = 400) {
                         for (let i = 0; i < 500; i++) {
                             if (copySlice[i] !== sliceA[i]) {
                                 noiseInjected = true;
+                                copyMismatch = true;
                             }
                             copyAcc += copySlice[i].toFixed(7) + ',';
                         }
@@ -1581,7 +1798,10 @@ export async function collectAudioProbeWithTrap(timeoutMs = 400) {
                 catch {
                     // ignore
                 }
-                // Trap 4: Realistic magnitude & NaN/Infinity check
+                // Trap 4: Realistic magnitude & NaN/Infinity check.
+                // Note: An all-zero buffer (`nonZeroCount === 0`) occurs legitimately on muted enterprise
+                // policies, Lockdown Mode, or privacy-hardened browsers; record `audio_muted: true`
+                // instead of falsely accusing the user of audio noise injection (S3-37).
                 let nonZeroCount = 0;
                 let acc = '';
                 for (let i = 0; i < 500; i++) {
@@ -1593,16 +1813,21 @@ export async function collectAudioProbeWithTrap(timeoutMs = 400) {
                         nonZeroCount++;
                     acc += v.toFixed(7) + ',';
                 }
-                if (nonZeroCount === 0) {
-                    noiseInjected = true;
-                }
-                const primaryHash = sha256Hex(acc);
-                const copyHash = copyAcc ? sha256Hex(copyAcc) : primaryHash;
+                const audioMuted = nonZeroCount === 0 && !noiseInjected;
+                const primaryHash = audioMuted
+                    ? sha256Hex('prismid-audio-output-muted')
+                    : sha256Hex(acc);
+                const copyHash = audioMuted && !copyMismatch
+                    ? primaryHash
+                    : copyAcc
+                        ? sha256Hex(copyAcc)
+                        : primaryHash;
                 return {
                     audio_compressor_hash: primaryHash,
                     audio_copy_hash: copyHash,
                     audio_silent_delta: silentDelta,
                     audio_noise_injected: noiseInjected,
+                    audio_muted: audioMuted,
                 };
             };
             const renderPromise = ctx.startRendering();
@@ -1620,6 +1845,7 @@ export async function collectAudioProbeWithTrap(timeoutMs = 400) {
                         audio_copy_hash: rejHash,
                         audio_silent_delta: 0,
                         audio_noise_injected: false,
+                        audio_muted: false,
                     });
                 });
             }
@@ -1638,6 +1864,7 @@ export async function collectAudioProbeWithTrap(timeoutMs = 400) {
                 audio_copy_hash: excHash,
                 audio_silent_delta: 0,
                 audio_noise_injected: false,
+                audio_muted: false,
             });
         }
     });
@@ -1648,21 +1875,6 @@ export async function collectAudioProbe(timeoutMs = 400) {
 }
 
 // --- probes/fontsCanvas.js ---
-/**
- * PrismID Sub-Pixel Font Bounding Box (`TextMetrics`), Canvas 2D Composite Probe,
- * and Solid-Patch Anti-Detect Noise Trap (`canvas_noise_injected`).
- *
- * 1. Uses `CanvasRenderingContext2D.measureText()` across 45 baseline fonts to capture
- *    64-bit sub-pixel floating-point metrics (`width`, `actualBoundingBoxAscent/Descent/Left/Right`).
- * 2. Renders a composite 2D scene for `canvas_2d_hash`.
- * 3. **Solid-Patch Exactness Trap + Dual-Canvas Consistency Check**:
- *    Anti-detect browsers (AdsPower, BitBrowser, Multilogin, CanvasBlocker) inject random or
- *    per-context noise into `getImageData` / `toDataURL`. By filling a 16x16 region with a pure
- *    solid RGB color `rgb(17, 136, 221)` using `globalCompositeOperation = 'copy'` and verifying
- *    every pixel equals `[17, 136, 221, 255]`, plus comparing two independent canvases, we detect
- *    Canvas noise injection with 100% precision and 0% false positives!
- */
-
 const BASELINE_FONTS = [
     'Arial',
     'Arial Black',
@@ -1711,6 +1923,10 @@ const BASELINE_FONTS = [
     'Fira Code',
 ];
 const PROBE_GLYPHS = 'mmmmmmmmmmlliW@#0123456789棱镜PrismID🔥';
+let cachedFontsBitmapHash = null;
+export function resetFontsProbeCache() {
+    cachedFontsBitmapHash = null;
+}
 function renderCompositeScene(canvas) {
     canvas.width = 240;
     canvas.height = 60;
@@ -1739,12 +1955,44 @@ function renderCompositeScene(canvas) {
     ctx.stroke();
     return canvas.toDataURL();
 }
+function inspectSolidPatch(data) {
+    if (data.length < 4) {
+        return { tampered: false, sampleRgba: [17, 136, 221, 255], nonUniformDelta: 0 };
+    }
+    const r0 = data[0];
+    const g0 = data[1];
+    const b0 = data[2];
+    const a0 = data[3];
+    // Allow ±2 uniform ICC / wide-gamut color management rounding (matching server/go/engine.go S3-36).
+    if (Math.abs(r0 - 17) > 2 ||
+        Math.abs(g0 - 136) > 2 ||
+        Math.abs(b0 - 221) > 2 ||
+        Math.abs(a0 - 255) > 2) {
+        return { tampered: true, sampleRgba: [r0, g0, b0, a0], nonUniformDelta: 0 };
+    }
+    // Every pixel in a pure solid fillRect MUST be identical across all 256 pixels;
+    // catches per-pixel farbling or single-pixel +1 noise hooks.
+    for (let i = 4; i < data.length; i += 4) {
+        const diff = Math.abs(data[i] - r0) +
+            Math.abs(data[i + 1] - g0) +
+            Math.abs(data[i + 2] - b0) +
+            Math.abs(data[i + 3] - a0);
+        if (diff !== 0) {
+            return {
+                tampered: true,
+                sampleRgba: [data[i], data[i + 1], data[i + 2], data[i + 3]],
+                nonUniformDelta: diff,
+            };
+        }
+    }
+    return { tampered: false, sampleRgba: [r0, g0, b0, a0], nonUniformDelta: 0 };
+}
 function detectCanvasNoiseWithRawMeasurements() {
     let noiseInjected = false;
     let controlRgba = [0, 0, 0, 0, 17, 136, 221, 255];
     let readbackDelta = 0;
     try {
-        // Trap 1: 16x16 Pure Solid-Color Exactness Trap
+        // Trap 1: 16x16 Pure Solid-Color Uniformity + ±2 ICC Tolerance Trap
         const trapCanvas = document.createElement('canvas');
         trapCanvas.width = 16;
         trapCanvas.height = 16;
@@ -1756,15 +2004,11 @@ function detectCanvasNoiseWithRawMeasurements() {
         trapCtx.fillStyle = 'rgb(17, 136, 221)';
         trapCtx.fillRect(0, 0, 16, 16);
         const imgData = trapCtx.getImageData(0, 0, 16, 16).data;
-        for (let i = 0; i < imgData.length; i += 4) {
-            if (imgData[i] !== 17 ||
-                imgData[i + 1] !== 136 ||
-                imgData[i + 2] !== 221 ||
-                imgData[i + 3] !== 255) {
-                noiseInjected = true;
-                controlRgba = [0, 0, 0, 0, imgData[i], imgData[i + 1], imgData[i + 2], imgData[i + 3]];
-                break;
-            }
+        const patch1 = inspectSolidPatch(imgData);
+        if (patch1.tampered) {
+            noiseInjected = true;
+            controlRgba = [0, 0, 0, 0, ...patch1.sampleRgba];
+            readbackDelta += patch1.nonUniformDelta;
         }
         // Trap 2: In-Scene Complex Text+Arc Deterministic Seed Trap
         const c1 = document.createElement('canvas');
@@ -1783,15 +2027,13 @@ function detectCanvasNoiseWithRawMeasurements() {
             ctx1.fillRect(224, 16, 16, 16);
             const blankData = ctx1.getImageData(224, 0, 16, 16).data;
             const solidInScene = ctx1.getImageData(224, 16, 16, 16).data;
+            const patch2 = inspectSolidPatch(solidInScene);
             controlRgba = [
                 blankData[0] ?? 0,
                 blankData[1] ?? 0,
                 blankData[2] ?? 0,
                 blankData[3] ?? 0,
-                solidInScene[0] ?? 17,
-                solidInScene[1] ?? 136,
-                solidInScene[2] ?? 221,
-                solidInScene[3] ?? 255,
+                ...patch2.sampleRgba,
             ];
             for (let i = 0; i < blankData.length; i++) {
                 if (blankData[i] !== 0) {
@@ -1800,18 +2042,9 @@ function detectCanvasNoiseWithRawMeasurements() {
                     break;
                 }
             }
-            for (let i = 0; i < solidInScene.length; i += 4) {
-                if (solidInScene[i] !== 17 ||
-                    solidInScene[i + 1] !== 136 ||
-                    solidInScene[i + 2] !== 221 ||
-                    solidInScene[i + 3] !== 255) {
-                    noiseInjected = true;
-                    controlRgba[4] = solidInScene[i];
-                    controlRgba[5] = solidInScene[i + 1];
-                    controlRgba[6] = solidInScene[i + 2];
-                    controlRgba[7] = solidInScene[i + 3];
-                    break;
-                }
+            if (patch2.tampered) {
+                noiseInjected = true;
+                readbackDelta += patch2.nonUniformDelta;
             }
             // Trap 3: Stateful PRNG Seed Advance Trap
             const readA = ctx1.getImageData(0, 0, 220, 60).data;
@@ -1844,7 +2077,7 @@ export function collectFontsAndCanvasProbe() {
         };
     }
     let canvas2dHash = '';
-    let fontsBitmapHash = '';
+    let fontsBitmapHash = cachedFontsBitmapHash || '';
     let canvasNoiseInjected = false;
     let canvasControlRgba = [0, 0, 0, 0, 17, 136, 221, 255];
     let canvasReadbackDelta = 0;
@@ -1854,21 +2087,24 @@ export function collectFontsAndCanvasProbe() {
         canvas.height = 60;
         const ctx = canvas.getContext('2d');
         if (ctx) {
-            // 1. Sub-pixel TextMetrics bounding box probe across 45 fonts
-            const fontMetricsParts = [];
-            for (const fontName of BASELINE_FONTS) {
-                ctx.font = `16px "${fontName}", monospace`;
-                const m = ctx.measureText(PROBE_GLYPHS);
-                fontMetricsParts.push([
-                    fontName,
-                    Number(m.width || 0).toFixed(4),
-                    Number(m.actualBoundingBoxAscent || 0).toFixed(4),
-                    Number(m.actualBoundingBoxDescent || 0).toFixed(4),
-                    Number(m.actualBoundingBoxLeft || 0).toFixed(4),
-                    Number(m.actualBoundingBoxRight || 0).toFixed(4),
-                ].join(':'));
+            // 1. Sub-pixel TextMetrics bounding box probe across 45 fonts (memoized per session, S3-41)
+            if (!fontsBitmapHash) {
+                const fontMetricsParts = [];
+                for (const fontName of BASELINE_FONTS) {
+                    ctx.font = `16px "${fontName}", monospace`;
+                    const m = ctx.measureText(PROBE_GLYPHS);
+                    fontMetricsParts.push([
+                        fontName,
+                        Number(m.width || 0).toFixed(4),
+                        Number(m.actualBoundingBoxAscent || 0).toFixed(4),
+                        Number(m.actualBoundingBoxDescent || 0).toFixed(4),
+                        Number(m.actualBoundingBoxLeft || 0).toFixed(4),
+                        Number(m.actualBoundingBoxRight || 0).toFixed(4),
+                    ].join(':'));
+                }
+                fontsBitmapHash = sha256Hex(fontMetricsParts.join('|'));
+                cachedFontsBitmapHash = fontsBitmapHash;
             }
-            fontsBitmapHash = sha256Hex(fontMetricsParts.join('|'));
             // 2. Composite Canvas 2D rendering
             const dataUrl = renderCompositeScene(canvas);
             if (dataUrl) {
@@ -1894,20 +2130,8 @@ export function collectFontsAndCanvasProbe() {
 }
 
 // --- probes/lieDetector.js ---
-/**
- * PrismID JS Engine FDLIBM `Math` Constants & Prototype Chain Lie Detector
- *
- * 1. Evaluates boundary floating-point transcendental functions (`Math.acos`, `Math.acosh`,
- *    `Math.sinh`, `Math.tan`, `Math.expm1`, `Math.cbrt`) to identify the underlying JS engine
- *    (V8 vs. JavaScriptCore vs. SpiderMonkey) in 0.01ms, catching spoofed User-Agent headers.
- * 2. Uses `Function.prototype.toString.call(fn)` and `Object.getOwnPropertyDescriptor`
- *    to detect monkey-patched browser APIs and `Proxy` wrappers.
- * 3. Checks `navigator.webdriver` and CDP/automation globals.
- */
-
-export function collectLieDetectorProbe() {
-    // 1. FDLIBM Math floating-point boundary fingerprint
-    const mValues = [
+function sampleMathConstants() {
+    return [
         Math.acos(0.12345678910111213),
         Math.acosh(1e300),
         Math.asin(0.12345678910111213),
@@ -1921,104 +2145,126 @@ export function collectLieDetectorProbe() {
         Math.sinh(1),
         Math.tan(-1e300),
     ];
+}
+export function collectLieDetectorProbe() {
+    // 1. FDLIBM Math floating-point boundary fingerprint + active tamper check (S3-29)
+    const mValues = sampleMathConstants();
+    const mValuesRepeat = sampleMathConstants();
     const mathConstantsHash = sha256Hex(mValues.map((n) => String(n)).join('|')).slice(0, 32);
-    // Determine JS engine family from runtime intrinsics & error formatting
+    let mathTampered = Math.cos(0) !== 1 ||
+        Math.sin(0) !== 0 ||
+        Math.atan2(0, 1) !== 0 ||
+        Math.expm1(0) !== 0 ||
+        Math.log1p(0) !== 0 ||
+        mValues.some((v) => !Number.isFinite(v));
+    if (!mathTampered) {
+        for (let i = 0; i < mValues.length; i++) {
+            if (mValues[i] !== mValuesRepeat[i]) {
+                mathTampered = true;
+                break;
+            }
+        }
+    }
+    // Determine JS engine family from stack-frame grammar & engine-exclusive intrinsics.
+    // Note: Safari 18.2+ (JSC) and Firefox 135+ (SpiderMonkey) also expose `Error.captureStackTrace`,
+    // so we NEVER rely on `'captureStackTrace' in Error` alone (S2-17)!
     let mathEngineSignature = 'unknown';
     try {
         const errStack = new Error().stack || '';
-        if ('captureStackTrace' in Error) {
+        const hasV8AtFrames = /^\s*(?:Error|TypeError)\b[\s\S]*\n\s+at\s+/m.test(errStack);
+        const g = globalThis;
+        if (hasV8AtFrames) {
             mathEngineSignature = 'v8';
         }
-        else if (errStack.includes('@') && typeof globalThis.mozInnerScreenX !== 'undefined') {
+        else if (typeof g.InternalError === 'function' ||
+            typeof g.mozInnerScreenX !== 'undefined') {
             mathEngineSignature = 'spidermonkey';
         }
         else if (errStack.includes('@')) {
             mathEngineSignature = 'jsc';
         }
-        else {
+        else if ('captureStackTrace' in Error) {
             mathEngineSignature = 'v8';
         }
     }
     catch {
         mathEngineSignature = 'unknown';
     }
-    // 2. Prototype chain & native function integrity inspection (CreepJS `getPrototypeLies` grade)
+    // 2. Prototype chain & native function integrity inspection
     const prototypeLies = [];
     const fnToString = Function.prototype.toString;
     const checkNativeFunction = (fn, label, expectedName) => {
         if (typeof fn !== 'function')
-            return;
+            return false;
+        const beforeLen = prototypeLies.length;
         try {
             const str = fnToString.call(fn);
             if (!/\{\s*\[native code\]\s*\}/.test(str)) {
                 prototypeLies.push(`${label}:non_native_toString`);
             }
-            // Check if function itself has an own `toString` or `name` override
             if (Object.prototype.hasOwnProperty.call(fn, 'toString')) {
                 prototypeLies.push(`${label}:own_toString_override`);
             }
-            // Native WebIDL methods & getters never have a `.prototype` property (`'prototype' in fn === false`)
+            // Native WebIDL methods, getters & Math functions do not have a `.prototype` property
             if ('prototype' in fn) {
                 prototypeLies.push(`${label}:has_prototype_property`);
             }
-            // Check expected function `.name` (e.g. `'get userAgent'` or `'userAgent'` for native getters)
             if (expectedName &&
                 fn.name !== expectedName &&
                 fn.name !== expectedName.replace(/^get /, '')) {
                 prototypeLies.push(`${label}:unexpected_name_${fn.name || 'empty'}`);
             }
-            // Native function .toString reference identity invariant:
-            // Apify fingerprint-injector's redirectToString attaches a `get(target, 'toString')` trap
-            // that returns a freshly allocated `new Proxy(target.toString, ...)` on each access.
             if (fn.toString !== fnToString || fn.toString !== fn.toString) {
                 prototypeLies.push(`${label}:toString_proxy_getter`);
             }
-            // Non-cyclic prototype identity invariant:
-            // Setting a native function's prototype to its own current prototype (`origProto`) MUST
-            // succeed (`Reflect.setPrototypeOf(fn, origProto) === true`) and NEVER throw.
-            // Apify fingerprint-injector's `redirectToString` unconditionally throws `Cyclic __proto__ value`
-            // or returns `false` inside its `setPrototypeOf` trap even for non-cyclic `origProto`!
-            const origProto = Object.getPrototypeOf(fn);
-            try {
-                if (Reflect.setPrototypeOf(fn, origProto) !== true) {
-                    prototypeLies.push(`${label}:non_cyclic_setPrototypeOf_rejected`);
-                }
-                Object.setPrototypeOf(fn, origProto);
-            }
-            catch {
-                prototypeLies.push(`${label}:fake_cyclic_proto_trap`);
-            }
-            // ECMAScript §10.1.2.1 OrdinarySetPrototypeOf cyclic __proto__ invariant:
-            // Calling `Object.setPrototypeOf(fn, Object.create(fn))` on any genuine function MUST
-            // throw `TypeError: Cyclic __proto__ value` because `SameValue(p, O)` matches `fn`.
-            // On an ES6 `new Proxy(target, handler)`, `[[SetPrototypeOf]]` forwards to `target` while
-            // `Object.create(proxy)` links to `proxy` (`SameValue(proxy, target) === false`), so it
-            // succeeds without throwing (or triggers a custom `setPrototypeOf` trap)!
-            try {
-                Object.setPrototypeOf(fn, Object.create(fn));
-                prototypeLies.push(`${label}:es6_proxy_detected`);
-            }
-            catch (err) {
-                const stack = err?.stack || '';
-                if (stack.includes('Proxy.')) {
-                    prototypeLies.push(`${label}:proxy_setPrototypeOf_trap`);
-                }
-            }
-            finally {
+            // Guard setPrototypeOf probes with `Object.isExtensible(fn)` so SES / Lockdown
+            // frozen-intrinsics environments never suffer false positives (S2-17).
+            if (Object.isExtensible(fn)) {
+                const origProto = Object.getPrototypeOf(fn);
                 try {
+                    if (Reflect.setPrototypeOf(fn, origProto) !== true) {
+                        prototypeLies.push(`${label}:non_cyclic_setPrototypeOf_rejected`);
+                    }
                     Object.setPrototypeOf(fn, origProto);
                 }
                 catch {
-                    // ignore
+                    prototypeLies.push(`${label}:fake_cyclic_proto_trap`);
+                }
+                try {
+                    Object.setPrototypeOf(fn, Object.create(fn));
+                    prototypeLies.push(`${label}:es6_proxy_detected`);
+                }
+                catch (err) {
+                    const stack = err?.stack || '';
+                    if (stack.includes('Proxy.')) {
+                        prototypeLies.push(`${label}:proxy_setPrototypeOf_trap`);
+                    }
+                }
+                finally {
+                    try {
+                        Object.setPrototypeOf(fn, origProto);
+                    }
+                    catch {
+                        // ignore
+                    }
                 }
             }
         }
         catch {
             prototypeLies.push(`${label}:proxy_toString_trap`);
         }
+        return prototypeLies.length > beforeLen;
     };
     try {
         checkNativeFunction(Function.prototype.toString, 'Function.toString', 'toString');
+        // Verify Math transcendental functions have not been monkey-patched or proxied (S3-29)
+        if (checkNativeFunction(Math.acos, 'Math.acos', 'acos') ||
+            checkNativeFunction(Math.sin, 'Math.sin', 'sin') ||
+            checkNativeFunction(Math.cos, 'Math.cos', 'cos') ||
+            checkNativeFunction(Math.tan, 'Math.tan', 'tan') ||
+            checkNativeFunction(Math.expm1, 'Math.expm1', 'expm1')) {
+            mathTampered = true;
+        }
         if (typeof HTMLCanvasElement !== 'undefined') {
             checkNativeFunction(HTMLCanvasElement.prototype.toDataURL, 'HTMLCanvasElement.toDataURL', 'toDataURL');
             checkNativeFunction(HTMLCanvasElement.prototype.getContext, 'HTMLCanvasElement.getContext', 'getContext');
@@ -2055,7 +2301,7 @@ export function collectLieDetectorProbe() {
             checkNativeFunction(OfflineAudioContext.prototype.startRendering, 'OfflineAudioContext.startRendering', 'startRendering');
         }
         if (typeof AudioBuffer !== 'undefined') {
-            checkNativeFunction(AudioBuffer.prototype.getChannelData, 'AudioBuffer.getChannelData', 'getChannelData');
+            checkNativeFunction(AudioBuffer.prototype.getChannelData, 'AudioBuffer.prototype.getChannelData', 'getChannelData');
             if (typeof AudioBuffer.prototype.copyFromChannel === 'function') {
                 checkNativeFunction(AudioBuffer.prototype.copyFromChannel, 'AudioBuffer.copyFromChannel', 'copyFromChannel');
             }
@@ -2078,8 +2324,6 @@ export function collectLieDetectorProbe() {
             for (const prop of navProps) {
                 const desc = Object.getOwnPropertyDescriptor(Navigator.prototype, prop);
                 if (!desc) {
-                    // Standard cross-browser WebIDL Navigator properties (excluding Chromium-only deviceMemory)
-                    // exist on Navigator.prototype unless deleted (e.g. stealth `delete Navigator.prototype.webdriver`).
                     if (prop !== 'deviceMemory') {
                         prototypeLies.push(`Navigator.${prop}:descriptor_deleted`);
                     }
@@ -2089,8 +2333,6 @@ export function collectLieDetectorProbe() {
                 }
                 else {
                     checkNativeFunction(desc.get, `Navigator.${prop}.get`, `get ${prop}`);
-                    // Getter Arity Probe (catches Apify fingerprint-injector `getterValue` proxy which returns
-                    // spoofed value only when `args.length === 0` and falls back to native when `args.length > 0`).
                     if (typeof navigator !== 'undefined' &&
                         prop !== 'plugins' &&
                         prop !== 'mimeTypes') {
@@ -2137,6 +2379,9 @@ export function collectLieDetectorProbe() {
     catch {
         // ignore
     }
+    if (mathTampered) {
+        mathEngineSignature = 'unknown_tampered_math';
+    }
     // 3. Automation / WebDriver / CDP flags
     const automationFlags = [];
     try {
@@ -2180,26 +2425,37 @@ export function collectLieDetectorProbe() {
 }
 
 // --- index.js ---
-/**
- * PrismID Web & WebView SDK (`prismid-js` v1.0.1)
- *
- * Provides 3-line integration for Browser Web apps and Tauri Desktop WebViews:
- *   1. Requests a 60s single-use challenge (`nonce` + `render_seed` [s0,s1,s2,s3])
- *   2. Executes WebGL shader spot-pixel sampling, non-extractable WebCrypto ECDSA P-256
- *      device key signing (`d_key_*`), inline Blob Worker + OffscreenCanvas cross-thread
- *      lie detection, 5-silo self-healing storage beacon, raw Canvas/Audio exactness
- *      measurements, sub-pixel TextMetrics font bounding boxes, and optional Rust NativeHardwareAnchor
- *   3. Seals the entire probe payload via AES-256-GCM (AEAD) and submits to `/api/v1/risk/identify`
- */
-
-
-
-
-
-
-
-
-
+function inferSubjectIdFromToken(token) {
+    if (!token)
+        return '';
+    const raw = token.startsWith('Bearer ') ? token.slice(7).trim() : token.trim();
+    if (!raw)
+        return '';
+    // 1. PrismID signed bearer token: `<subject_id>.<exp_unix>.<64hex>`
+    const prismMatch = /^(.+)\.\d{9,12}\.[0-9a-f]{64}$/i.exec(raw);
+    if (prismMatch && prismMatch[1]) {
+        return prismMatch[1];
+    }
+    // 2. Standard 3-segment JWT (`header.payload.signature`) with `sub` claim
+    const parts = raw.split('.');
+    if (parts.length === 3 && parts[0].startsWith('eyJ')) {
+        try {
+            const b64 = parts[1].replace(/-/g, '+').replace(/_/g, '/');
+            const padded = b64 + '='.repeat((4 - (b64.length % 4)) % 4);
+            const jsonStr = typeof atob === 'function'
+                ? atob(padded)
+                : Buffer.from(padded, 'base64').toString('utf8');
+            const parsed = JSON.parse(jsonStr);
+            if (typeof parsed.sub === 'string' && parsed.sub.trim()) {
+                return parsed.sub.trim();
+            }
+        }
+        catch {
+            // fall through
+        }
+    }
+    return raw;
+}
 function collectDisplayGamutSpec() {
     try {
         if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') {
@@ -2301,9 +2557,21 @@ export function createPrismClient(options = {}) {
     const fetchFn = options.fetchImpl || (typeof fetch !== 'undefined' ? fetch.bind(globalThis) : undefined);
     const cooldownMs = options.cooldownMs ?? 5 * 60 * 1000;
     const requestTimeoutMs = options.requestTimeoutMs ?? 5000;
+    const probeTimeoutMs = options.probeTimeoutMs ?? 800;
     let lastIdentifiedToken = null;
     let lastIdentifiedAt = 0;
+    let lastError = null;
     let inFlightPromise = null;
+    function recordError(err) {
+        lastError = err;
+        try {
+            options.onError?.(err);
+        }
+        catch {
+            // ignore observer exceptions
+        }
+        return err;
+    }
     function withDeadline(promise, timeoutMs, fallback) {
         let timer;
         const deadline = new Promise((resolve) => {
@@ -2324,7 +2592,9 @@ export function createPrismClient(options = {}) {
             timer = setTimeout(() => {
                 if (controller)
                     controller.abort();
-                reject(new Error('request deadline exceeded'));
+                const err = new Error('request deadline exceeded');
+                err.isTimeout = true;
+                reject(err);
             }, requestTimeoutMs);
         });
         try {
@@ -2348,15 +2618,19 @@ export function createPrismClient(options = {}) {
                 clearTimeout(timer);
         }
     }
-    async function buildAuthHeaders() {
+    // Resolves access token AT MOST ONCE per client operation (S3-39).
+    async function resolveAccessToken() {
+        if (!options.getAccessToken)
+            return null;
+        const tok = await withDeadline(Promise.resolve(options.getAccessToken()).catch(() => null), Math.min(requestTimeoutMs, 1500), null);
+        return tok ? String(tok) : null;
+    }
+    function buildAuthHeadersFromToken(token) {
         const headers = {
             'Content-Type': 'application/json',
         };
-        if (options.getAccessToken) {
-            const token = await withDeadline(Promise.resolve(options.getAccessToken()).catch(() => null), Math.min(requestTimeoutMs, 1500), null);
-            if (token) {
-                headers['Authorization'] = token.startsWith('Bearer ') ? token : `Bearer ${token}`;
-            }
+        if (token) {
+            headers['Authorization'] = token.startsWith('Bearer ') ? token : `Bearer ${token}`;
         }
         return headers;
     }
@@ -2364,35 +2638,67 @@ export function createPrismClient(options = {}) {
         const samplePoints = Array.isArray(challenge.sample_points) && challenge.sample_points.length > 0
             ? challenge.sample_points
             : DEFAULT_SAMPLE_POINTS;
+        // Enforce bounded aggregate probe budget across synchronous & asynchronous probes (S3-41).
+        const aggregateBudgetMs = Math.max(120, Math.min(probeTimeoutMs, requestTimeoutMs));
+        const audioBudgetMs = Math.min(400, Math.floor(aggregateBudgetMs * 0.65));
+        const workerBudgetMs = Math.min(300, Math.floor(aggregateBudgetMs * 0.5));
+        const storageBudgetMs = Math.min(350, Math.floor(aggregateBudgetMs * 0.55));
+        const providerTimeoutMs = Math.min(requestTimeoutMs, aggregateBudgetMs);
         const sysMeta = collectSystemMetadata();
         const webgl = collectWebGLProbe(challenge.render_seed, samplePoints);
         const fontsCanvas = collectFontsAndCanvasProbe();
         const lieDetector = collectLieDetectorProbe();
-        const providerTimeoutMs = Math.min(requestTimeoutMs, 1000);
-        const [audioRes, workerLie, storageBeacon, nativeAnchor, turnstileToken] = await Promise.all([
-            collectAudioProbeWithTrap(),
+        const fallbackAudio = {
+            audio_compressor_hash: sha256Hex('prismid-audio-aggregate-deadline'),
+            audio_copy_hash: sha256Hex('prismid-audio-aggregate-deadline'),
+            audio_silent_delta: 0,
+            audio_noise_injected: false,
+            audio_muted: false,
+        };
+        const fallbackWorker = {
+            worker_unavailable: true,
+            worker_webgl_available: false,
+            worker_lie_detected: false,
+            worker_gpu_renderer: '',
+            worker_static_webgl_fp_hash: '',
+            worker_cpu_cores: 0,
+            worker_platform: '',
+            worker_user_agent: '',
+            worker_timezone: '',
+        };
+        const fallbackBeacon = {
+            beacon_id: '',
+            storage_healed: false,
+            surviving_silos: [],
+            surviving_silos_mask: 0,
+        };
+        // Preload persistent deviceKey in parallel with async probes so IndexedDB I/O overlaps (S3-41).
+        const [audioRes, workerLie, storageBeacon, nativeAnchor, turnstileToken] = await withDeadline(Promise.all([
+            collectAudioProbeWithTrap(audioBudgetMs),
             collectWorkerLieProbe({
                 gpuRenderer: webgl.gpu_renderer,
                 staticWebGLFpHash: webgl.static_webgl_fp_hash,
+                webglAvailable: webgl.webgl_available,
                 cpuCores: sysMeta.cpuCores,
                 platform: sysMeta.platform,
                 userAgent: sysMeta.userAgent,
                 timezone: sysMeta.timezone,
-            }),
-            collectAndHealStorageBeacon(),
+            }, workerBudgetMs),
+            collectAndHealStorageBeacon(storageBudgetMs),
             options.nativeAnchorProvider
                 ? withDeadline(Promise.resolve(options.nativeAnchorProvider()).catch(() => null), providerTimeoutMs, null)
                 : Promise.resolve(null),
             options.getTurnstileToken
                 ? withDeadline(Promise.resolve(options.getTurnstileToken()).catch(() => undefined), providerTimeoutMs, undefined)
                 : Promise.resolve(undefined),
-        ]);
+            preloadDeviceKey().catch(() => false),
+        ]).then(([a, w, s, n, t]) => [a, w, s, n, t]), aggregateBudgetMs, [fallbackAudio, fallbackWorker, fallbackBeacon, null, undefined]);
         const deviceKey = await withDeadline(signChallengeWithDeviceKey({
             nonce: challenge.nonce,
             beaconId: storageBeacon.beacon_id,
             staticWebGLFpHash: webgl.static_webgl_fp_hash,
             audioCompressorHash: audioRes.audio_compressor_hash,
-        }), 350, undefined);
+        }), 200, undefined);
         const payload = {
             v: 1,
             nonce: challenge.nonce,
@@ -2411,6 +2717,7 @@ export function createPrismClient(options = {}) {
             audio_compressor_hash: audioRes.audio_compressor_hash,
             audio_copy_hash: audioRes.audio_copy_hash,
             audio_silent_delta: audioRes.audio_silent_delta,
+            ...(audioRes.audio_muted ? { audio_muted: true } : {}),
             system: {
                 user_agent: sysMeta.userAgent,
                 platform: sysMeta.platform,
@@ -2441,7 +2748,7 @@ export function createPrismClient(options = {}) {
                 webgl_noise_injected: webgl.webgl_noise_injected,
                 audio_noise_injected: audioRes.audio_noise_injected,
                 storage_healed: storageBeacon.storage_healed,
-                storage_silos_mask: storageBeacon.surviving_silos.length,
+                storage_silos_mask: storageBeacon.surviving_silos_mask,
                 math_engine_signature: lieDetector.math_engine_signature,
                 math_constants_hash: lieDetector.math_constants_hash,
                 prototype_lies: lieDetector.prototype_lies,
@@ -2457,25 +2764,29 @@ export function createPrismClient(options = {}) {
         };
         return { request, payload };
     }
-    async function identify(callOpts) {
-        if (!fetchFn)
-            return null;
-        const token = options.getAccessToken
-            ? (await withDeadline(Promise.resolve(options.getAccessToken()).catch(() => null), Math.min(requestTimeoutMs, 1500), null)) || null
-            : null;
+    async function identifyDetailed(callOpts) {
+        if (!fetchFn) {
+            return {
+                result: null,
+                error: recordError({ kind: 'network', message: 'fetch implementation unavailable' }),
+            };
+        }
+        // Resolve access token ONCE and reuse for cooldown check + HTTP Authorization header (S3-39).
+        const token = await resolveAccessToken();
         const now = Date.now();
         if (!callOpts?.force &&
             lastIdentifiedAt > 0 &&
             lastIdentifiedToken === token &&
             now - lastIdentifiedAt < cooldownMs) {
-            return null;
+            return { result: null, error: null };
         }
         if (inFlightPromise) {
             return inFlightPromise;
         }
         inFlightPromise = (async () => {
             try {
-                const headers = await buildAuthHeaders();
+                lastError = null;
+                const headers = buildAuthHeadersFromToken(token);
                 if (!callOpts?.force) {
                     try {
                         const scRes = await fetchJsonWithDeadline(`${baseUrl}/api/v1/risk/should-collect`, {
@@ -2487,12 +2798,21 @@ export function createPrismClient(options = {}) {
                             if (shouldCollect === false) {
                                 lastIdentifiedToken = token;
                                 lastIdentifiedAt = Date.now();
-                                return { accepted: true };
+                                // Never synthesize `{ accepted: true }` when collection was skipped (S3-53).
+                                return {
+                                    result: {
+                                        accepted: false,
+                                        skipped: true,
+                                        code: 'COLLECTION_SKIPPED',
+                                        message: 'collection skipped by should-collect policy',
+                                    },
+                                    error: null,
+                                };
                             }
                         }
                     }
                     catch {
-                        // Proceed to challenge if should-collect endpoint is not used
+                        // Proceed to challenge if should-collect endpoint is unreachable or unused
                     }
                 }
                 const chRes = await fetchJsonWithDeadline(`${baseUrl}/api/v1/risk/challenge`, {
@@ -2501,12 +2821,23 @@ export function createPrismClient(options = {}) {
                     body: '{}',
                 });
                 if (!chRes.ok || !chRes.data) {
-                    return null;
+                    const err = recordError({
+                        kind: chRes.ok ? 'malformed_response' : 'http',
+                        status: chRes.status,
+                        code: chRes.data?.code,
+                        message: chRes.data?.error || `challenge HTTP ${chRes.status}`,
+                    });
+                    return { result: null, error: err };
                 }
                 const chRaw = chRes.data;
                 const challenge = chRaw.nonce ? chRaw : chRaw.data;
                 if (!challenge || !challenge.nonce || !Array.isArray(challenge.render_seed)) {
-                    return null;
+                    const err = recordError({
+                        kind: 'malformed_response',
+                        status: chRes.status,
+                        message: 'invalid challenge schema',
+                    });
+                    return { result: null, error: err };
                 }
                 const { request } = await collectAndSeal(challenge);
                 const idRes = await fetchJsonWithDeadline(`${baseUrl}/api/v1/risk/identify`, {
@@ -2516,7 +2847,12 @@ export function createPrismClient(options = {}) {
                 });
                 const idRaw = idRes.data;
                 if (!idRaw || typeof idRaw !== 'object') {
-                    return null;
+                    const err = recordError({
+                        kind: idRes.ok ? 'malformed_response' : 'http',
+                        status: idRes.status,
+                        message: `identify HTTP ${idRes.status} without valid JSON body`,
+                    });
+                    return { result: null, error: err };
                 }
                 const candidate = typeof idRaw.accepted === 'boolean'
                     ? idRaw
@@ -2525,19 +2861,52 @@ export function createPrismClient(options = {}) {
                         : undefined;
                 // Strict schema check: never synthesize `{ accepted: true }` from an empty `{}` response!
                 if (!candidate || typeof candidate.accepted !== 'boolean') {
-                    return null;
+                    const err = recordError({
+                        kind: idRes.ok ? 'malformed_response' : 'http',
+                        status: idRes.status,
+                        code: idRaw.code,
+                        message: idRaw.error || idRaw.message || `identify HTTP ${idRes.status}`,
+                    });
+                    return { result: null, error: err };
                 }
                 if (!idRes.ok && candidate.accepted !== false) {
-                    return null;
+                    const err = recordError({
+                        kind: 'http',
+                        status: idRes.status,
+                        code: candidate.code,
+                        message: candidate.message || `identify HTTP ${idRes.status}`,
+                    });
+                    return { result: null, error: err };
+                }
+                if (!idRes.ok) {
+                    const err = recordError({
+                        kind: 'http',
+                        status: idRes.status,
+                        code: candidate.code,
+                        message: candidate.message || idRaw.error || `identify HTTP ${idRes.status}`,
+                    });
+                    // Preserve structured `accepted: false` rejection payloads (e.g. HTTP 409/403) when non-429/401,
+                    // while return null on 401/429 gateway rejections without domain error code if no `code` was set.
+                    if (idRes.status === 401 || idRes.status === 429) {
+                        if (!candidate.code) {
+                            return { result: null, error: err };
+                        }
+                    }
+                    return { result: candidate, error: err };
                 }
                 if (candidate.accepted && !candidate.risk_pending && !candidate.device_key_recovery_required) {
                     lastIdentifiedToken = token;
                     lastIdentifiedAt = Date.now();
                 }
-                return candidate;
+                return { result: candidate, error: null };
             }
-            catch {
-                return null;
+            catch (caught) {
+                const isTimeout = Boolean(caught?.isTimeout);
+                const err = recordError({
+                    kind: isTimeout ? 'timeout' : 'network',
+                    message: caught instanceof Error ? caught.message : 'network error',
+                });
+                return { result: null, error: err };
             }
             finally {
                 inFlightPromise = null;
@@ -2545,13 +2914,184 @@ export function createPrismClient(options = {}) {
         })();
         return inFlightPromise;
     }
-    function resetSessionCache() {
+    async function identify(callOpts) {
+        const { result } = await identifyDetailed(callOpts);
+        return result;
+    }
+    function getLastError() {
+        return lastError;
+    }
+    async function rebindKey(rebindOpts) {
+        if (!fetchFn) {
+            return { accepted: false, error: 'fetch unavailable' };
+        }
+        try {
+            const token = await resolveAccessToken();
+            const headers = buildAuthHeadersFromToken(token);
+            let subjectId = (rebindOpts?.subjectId || '').trim();
+            if (!subjectId && options.getSubjectId) {
+                const resolvedSub = await withDeadline(Promise.resolve(options.getSubjectId()).catch(() => null), 1500, null);
+                if (resolvedSub)
+                    subjectId = String(resolvedSub).trim();
+            }
+            if (!subjectId) {
+                subjectId = inferSubjectIdFromToken(token);
+            }
+            if (!subjectId) {
+                return { accepted: false, error: 'subjectId is required to sign rebind proof' };
+            }
+            const beaconId = rebindOpts?.beaconId?.trim().toLowerCase() ||
+                (await collectAndHealStorageBeacon(Math.min(350, probeTimeoutMs))).beacon_id;
+            if (!beaconId) {
+                return { accepted: false, error: 'storage beacon unavailable' };
+            }
+            const chRes = await fetchJsonWithDeadline(`${baseUrl}/api/v1/risk/challenge`, {
+                method: 'POST',
+                headers,
+                body: '{}',
+            });
+            const chRaw = chRes.data;
+            const challenge = chRaw?.nonce ? chRaw : chRaw?.data;
+            if (!chRes.ok || !challenge?.nonce) {
+                return { accepted: false, error: chRaw?.error || `challenge HTTP ${chRes.status}` };
+            }
+            let deviceKey;
+            let previousDeviceKey;
+            if (rebindOpts?.rotate) {
+                const rotated = await rotateDeviceKeyAndSignRebind({
+                    nonce: challenge.nonce,
+                    subjectId,
+                    beaconId,
+                });
+                deviceKey = rotated?.device_key;
+                previousDeviceKey = rotated?.previous_device_key;
+            }
+            else {
+                deviceKey = await signRebindWithDeviceKey({
+                    nonce: challenge.nonce,
+                    subjectId,
+                    beaconId,
+                });
+            }
+            if (!deviceKey) {
+                return { accepted: false, error: 'failed to initialize or sign with persistent WebCrypto device key' };
+            }
+            let stepUpToken = rebindOpts?.stepUpToken?.trim() || '';
+            if (!stepUpToken && !previousDeviceKey && options.getStepUpToken) {
+                const fetchedStepUp = await withDeadline(Promise.resolve(options.getStepUpToken('rebind_key', { subjectId, beaconId })).catch(() => null), requestTimeoutMs, null);
+                if (fetchedStepUp)
+                    stepUpToken = String(fetchedStepUp).trim();
+            }
+            const rbRes = await fetchJsonWithDeadline(`${baseUrl}/api/v1/risk/rebind-key`, {
+                method: 'POST',
+                headers: {
+                    ...headers,
+                    ...(stepUpToken ? { 'X-PrismID-StepUp-Token': stepUpToken } : {}),
+                },
+                body: JSON.stringify({
+                    challenge_nonce: challenge.nonce,
+                    beacon_id: beaconId,
+                    step_up_token: stepUpToken || undefined,
+                    device_key: deviceKey,
+                    ...(previousDeviceKey ? { previous_device_key: previousDeviceKey } : {}),
+                }),
+            });
+            if (!rbRes.data) {
+                return { accepted: false, error: `rebind-key HTTP ${rbRes.status}` };
+            }
+            resetSessionCache();
+            return {
+                ...rbRes.data,
+                accepted: rbRes.ok && rbRes.data.accepted !== false,
+            };
+        }
+        catch (err) {
+            return {
+                accepted: false,
+                error: err instanceof Error ? err.message : 'rebindKey request failed',
+            };
+        }
+    }
+    async function clearSpoof(clearOpts) {
+        if (!fetchFn) {
+            return { accepted: false, error: 'fetch unavailable' };
+        }
+        try {
+            const token = await resolveAccessToken();
+            const headers = buildAuthHeadersFromToken(token);
+            const subjectId = inferSubjectIdFromToken(token);
+            let stepUpToken = clearOpts?.stepUpToken?.trim() || '';
+            if (!stepUpToken && options.getStepUpToken) {
+                const fetched = await withDeadline(Promise.resolve(options.getStepUpToken('clear_spoof', { subjectId })).catch(() => null), requestTimeoutMs, null);
+                if (fetched)
+                    stepUpToken = String(fetched).trim();
+            }
+            const res = await fetchJsonWithDeadline(`${baseUrl}/api/v1/risk/clear-spoof`, {
+                method: 'POST',
+                headers: {
+                    ...headers,
+                    ...(stepUpToken ? { 'X-PrismID-StepUp-Token': stepUpToken } : {}),
+                },
+                body: JSON.stringify({ step_up_token: stepUpToken }),
+            });
+            if (!res.data) {
+                return { accepted: false, error: `clear-spoof HTTP ${res.status}` };
+            }
+            resetSessionCache();
+            return {
+                ...res.data,
+                accepted: res.ok && res.data.accepted !== false,
+            };
+        }
+        catch (err) {
+            return {
+                accepted: false,
+                error: err instanceof Error ? err.message : 'clearSpoof request failed',
+            };
+        }
+    }
+    async function deleteSubject() {
+        if (!fetchFn) {
+            return { accepted: false, error: 'fetch unavailable' };
+        }
+        try {
+            const token = await resolveAccessToken();
+            const headers = buildAuthHeadersFromToken(token);
+            const res = await fetchJsonWithDeadline(`${baseUrl}/api/v1/risk/subject`, {
+                method: 'DELETE',
+                headers,
+            });
+            if (!res.data) {
+                return { accepted: false, error: `delete-subject HTTP ${res.status}` };
+            }
+            resetSessionCache({ includeDeviceKey: true });
+            return {
+                ...res.data,
+                accepted: res.ok && res.data.accepted !== false,
+            };
+        }
+        catch (err) {
+            return {
+                accepted: false,
+                error: err instanceof Error ? err.message : 'deleteSubject request failed',
+            };
+        }
+    }
+    function resetSessionCache(resetOpts) {
         lastIdentifiedToken = null;
         lastIdentifiedAt = 0;
+        if (resetOpts?.includeDeviceKey) {
+            resetDeviceKeyCache();
+        }
     }
     return {
         identify,
+        identifyDetailed,
+        getLastError,
         collectAndSeal,
+        rebindKey,
+        clearSpoof,
+        deleteSubject,
         resetSessionCache,
     };
 }

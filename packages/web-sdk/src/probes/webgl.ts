@@ -1,8 +1,8 @@
 /**
  * PrismID WebGL Probe:
  *   1. Unmasked GPU Vendor & Renderer (`WEBGL_debug_renderer_info`)
- *   2. 12 Hardware Register Limits Vector (`webgl_limits_vector`)
- *   3. Static 3D Multi-Frequency Anti-Aliased Geometry Scene Hash (`static_webgl_fp_hash`)
+ *   2. Hardware Register Limits Vector (`webgl_limits_vector`)
+ *   3. Static 3D Multi-Frequency Shader Scene Hash (`static_webgl_fp_hash`)
  *   4. Dynamic `render_seed` [s0, s1, s2, s3] 256x256 Fragment Shader & 8 Spot-Pixel Sampler
  */
 
@@ -92,15 +92,19 @@ export function computeExpectedSpotPixelMath(
   return [q(r), q(g), q(b), 255]
 }
 
+const DETERMINISTIC_CONTEXT_ATTRS: WebGLContextAttributes = {
+  antialias: false,
+  depth: false,
+  stencil: false,
+  preserveDrawingBuffer: true,
+}
+
 function createWebGLContext(width: number, height: number): WebGLRenderingContext | null {
   try {
     if (typeof OffscreenCanvas !== 'undefined') {
       const oc = new OffscreenCanvas(width, height)
-      const gl = oc.getContext('webgl', {
-        antialias: true,
-        preserveDrawingBuffer: true,
-      }) as WebGLRenderingContext | null
-      if (gl) return gl
+      const gl = oc.getContext('webgl', DETERMINISTIC_CONTEXT_ATTRS) as WebGLRenderingContext | null
+      if (gl && (typeof gl.isContextLost !== 'function' || !gl.isContextLost())) return gl
     }
   } catch {
     // Fallback to HTMLCanvasElement
@@ -110,20 +114,25 @@ function createWebGLContext(width: number, height: number): WebGLRenderingContex
       const canvas = document.createElement('canvas')
       canvas.width = width
       canvas.height = height
-      const gl = (canvas.getContext('webgl', {
-        antialias: true,
-        preserveDrawingBuffer: true,
-      }) ||
-        canvas.getContext('experimental-webgl', {
-          antialias: true,
-          preserveDrawingBuffer: true,
-        })) as WebGLRenderingContext | null
-      return gl
+      const gl = (canvas.getContext('webgl', DETERMINISTIC_CONTEXT_ATTRS) ||
+        canvas.getContext('experimental-webgl', DETERMINISTIC_CONTEXT_ATTRS)) as WebGLRenderingContext | null
+      if (gl && (typeof gl.isContextLost !== 'function' || !gl.isContextLost())) return gl
     }
   } catch {
     // WebGL unavailable
   }
   return null
+}
+
+function releaseWebGLContext(gl: WebGLRenderingContext): void {
+  try {
+    const ext = gl.getExtension('WEBGL_lose_context')
+    if (ext && typeof ext.loseContext === 'function') {
+      ext.loseContext()
+    }
+  } catch {
+    // ignore
+  }
 }
 
 function compileProgram(
@@ -160,17 +169,25 @@ function compileProgram(
   return prog
 }
 
-function drawFullScreenQuad(gl: WebGLRenderingContext, prog: WebGLProgram): WebGLBuffer | null {
+// Single oversized clip-space triangle avoids any diagonal 2-triangle seam across [0..W, 0..H].
+function drawFullScreenTriangle(gl: WebGLRenderingContext, prog: WebGLProgram): WebGLBuffer | null {
   const buf = gl.createBuffer()
   if (!buf) return null
   gl.bindBuffer(gl.ARRAY_BUFFER, buf)
-  const vertices = new Float32Array([-1, -1, 1, -1, -1, 1, -1, 1, 1, -1, 1, 1])
+  const vertices = new Float32Array([-1, -1, 3, -1, -1, 3])
   gl.bufferData(gl.ARRAY_BUFFER, vertices, gl.STATIC_DRAW)
   const posLoc = gl.getAttribLocation(prog, 'a_pos')
   gl.enableVertexAttribArray(posLoc)
   gl.vertexAttribPointer(posLoc, 2, gl.FLOAT, false, 0, 0)
-  gl.drawArrays(gl.TRIANGLES, 0, 6)
+  gl.drawArrays(gl.TRIANGLES, 0, 3)
   return buf
+}
+
+function hasAnyNonZeroByte(buf: Uint8Array): boolean {
+  for (let i = 0; i < buf.length; i++) {
+    if (buf[i] !== 0) return true
+  }
+  return false
 }
 
 function extractWebGLLimitsVector(gl: WebGLRenderingContext): string {
@@ -242,104 +259,120 @@ export function collectWebGLProbe(
 ): WebGLProbeResult {
   const gl = createWebGLContext(256, 256)
   if (!gl) {
-    // Headless / non-WebGL environment fallback (strictly marked webgl_available: false and SwiftShader,
-    // which server/go demotes to VirtualGPUConfidence = 0.30 / RiskPending = true)
+    // Non-WebGL environment fallback (hardened Firefox / enterprise policy / headless without GPU).
+    // Reported honestly as `webgl_available: false` and `Unavailable / WebGL Disabled` rather than
+    // impersonating `SwiftShader` so server/go can distinguish bound privacy browsers from software GPU farms (S2-18).
     return {
-      gpu_vendor: 'SwiftShader',
-      gpu_renderer: 'Google SwiftShader (Headless Fallback)',
+      gpu_vendor: 'Unavailable',
+      gpu_renderer: 'WebGL Disabled',
       webgl_limits_vector: '8192|8192|8192,8192|8192|1024|1024|30|1,1|1,1024|0|23,23,23,23',
       webgl_extensions_hash: '0000000000000000',
-      static_webgl_fp_hash: sha256Hex('headless-no-webgl-static-fallback'),
+      static_webgl_fp_hash: sha256Hex('no-webgl-disabled-static-fallback'),
       spot_pixels: samplePoints.map(([x, y]) => computeExpectedSpotPixelMath(x, y, renderSeed)),
       webgl_available: false,
       webgl_noise_injected: false,
     }
   }
 
-  let gpuVendor = 'Unknown'
-  let gpuRenderer = 'Unknown'
   try {
-    const dbg = gl.getExtension('WEBGL_debug_renderer_info')
-    if (dbg) {
-      gpuVendor = String(gl.getParameter(dbg.UNMASKED_VENDOR_WEBGL) || gl.getParameter(gl.VENDOR) || 'Unknown')
-      gpuRenderer = String(gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) || gl.getParameter(gl.RENDERER) || 'Unknown')
-    } else {
-      gpuVendor = String(gl.getParameter(gl.VENDOR) || 'Unknown')
-      gpuRenderer = String(gl.getParameter(gl.RENDERER) || 'Unknown')
-    }
-  } catch {
-    // ignore
-  }
-
-  const limitsVector = extractWebGLLimitsVector(gl)
-  const extensionsHash = extractWebGLExtensionsHash(gl)
-
-  // Step 1: Render 64x64 static fingerprint scene and hash raw pixel buffer
-  // Also perform dual readPixels determinism check to detect WebGL noise-injection extensions.
-  let staticFpHash = ''
-  let webglNoiseInjected = false
-  try {
-    gl.viewport(0, 0, 64, 64)
-    const staticProg = compileProgram(gl, VERTEX_SHADER_SRC, STATIC_FINGERPRINT_FRAGMENT_SHADER_SRC)
-    if (staticProg) {
-      gl.useProgram(staticProg)
-      const buf = drawFullScreenQuad(gl, staticProg)
-      const pixels1 = new Uint8Array(64 * 64 * 4)
-      const pixels2 = new Uint8Array(64 * 64 * 4)
-      gl.readPixels(0, 0, 64, 64, gl.RGBA, gl.UNSIGNED_BYTE, pixels1)
-      gl.readPixels(0, 0, 64, 64, gl.RGBA, gl.UNSIGNED_BYTE, pixels2)
-      const hash1 = sha256Hex(pixels1)
-      const hash2 = sha256Hex(pixels2)
-      staticFpHash = hash1
-      if (hash1 !== hash2) {
-        webglNoiseInjected = true
+    let gpuVendor = 'Unknown'
+    let gpuRenderer = 'Unknown'
+    try {
+      const dbg = gl.getExtension('WEBGL_debug_renderer_info')
+      if (dbg) {
+        gpuVendor = String(gl.getParameter(dbg.UNMASKED_VENDOR_WEBGL) || gl.getParameter(gl.VENDOR) || 'Unknown')
+        gpuRenderer = String(gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) || gl.getParameter(gl.RENDERER) || 'Unknown')
+      } else {
+        gpuVendor = String(gl.getParameter(gl.VENDOR) || 'Unknown')
+        gpuRenderer = String(gl.getParameter(gl.RENDERER) || 'Unknown')
       }
-      if (buf) gl.deleteBuffer(buf)
-      gl.deleteProgram(staticProg)
+    } catch {
+      // ignore
     }
-  } catch {
-    // ignore
-  }
-  if (!staticFpHash) {
-    staticFpHash = sha256Hex(`${gpuVendor}|${gpuRenderer}|${limitsVector}`)
-  }
 
-  // Step 2: Render 256x256 dynamic challenge shader with u_seed = renderSeed
-  const spotPixels: [number, number, number, number][] = []
-  try {
-    gl.viewport(0, 0, 256, 256)
-    const dynProg = compileProgram(gl, VERTEX_SHADER_SRC, DYNAMIC_CHALLENGE_FRAGMENT_SHADER_SRC)
-    if (dynProg) {
-      gl.useProgram(dynProg)
-      const seedLoc = gl.getUniformLocation(dynProg, 'u_seed')
-      gl.uniform4f(seedLoc, renderSeed[0], renderSeed[1], renderSeed[2], renderSeed[3])
-      const buf = drawFullScreenQuad(gl, dynProg)
-      const pixel = new Uint8Array(4)
-      for (const [x, y] of samplePoints) {
-        gl.readPixels(x, y, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, pixel)
-        spotPixels.push([pixel[0], pixel[1], pixel[2], pixel[3]])
+    const limitsVector = extractWebGLLimitsVector(gl)
+    const extensionsHash = extractWebGLExtensionsHash(gl)
+
+    // Step 1: Render 64x64 static fingerprint scene on a matching 64x64 non-MSAA context
+    // so main-thread and Worker OffscreenCanvas(64, 64) produce bit-identical buffers across
+    // Chromium, Firefox (Gecko), and Safari (WebKit) (S2-17, S3-38).
+    let staticFpHash = ''
+    let webglNoiseInjected = false
+    const staticGl = createWebGLContext(64, 64)
+    if (staticGl) {
+      try {
+        staticGl.viewport(0, 0, 64, 64)
+        const staticProg = compileProgram(staticGl, VERTEX_SHADER_SRC, STATIC_FINGERPRINT_FRAGMENT_SHADER_SRC)
+        if (staticProg) {
+          staticGl.useProgram(staticProg)
+          const buf = drawFullScreenTriangle(staticGl, staticProg)
+          const pixels1 = new Uint8Array(64 * 64 * 4)
+          const pixels2 = new Uint8Array(64 * 64 * 4)
+          staticGl.readPixels(0, 0, 64, 64, staticGl.RGBA, staticGl.UNSIGNED_BYTE, pixels1)
+          const err1 = typeof staticGl.getError === 'function' ? staticGl.getError() : 0
+          staticGl.readPixels(0, 0, 64, 64, staticGl.RGBA, staticGl.UNSIGNED_BYTE, pixels2)
+          const err2 = typeof staticGl.getError === 'function' ? staticGl.getError() : 0
+          const lost = typeof staticGl.isContextLost === 'function' && staticGl.isContextLost()
+          if (!lost && err1 === 0 && err2 === 0 && hasAnyNonZeroByte(pixels1)) {
+            const hash1 = sha256Hex(pixels1)
+            const hash2 = sha256Hex(pixels2)
+            staticFpHash = hash1
+            if (hash1 !== hash2) {
+              webglNoiseInjected = true
+            }
+          }
+          if (buf) staticGl.deleteBuffer(buf)
+          staticGl.deleteProgram(staticProg)
+        }
+      } catch {
+        // ignore
+      } finally {
+        releaseWebGLContext(staticGl)
       }
-      if (buf) gl.deleteBuffer(buf)
-      gl.deleteProgram(dynProg)
     }
-  } catch {
-    // Fallback if shader compilation was blocked
-  }
+    if (!staticFpHash) {
+      staticFpHash = sha256Hex(`${gpuVendor}|${gpuRenderer}|${limitsVector}`)
+    }
 
-  // Do NOT fall back to CPU math when a WebGL context exists but failed/blocked shader rendering:
-  // fill with [0,0,0,0] so broken/stubbed WebGL mocks fail spot-pixel verification honestly.
-  while (spotPixels.length < samplePoints.length) {
-    spotPixels.push([0, 0, 0, 0])
-  }
+    // Step 2: Render 256x256 dynamic challenge shader with u_seed = renderSeed
+    const spotPixels: [number, number, number, number][] = []
+    try {
+      gl.viewport(0, 0, 256, 256)
+      const dynProg = compileProgram(gl, VERTEX_SHADER_SRC, DYNAMIC_CHALLENGE_FRAGMENT_SHADER_SRC)
+      if (dynProg) {
+        gl.useProgram(dynProg)
+        const seedLoc = gl.getUniformLocation(dynProg, 'u_seed')
+        gl.uniform4f(seedLoc, renderSeed[0], renderSeed[1], renderSeed[2], renderSeed[3])
+        const buf = drawFullScreenTriangle(gl, dynProg)
+        const pixel = new Uint8Array(4)
+        for (const [x, y] of samplePoints) {
+          gl.readPixels(x, y, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, pixel)
+          spotPixels.push([pixel[0], pixel[1], pixel[2], pixel[3]])
+        }
+        if (buf) gl.deleteBuffer(buf)
+        gl.deleteProgram(dynProg)
+      }
+    } catch {
+      // Fallback if shader compilation was blocked
+    }
 
-  return {
-    gpu_vendor: gpuVendor,
-    gpu_renderer: gpuRenderer,
-    webgl_limits_vector: limitsVector,
-    webgl_extensions_hash: extensionsHash,
-    static_webgl_fp_hash: staticFpHash,
-    spot_pixels: spotPixels,
-    webgl_available: true,
-    webgl_noise_injected: webglNoiseInjected,
+    // Do NOT fall back to CPU math when a WebGL context exists but failed/blocked shader rendering:
+    // fill with [0,0,0,0] so broken/stubbed WebGL mocks fail spot-pixel verification honestly.
+    while (spotPixels.length < samplePoints.length) {
+      spotPixels.push([0, 0, 0, 0])
+    }
+
+    return {
+      gpu_vendor: gpuVendor,
+      gpu_renderer: gpuRenderer,
+      webgl_limits_vector: limitsVector,
+      webgl_extensions_hash: extensionsHash,
+      static_webgl_fp_hash: staticFpHash,
+      spot_pixels: spotPixels,
+      webgl_available: true,
+      webgl_noise_injected: webglNoiseInjected,
+    }
+  } finally {
+    releaseWebGLContext(gl)
   }
 }

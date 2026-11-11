@@ -130,14 +130,19 @@ export function deriveAEADKeyBytes(nonce: string): Uint8Array {
   return sha256Bytes(AEAD_KEY_DOMAIN_PREFIX + nonce)
 }
 
-export function randomBytes(length: number): Uint8Array {
-  const buf = new Uint8Array(length)
+export function csprngBytes(length: number): Uint8Array | null {
   if (typeof globalThis.crypto !== 'undefined' && typeof globalThis.crypto.getRandomValues === 'function') {
+    const buf = new Uint8Array(length)
     globalThis.crypto.getRandomValues(buf)
     return buf
   }
-  for (let i = 0; i < length; i++) {
-    buf[i] = Math.floor(Math.random() * 256)
+  return null
+}
+
+export function randomBytes(length: number): Uint8Array {
+  const buf = csprngBytes(length)
+  if (!buf) {
+    throw new Error('Cryptographically secure PRNG (crypto.getRandomValues) is unavailable')
   }
   return buf
 }

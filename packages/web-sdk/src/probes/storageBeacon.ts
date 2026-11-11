@@ -2,17 +2,17 @@
  * PrismID 5-Silo Self-Healing Cryptographic Beacon (`storageBeacon.ts`)
  *
  * Persists a 128-bit (32 hex chars) device installation beacon across 5 browser storage silos:
- *   1. `localStorage`
- *   2. `sessionStorage`
- *   3. `IndexedDB` (`prismid_vault_v1` -> `beacons`)
- *   4. `CacheStorage` (`prismid-beacon-cache-v1` -> `https://prismid.invalid/__beacon_v1`)
- *   5. `document.cookie` (`_prismid_bcn_v1`)
+ *   1. `localStorage`   (bit 0 = 1)
+ *   2. `sessionStorage` (bit 1 = 2)
+ *   3. `cookie`         (bit 2 = 4)
+ *   4. `indexedDB`      (bit 3 = 8)
+ *   5. `cacheStorage`   (bit 4 = 16)
  *
- * All asynchronous reads and writes enforce strict per-operation and overall deadlines
- * so blocked/corrupted browser storage engines can never hang `identify()`.
+ * All asynchronous reads and writes enforce strict per-operation and overall deadlines,
+ * abort late background writes after timeout, and never fall back to non-cryptographic PRNGs.
  */
 
-import { randomBytes } from '../crypto/aead.js'
+import { csprngBytes } from '../crypto/aead.js'
 
 const STORAGE_KEY = '_prismid_bcn_v1'
 const IDB_NAME = 'prismid_vault_v1'
@@ -20,10 +20,19 @@ const IDB_STORE = 'beacons'
 const CACHE_NAME = 'prismid-beacon-cache-v1'
 const CACHE_URL = 'https://prismid.invalid/__beacon_v1'
 
+export const SILO_MASK = {
+  localStorage: 1 << 0,
+  sessionStorage: 1 << 1,
+  cookie: 1 << 2,
+  indexedDB: 1 << 3,
+  cacheStorage: 1 << 4,
+} as const
+
 export interface StorageBeaconResult {
   beacon_id: string
   storage_healed: boolean
   surviving_silos: string[]
+  surviving_silos_mask: number
 }
 
 function isValidBeaconId(val: unknown): val is string {
@@ -31,7 +40,11 @@ function isValidBeaconId(val: unknown): val is string {
 }
 
 function generateBeaconId(): string {
-  const bytes = randomBytes(16)
+  const bytes = csprngBytes(16)
+  if (!bytes) {
+    // Never fall back to predictable Math.random() when CSPRNG is absent (S3-34).
+    return ''
+  }
   let hex = ''
   for (let i = 0; i < bytes.length; i++) {
     hex += bytes[i].toString(16).padStart(2, '0')
@@ -50,6 +63,7 @@ function readLocalStorage(): { available: boolean; value: string | null } {
 }
 
 function writeLocalStorage(id: string): void {
+  if (!id) return
   try {
     if (typeof localStorage !== 'undefined') {
       localStorage.setItem(STORAGE_KEY, id)
@@ -70,6 +84,7 @@ function readSessionStorage(): { available: boolean; value: string | null } {
 }
 
 function writeSessionStorage(id: string): void {
+  if (!id) return
   try {
     if (typeof sessionStorage !== 'undefined') {
       sessionStorage.setItem(STORAGE_KEY, id)
@@ -86,9 +101,12 @@ function readCookie(): { available: boolean; value: string | null } {
     }
     const parts = document.cookie.split(';')
     for (const part of parts) {
-      const [k, v] = part.trim().split('=')
+      const eqIdx = part.indexOf('=')
+      if (eqIdx < 0) continue
+      const k = part.slice(0, eqIdx).trim()
+      const v = part.slice(eqIdx + 1).trim()
       if (k === STORAGE_KEY && isValidBeaconId(v)) {
-        return { available: true, value: v.trim() }
+        return { available: true, value: v }
       }
     }
     return { available: true, value: null }
@@ -98,9 +116,13 @@ function readCookie(): { available: boolean; value: string | null } {
 }
 
 function writeCookie(id: string): void {
+  if (!id) return
   try {
     if (typeof document !== 'undefined') {
-      document.cookie = `${STORAGE_KEY}=${id}; path=/; max-age=34560000; SameSite=Lax`
+      const isHttps =
+        typeof globalThis.location !== 'undefined' && globalThis.location?.protocol === 'https:'
+      const secureAttr = isHttps ? '; Secure' : ''
+      document.cookie = `${STORAGE_KEY}=${id}; path=/; max-age=34560000; SameSite=Lax${secureAttr}`
     }
   } catch {
     // ignore
@@ -108,135 +130,125 @@ function writeCookie(id: string): void {
 }
 
 function readIndexedDB(timeoutMs = 150): Promise<{ available: boolean; value: string | null }> {
-  if (typeof indexedDB === 'undefined') {
+  if (typeof indexedDB === 'undefined' || !indexedDB) {
     return Promise.resolve({ available: false, value: null })
   }
   return new Promise((resolve) => {
     let settled = false
+    let db: IDBDatabase | undefined
     const finish = (res: { available: boolean; value: string | null }) => {
       if (settled) return
       settled = true
+      clearTimeout(timer)
+      try {
+        db?.close()
+      } catch {}
       resolve(res)
     }
     const timer = setTimeout(() => finish({ available: false, value: null }), timeoutMs)
 
     try {
       const req = indexedDB.open(IDB_NAME, 1)
-      req.onblocked = () => {
-        clearTimeout(timer)
-        finish({ available: false, value: null })
-      }
+      req.onblocked = () => finish({ available: false, value: null })
       req.onupgradeneeded = () => {
+        if (settled) {
+          try { req.transaction?.abort() } catch {}
+          return
+        }
         try {
-          const db = req.result
-          if (!db.objectStoreNames.contains(IDB_STORE)) {
-            db.createObjectStore(IDB_STORE)
+          const upgDb = req.result
+          if (!upgDb.objectStoreNames.contains(IDB_STORE)) {
+            upgDb.createObjectStore(IDB_STORE)
           }
         } catch {
           // ignore
         }
       }
-      req.onerror = () => {
-        clearTimeout(timer)
-        finish({ available: false, value: null })
-      }
+      req.onerror = () => finish({ available: false, value: null })
       req.onsuccess = () => {
+        db = req.result
+        if (settled) {
+          try { db.close() } catch {}
+          return
+        }
         try {
-          const db = req.result
           const tx = db.transaction(IDB_STORE, 'readonly')
           const store = tx.objectStore(IDB_STORE)
           const getReq = store.get(STORAGE_KEY)
           getReq.onsuccess = () => {
-            clearTimeout(timer)
             const val = getReq.result
-            try {
-              db.close()
-            } catch {}
             finish({ available: true, value: isValidBeaconId(val) ? val.trim() : null })
           }
           getReq.onerror = () => {
-            clearTimeout(timer)
-            try {
-              db.close()
-            } catch {}
             finish({ available: true, value: null })
           }
         } catch {
-          clearTimeout(timer)
           finish({ available: false, value: null })
         }
       }
     } catch {
-      clearTimeout(timer)
       finish({ available: false, value: null })
     }
   })
 }
 
-function writeIndexedDB(id: string, timeoutMs = 150): Promise<void> {
-  if (typeof indexedDB === 'undefined') return Promise.resolve()
+function writeIndexedDB(
+  id: string,
+  timeoutMs = 150,
+  isAborted?: () => boolean
+): Promise<void> {
+  if (!id || typeof indexedDB === 'undefined' || !indexedDB || isAborted?.()) {
+    return Promise.resolve()
+  }
   return new Promise((resolve) => {
     let settled = false
+    let db: IDBDatabase | undefined
     const finish = () => {
       if (settled) return
       settled = true
+      clearTimeout(timer)
+      try {
+        db?.close()
+      } catch {}
       resolve()
     }
     const timer = setTimeout(finish, timeoutMs)
 
     try {
       const req = indexedDB.open(IDB_NAME, 1)
-      req.onblocked = () => {
-        clearTimeout(timer)
-        finish()
-      }
+      req.onblocked = () => finish()
       req.onupgradeneeded = () => {
+        if (settled || isAborted?.()) {
+          try { req.transaction?.abort() } catch {}
+          return
+        }
         try {
-          const db = req.result
-          if (!db.objectStoreNames.contains(IDB_STORE)) {
-            db.createObjectStore(IDB_STORE)
+          const upgDb = req.result
+          if (!upgDb.objectStoreNames.contains(IDB_STORE)) {
+            upgDb.createObjectStore(IDB_STORE)
           }
         } catch {
           // ignore
         }
       }
-      req.onerror = () => {
-        clearTimeout(timer)
-        finish()
-      }
+      req.onerror = () => finish()
       req.onsuccess = () => {
+        db = req.result
+        if (settled || isAborted?.()) {
+          finish()
+          return
+        }
         try {
-          const db = req.result
           const tx = db.transaction(IDB_STORE, 'readwrite')
           tx.objectStore(IDB_STORE).put(id, STORAGE_KEY)
-          tx.oncomplete = () => {
-            clearTimeout(timer)
-            try {
-              db.close()
-            } catch {}
-            finish()
-          }
-          tx.onerror = () => {
-            clearTimeout(timer)
-            try {
-              db.close()
-            } catch {}
-            finish()
-          }
-          tx.onabort = () => {
-            clearTimeout(timer)
-            try {
-              db.close()
-            } catch {}
-            finish()
-          }
+          tx.oncomplete = () => finish()
+          tx.onerror = () => finish()
+          tx.onabort = () => finish()
         } catch {
-          clearTimeout(timer)
           finish()
         }
       }
     } catch {
-      clearTimeout(timer)
       finish()
     }
   })
@@ -251,6 +263,7 @@ async function readCacheStorage(timeoutMs = 150): Promise<{ available: boolean; 
     const finish = (res: { available: boolean; value: string | null }) => {
       if (settled) return
       settled = true
+      clearTimeout(timer)
       resolve(res)
     }
     const timer = setTimeout(() => finish({ available: false, value: null }), timeoutMs)
@@ -259,30 +272,36 @@ async function readCacheStorage(timeoutMs = 150): Promise<{ available: boolean; 
       .then((cache) => cache.match(CACHE_URL))
       .then((resp) => (resp ? resp.text() : null))
       .then((text) => {
-        clearTimeout(timer)
         finish({ available: true, value: isValidBeaconId(text) ? text.trim() : null })
       })
       .catch(() => {
-        clearTimeout(timer)
         finish({ available: false, value: null })
       })
   })
 }
 
-function writeCacheStorage(id: string, timeoutMs = 150): Promise<void> {
-  if (typeof caches === 'undefined' || typeof Response === 'undefined') return Promise.resolve()
+function writeCacheStorage(
+  id: string,
+  timeoutMs = 150,
+  isAborted?: () => boolean
+): Promise<void> {
+  if (!id || typeof caches === 'undefined' || typeof Response === 'undefined' || isAborted?.()) {
+    return Promise.resolve()
+  }
   return new Promise((resolve) => {
     let settled = false
     const finish = () => {
       if (settled) return
       settled = true
+      clearTimeout(timer)
       resolve()
     }
     const timer = setTimeout(finish, timeoutMs)
     caches
       .open(CACHE_NAME)
-      .then((cache) =>
-        cache.put(
+      .then((cache) => {
+        if (settled || isAborted?.()) return
+        return cache.put(
           CACHE_URL,
           new Response(id, {
             headers: {
@@ -292,96 +311,120 @@ function writeCacheStorage(id: string, timeoutMs = 150): Promise<void> {
             },
           })
         )
-      )
-      .then(() => {
-        clearTimeout(timer)
-        finish()
       })
-      .catch(() => {
-        clearTimeout(timer)
-        finish()
-      })
+      .then(() => finish())
+      .catch(() => finish())
   })
 }
 
+function evaluateSilos(
+  silos: { name: keyof typeof SILO_MASK; available: boolean; value: string | null }[],
+  fallbackId: string
+): StorageBeaconResult {
+  const survivingSilos: string[] = []
+  let survivingMask = 0
+  const freq = new Map<string, number>()
+  let missingPrimarySilo = false
+
+  for (const s of silos) {
+    if (s.value) {
+      survivingSilos.push(s.name)
+      survivingMask |= SILO_MASK[s.name]
+      freq.set(s.value, (freq.get(s.value) || 0) + 1)
+    } else if (
+      s.available &&
+      (s.name === 'localStorage' || s.name === 'cookie' || s.name === 'indexedDB')
+    ) {
+      missingPrimarySilo = true
+    }
+  }
+
+  let canonicalId = ''
+  let storageHealed = false
+
+  if (freq.size > 0) {
+    let bestCount = -1
+    for (const [id, count] of freq.entries()) {
+      if (count > bestCount) {
+        bestCount = count
+        canonicalId = id
+      }
+    }
+    if (missingPrimarySilo || freq.size > 1) {
+      storageHealed = true
+    }
+  } else {
+    canonicalId = fallbackId
+  }
+
+  return {
+    beacon_id: canonicalId,
+    storage_healed: storageHealed,
+    surviving_silos: survivingSilos,
+    surviving_silos_mask: survivingMask,
+  }
+}
+
 export async function collectAndHealStorageBeacon(timeoutMs = 350): Promise<StorageBeaconResult> {
+  // Read synchronous silos FIRST so even if async IndexedDB/CacheStorage hang past `timeoutMs`,
+  // we preserve the existing synchronous beacon rather than clobbering it with a random ID,
+  // and `aborted = true` stops late async tasks from overwriting storage afterwards (S3-35).
+  const ls = readLocalStorage()
+  const ss = readSessionStorage()
+  const ck = readCookie()
   const fallbackId = generateBeaconId()
-  let timer: ReturnType<typeof setTimeout> | undefined
-
-  const work = (async (): Promise<StorageBeaconResult> => {
-    const ls = readLocalStorage()
-    const ss = readSessionStorage()
-    const ck = readCookie()
-    const perSiloMs = Math.max(40, Math.floor(timeoutMs * 0.4))
-    const [idb, cs] = await Promise.all([readIndexedDB(perSiloMs), readCacheStorage(perSiloMs)])
-
-    const silos: { name: string; available: boolean; value: string | null }[] = [
+  const syncSnapshot = evaluateSilos(
+    [
       { name: 'localStorage', ...ls },
       { name: 'sessionStorage', ...ss },
       { name: 'cookie', ...ck },
-      { name: 'indexedDB', ...idb },
-      { name: 'cacheStorage', ...cs },
-    ]
+    ],
+    fallbackId
+  )
 
-    const survivingSilos: string[] = []
-    const freq = new Map<string, number>()
-    let missingPrimarySilo = false
+  let aborted = false
+  let timer: ReturnType<typeof setTimeout> | undefined
 
-    for (const s of silos) {
-      if (s.value) {
-        survivingSilos.push(s.name)
-        freq.set(s.value, (freq.get(s.value) || 0) + 1)
-      } else if (
-        s.available &&
-        (s.name === 'localStorage' || s.name === 'cookie' || s.name === 'indexedDB')
-      ) {
-        missingPrimarySilo = true
-      }
+  const work = (async (): Promise<StorageBeaconResult> => {
+    const perSiloMs = Math.max(40, Math.floor(timeoutMs * 0.4))
+    const [idb, cs] = await Promise.all([readIndexedDB(perSiloMs), readCacheStorage(perSiloMs)])
+    if (aborted) {
+      return syncSnapshot
     }
 
-    let canonicalId = ''
-    let storageHealed = false
+    const resolved = evaluateSilos(
+      [
+        { name: 'localStorage', ...ls },
+        { name: 'sessionStorage', ...ss },
+        { name: 'cookie', ...ck },
+        { name: 'indexedDB', ...idb },
+        { name: 'cacheStorage', ...cs },
+      ],
+      fallbackId
+    )
 
-    if (freq.size > 0) {
-      let bestCount = -1
-      for (const [id, count] of freq.entries()) {
-        if (count > bestCount) {
-          bestCount = count
-          canonicalId = id
-        }
-      }
-      if (missingPrimarySilo || freq.size > 1) {
-        storageHealed = true
-      }
-    } else {
-      canonicalId = fallbackId
+    if (resolved.beacon_id && !aborted) {
+      writeLocalStorage(resolved.beacon_id)
+      writeSessionStorage(resolved.beacon_id)
+      writeCookie(resolved.beacon_id)
+      await Promise.all([
+        writeIndexedDB(resolved.beacon_id, perSiloMs, () => aborted),
+        writeCacheStorage(resolved.beacon_id, perSiloMs, () => aborted),
+      ])
     }
 
-    writeLocalStorage(canonicalId)
-    writeSessionStorage(canonicalId)
-    writeCookie(canonicalId)
-    await Promise.all([
-      writeIndexedDB(canonicalId, perSiloMs),
-      writeCacheStorage(canonicalId, perSiloMs),
-    ])
-
-    return {
-      beacon_id: canonicalId,
-      storage_healed: storageHealed,
-      surviving_silos: survivingSilos,
-    }
+    return resolved
   })()
 
   const deadline = new Promise<StorageBeaconResult>((resolve) => {
     timer = setTimeout(() => {
-      writeLocalStorage(fallbackId)
-      writeSessionStorage(fallbackId)
-      writeCookie(fallbackId)
-      resolve({
-        beacon_id: fallbackId,
-        storage_healed: false,
-        surviving_silos: [],
-      })
+      aborted = true
+      if (syncSnapshot.beacon_id) {
+        writeLocalStorage(syncSnapshot.beacon_id)
+        writeSessionStorage(syncSnapshot.beacon_id)
+        writeCookie(syncSnapshot.beacon_id)
+      }
+      resolve(syncSnapshot)
     }, timeoutMs)
   })
 
