@@ -1,4 +1,4 @@
-import { spawn, type ChildProcess } from 'node:child_process'
+import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
 import crypto from 'node:crypto'
 import fs from 'node:fs'
 import { createRequire } from 'node:module'
@@ -245,16 +245,26 @@ describe('PrismID Web SDK (prismid-js) Unit & Cross-Language Suite', () => {
 
   describe('6. Live Cross-Language E2E Integration (prismid-js -> prismid-go standalone server)', () => {
     let serverProc: ChildProcess | null = null
+    let serverBinPath = ''
     let baseUrl = ''
 
     beforeAll(async () => {
       const port = await allocateFreeLocalPort()
       baseUrl = `http://127.0.0.1:${port}`
+      const binExt = process.platform === 'win32' ? '.exe' : ''
+      serverBinPath = path.join(os.tmpdir(), `prismid-e2e-server-${process.pid}${binExt}`)
+      const buildRes = spawnSync('go', ['build', '-o', serverBinPath, './cmd/prismid-server'], {
+        cwd: GO_SERVER_DIR,
+        encoding: 'utf-8',
+      })
+      if (buildRes.status !== 0) {
+        throw new Error(
+          `Failed to build prismid-server: ${buildRes.stderr || buildRes.stdout || buildRes.error?.message}`
+        )
+      }
       serverProc = spawn(
-        'go',
+        serverBinPath,
         [
-          'run',
-          './cmd/prismid-server',
           '-addr',
           `127.0.0.1:${port}`,
           '-demo-mode=true',
@@ -263,11 +273,11 @@ describe('PrismID Web SDK (prismid-js) Unit & Cross-Language Suite', () => {
         {
           cwd: GO_SERVER_DIR,
           stdio: 'pipe',
-          detached: true,
+          detached: process.platform !== 'win32',
         }
       )
 
-      const deadline = Date.now() + 15000
+      const deadline = Date.now() + 20000
       while (Date.now() < deadline) {
         try {
           const res = await fetch(`${baseUrl}/healthz`)
@@ -278,14 +288,25 @@ describe('PrismID Web SDK (prismid-js) Unit & Cross-Language Suite', () => {
         await new Promise((r) => setTimeout(r, 150))
       }
       throw new Error('Timed out waiting for standalone prismid-go server to start')
-    }, 20000)
+    }, 65000)
 
     afterAll(() => {
       if (serverProc && serverProc.pid) {
         try {
-          process.kill(-serverProc.pid, 'SIGTERM')
+          if (process.platform !== 'win32') {
+            process.kill(-serverProc.pid, 'SIGTERM')
+          } else {
+            serverProc.kill()
+          }
         } catch {
-          serverProc.kill('SIGTERM')
+          serverProc.kill()
+        }
+      }
+      if (serverBinPath) {
+        try {
+          fs.unlinkSync(serverBinPath)
+        } catch {
+          // ignore cleanup race on Windows file lock
         }
       }
     })
@@ -1737,7 +1758,7 @@ describe('PrismID Web SDK (prismid-js) Unit & Cross-Language Suite', () => {
         }
         expect(testedEngines).toBeGreaterThanOrEqual(1)
       },
-      45000
+      90000
     )
   })
 })
