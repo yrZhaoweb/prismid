@@ -1,10 +1,21 @@
 //! Windows native hardware anchor implementation (`MachineGuid`, SMBIOS UUID, BIOS SerialNumber,
-//! HKCU Registry / user-profile persistent anchor, and Hypervisor detection).
+//! HKCU Registry / user-profile persistent anchor, and guest VM detection).
+//!
+//! Note on Windows 11 VBS / Credential Guard / WSL2:
+//! `Win32_ComputerSystem.HypervisorPresent` is `True` on bare-metal Windows 11 hosts whenever
+//! Virtualization-Based Security (VBS), Memory Integrity (HVCI), or WSL2/Hyper-V platform is
+//! enabled. Therefore `HypervisorPresent` alone is NEVER treated as sufficient proof of a guest VM;
+//! it must be corroborated by guest hardware/BIOS/model signatures (e.g. `"Virtual Machine"`,
+//! `"VMware"`, `"VirtualBox"`, `"QEMU"`, `"KVM"`, `"Parallels"`, `"Xen"`, `"Amazon EC2"`, etc.).
 
 use crate::{
-    detect_vm_vendor_from_text, load_or_create_file_anchor, NativeHardwareAnchor,
+    detect_vm_vendor_from_text, load_or_create_file_anchor, run_cmd_with_timeout,
+    NativeHardwareAnchor,
 };
-use std::process::Command;
+use std::time::Duration;
+
+const REG_TIMEOUT: Duration = Duration::from_millis(300);
+const CIM_TIMEOUT: Duration = Duration::from_millis(1500);
 
 pub fn collect() -> NativeHardwareAnchor {
     let reg_out = run_cmd(
@@ -15,6 +26,7 @@ pub fn collect() -> NativeHardwareAnchor {
             "/v",
             "MachineGuid",
         ],
+        REG_TIMEOUT,
     );
 
     let cim_out = run_cmd(
@@ -23,8 +35,9 @@ pub fn collect() -> NativeHardwareAnchor {
             "-NoProfile",
             "-NonInteractive",
             "-Command",
-            "Get-CimInstance -ClassName Win32_ComputerSystemProduct | Select-Object -ExpandProperty UUID; Get-CimInstance -ClassName Win32_BIOS | Select-Object -ExpandProperty SerialNumber; Get-CimInstance -ClassName Win32_Processor | Select-Object -ExpandProperty Name; Get-CimInstance -ClassName Win32_ComputerSystem | Select-Object -ExpandProperty TotalPhysicalMemory; Get-CimInstance -ClassName Win32_ComputerSystem | Select-Object -ExpandProperty HypervisorPresent; Get-CimInstance -ClassName Win32_ComputerSystem | Select-Object -ExpandProperty Manufacturer",
+            "$cs = Get-CimInstance -ClassName Win32_ComputerSystem; Get-CimInstance -ClassName Win32_ComputerSystemProduct | Select-Object -ExpandProperty UUID; Get-CimInstance -ClassName Win32_BIOS | Select-Object -ExpandProperty SerialNumber; Get-CimInstance -ClassName Win32_Processor | Select-Object -ExpandProperty Name | Select-Object -First 1; $cs.TotalPhysicalMemory; $cs.HypervisorPresent; $cs.Manufacturer; $cs.Model",
         ],
+        CIM_TIMEOUT,
     );
 
     let cpu_cores = std::thread::available_parallelism()
@@ -47,6 +60,37 @@ pub(crate) fn is_oem_placeholder(val: &str) -> bool {
         || lower.contains("not specified")
 }
 
+fn detect_windows_guest_vm(manufacturer: &str, model: &str, full_cim_text: &str, hypervisor_present: bool) -> (bool, String) {
+    if let Some(vendor) = detect_vm_vendor_from_text(&format!("{} {} {}", manufacturer, model, full_cim_text)) {
+        return (true, vendor);
+    }
+
+    let mfg_lower = manufacturer.trim().to_ascii_lowercase();
+    let model_lower = model.trim().to_ascii_lowercase();
+
+    // Microsoft Hyper-V / Azure guest VMs report Manufacturer="Microsoft Corporation" and Model="Virtual Machine"
+    // (whereas bare-metal Surface devices report Model="Surface Laptop ...", "Surface Pro ...", etc.).
+    if model_lower.contains("virtual machine")
+        || model_lower.contains("hvm domu")
+        || model_lower == "virtual"
+        || (mfg_lower.contains("microsoft") && model_lower.contains("hyper-v"))
+    {
+        return (true, "hyperv".to_string());
+    }
+
+    // Do NOT flag bare-metal Windows 11 VBS / Credential Guard / WSL2 hosts where HypervisorPresent=True
+    // unless Manufacturer itself explicitly denotes a generic virtual platform.
+    if hypervisor_present
+        && (mfg_lower == "innotek gmbh"
+            || mfg_lower == "red hat"
+            || mfg_lower.contains("virtual"))
+    {
+        return (true, "hypervisor".to_string());
+    }
+
+    (false, String::new())
+}
+
 pub(crate) fn parse_windows_cim_output(
     reg_out: &str,
     cim_out: &str,
@@ -64,6 +108,7 @@ pub(crate) fn parse_windows_cim_output(
         .unwrap_or(0);
     let hypervisor_str = lines.next().unwrap_or("");
     let manufacturer = lines.next().unwrap_or("");
+    let model = lines.next().unwrap_or("");
 
     if hw_uuid.is_empty() && !is_oem_placeholder(&smbios_uuid) {
         hw_uuid = smbios_uuid.clone();
@@ -81,14 +126,9 @@ pub(crate) fn parse_windows_cim_output(
         (false, false) => String::new(),
     };
 
-    let mut is_vm = hypervisor_str.eq_ignore_ascii_case("true");
-    let mut vm_vendor = String::new();
-    if let Some(v) = detect_vm_vendor_from_text(&format!("{} {}", manufacturer, cim_out)) {
-        is_vm = true;
-        vm_vendor = v;
-    } else if is_vm {
-        vm_vendor = "hypervisor".to_string();
-    }
+    let hypervisor_present = hypervisor_str.eq_ignore_ascii_case("true");
+    let (is_vm, vm_vendor) =
+        detect_windows_guest_vm(manufacturer, model, cim_out, hypervisor_present);
 
     NativeHardwareAnchor {
         platform: "windows".to_string(),
@@ -105,7 +145,7 @@ pub(crate) fn parse_windows_cim_output(
 
 fn load_or_create_windows_anchor(hw_uuid: &str) -> String {
     let reg_key = r"HKCU\Software\PrismID";
-    let existing = run_cmd("reg", &["query", reg_key, "/v", "DeviceAnchor"]);
+    let existing = run_cmd("reg", &["query", reg_key, "/v", "DeviceAnchor"], REG_TIMEOUT);
     let parsed = parse_reg_value(&existing, "DeviceAnchor");
     if parsed.len() >= 32 && parsed.chars().all(|c| c.is_ascii_hexdigit()) {
         return parsed.to_ascii_lowercase();
@@ -130,6 +170,7 @@ fn load_or_create_windows_anchor(hw_uuid: &str) -> String {
             &anchor,
             "/f",
         ],
+        REG_TIMEOUT,
     );
     anchor
 }
@@ -145,11 +186,8 @@ pub(crate) fn parse_reg_value(output: &str, key: &str) -> String {
     String::new()
 }
 
-fn run_cmd(program: &str, args: &[&str]) -> String {
-    Command::new(program)
-        .args(args)
-        .output()
-        .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+fn run_cmd(program: &str, args: &[&str], timeout: Duration) -> String {
+    run_cmd_with_timeout(program, args, timeout)
+        .map(|(_, out)| out)
         .unwrap_or_default()
 }

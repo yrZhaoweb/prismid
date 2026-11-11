@@ -1,15 +1,20 @@
 //! macOS native hardware anchor implementation using `ioreg` and `sysctl`.
 //!
 //! Explicitly avoids `diskutil info /` (~260ms) in favor of `ioreg -rd1 -c IOPlatformExpertDevice`
-//! + `sysctl` (~12ms on Apple Silicon).
+//! + `sysctl` (~12ms on Apple Silicon), and bounds `/usr/bin/security` Keychain CLI calls with a
+//! hard timeout + owner-only `0600` file-anchor fallback so locked/headless/sandboxed environments
+//! never block or stall.
 
 use crate::{
-    detect_vm_vendor_from_text, load_or_create_file_anchor, NativeHardwareAnchor,
+    detect_vm_vendor_from_text, load_or_create_file_anchor, read_existing_file_anchor,
+    run_cmd_with_timeout, write_file_anchor_restricted, NativeHardwareAnchor,
 };
-use std::process::Command;
+use std::time::Duration;
 
 const KEYCHAIN_SERVICE: &str = "io.prismid.device.anchor";
 const KEYCHAIN_ACCOUNT: &str = "default";
+const CMD_TIMEOUT: Duration = Duration::from_millis(150);
+const KEYCHAIN_TIMEOUT: Duration = Duration::from_millis(120);
 
 pub fn collect() -> NativeHardwareAnchor {
     let ioreg_out = run_cmd("/usr/sbin/ioreg", &["-rd1", "-c", "IOPlatformExpertDevice"]);
@@ -92,35 +97,58 @@ fn extract_ioreg_string(ioreg_output: &str, key: &str) -> String {
     String::new()
 }
 
+fn keychain_disabled_by_env() -> bool {
+    std::env::var_os("PRISMID_DISABLE_KEYCHAIN")
+        .map(|v| {
+            let s = v.to_string_lossy();
+            s == "1" || s.eq_ignore_ascii_case("true")
+        })
+        .unwrap_or(false)
+}
+
 fn read_or_create_macos_keychain_anchor(hw_uuid_hint: &str) -> String {
-    // Fast-path: check file cache first if it already matches keychain, or read from macOS security CLI
-    if let Ok(output) = Command::new("/usr/bin/security")
-        .args([
+    let seed = if hw_uuid_hint.is_empty() {
+        "macos_default"
+    } else {
+        hw_uuid_hint
+    };
+
+    // 1. Sub-millisecond fast-path: return owner-only 0600 local file anchor if already present,
+    // avoiding Keychain IPC / authorization prompts on every warm process start.
+    if let Some(cached) = read_existing_file_anchor(seed) {
+        return cached;
+    }
+
+    if keychain_disabled_by_env() {
+        return load_or_create_file_anchor(seed);
+    }
+
+    // 2. Bounded Keychain lookup (hard 120ms timeout; killed immediately if locked or prompting).
+    if let Some((true, stdout)) = run_cmd_with_timeout(
+        "/usr/bin/security",
+        &[
             "find-generic-password",
             "-s",
             KEYCHAIN_SERVICE,
             "-a",
             KEYCHAIN_ACCOUNT,
             "-w",
-        ])
-        .output()
-    {
-        if output.status.success() {
-            let secret = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if secret.len() >= 16 {
-                return secret;
-            }
+        ],
+        KEYCHAIN_TIMEOUT,
+    ) {
+        let secret = stdout.trim().to_string();
+        if secret.len() >= 32 && secret.chars().all(|c| c.is_ascii_hexdigit()) {
+            let normalized = secret.to_ascii_lowercase();
+            write_file_anchor_restricted(seed, &normalized);
+            return normalized;
         }
     }
 
-    let anchor = load_or_create_file_anchor(if hw_uuid_hint.is_empty() {
-        "macos_default"
-    } else {
-        hw_uuid_hint
-    });
-
-    let _ = Command::new("/usr/bin/security")
-        .args([
+    // 3. Fallback: generate and persist 0600 file anchor, then mirror to Keychain best-effort.
+    let anchor = load_or_create_file_anchor(seed);
+    let _ = run_cmd_with_timeout(
+        "/usr/bin/security",
+        &[
             "add-generic-password",
             "-U",
             "-s",
@@ -129,17 +157,15 @@ fn read_or_create_macos_keychain_anchor(hw_uuid_hint: &str) -> String {
             KEYCHAIN_ACCOUNT,
             "-w",
             &anchor,
-        ])
-        .output();
+        ],
+        Duration::from_millis(80),
+    );
 
     anchor
 }
 
 fn run_cmd(program: &str, args: &[&str]) -> String {
-    Command::new(program)
-        .args(args)
-        .output()
-        .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+    run_cmd_with_timeout(program, args, CMD_TIMEOUT)
+        .map(|(_, out)| out)
         .unwrap_or_default()
 }
