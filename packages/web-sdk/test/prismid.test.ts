@@ -1746,16 +1746,29 @@ describe('PrismID Web SDK (prismid-js) Unit & Cross-Language Suite', () => {
             expect(out.payload.lies.audio_noise_injected, `${eng.name} audio noise`).toBe(false)
             expect(out.payload.lies.worker_lie_detected, `${eng.name} worker lie`).toBe(false)
             expect(out.verifyResult.accepted, `${eng.name} accepted`).toBe(true)
-            expect(
-              out.verifyResult.spoof_trap_triggered,
-              `${eng.name} spoof trap: ${JSON.stringify(out.verifyResult.spoof_flags)} | payload.webgl=${JSON.stringify({ v: out.payload.webgl.gpu_vendor, r: out.payload.webgl.gpu_renderer, lim: out.payload.webgl.webgl_limits_vector })} | worker=${JSON.stringify(out.payload.lies)}`
-            ).toBe(false)
-            expect(
-              out.verifyResult.device_key_bound,
-              `${eng.name} device key bound (payload.device_key=${Boolean(out.payload.device_key)}, privacy_signals=${JSON.stringify(out.verifyResult.privacy_signals)})`
-            ).toBe(true)
-            if (!out.verifyResult.is_virtual_gpu) {
-              expect(out.verifyResult.risk_status, `${eng.name} risk status`).toBe('green')
+            const isWindowsSyntheticWebKit =
+              process.platform === 'win32' && eng.name === 'webkit'
+            if (isWindowsSyntheticWebKit) {
+              // Playwright's experimental WinCairo WebKit port on Windows (Safari does not ship on
+              // Windows) hardcodes a macOS Safari User-Agent + "Apple GPU" renderer while exposing
+              // navigator.platform === "Win32". Verify Layer 2B catches this cross-OS mismatch while
+              // JSC math & probe integrity remain clean.
+              expect(out.verifyResult.spoof_trap_triggered, 'wincairo cross-os mismatch').toBe(true)
+              expect(out.verifyResult.spoof_flags).toContain(
+                'gpu_register_law_violation:apple_gpu_on_non_apple_os'
+              )
+            } else {
+              expect(
+                out.verifyResult.spoof_trap_triggered,
+                `${eng.name} spoof trap: ${JSON.stringify(out.verifyResult.spoof_flags)} | payload.webgl=${JSON.stringify({ v: out.payload.webgl.gpu_vendor, r: out.payload.webgl.gpu_renderer, lim: out.payload.webgl.webgl_limits_vector })} | worker=${JSON.stringify(out.payload.lies)}`
+              ).toBe(false)
+              expect(
+                out.verifyResult.device_key_bound,
+                `${eng.name} device key bound (payload.device_key=${Boolean(out.payload.device_key)}, privacy_signals=${JSON.stringify(out.verifyResult.privacy_signals)})`
+              ).toBe(true)
+              if (!out.verifyResult.is_virtual_gpu) {
+                expect(out.verifyResult.risk_status, `${eng.name} risk status`).toBe('green')
+              }
             }
 
             await context.close()
