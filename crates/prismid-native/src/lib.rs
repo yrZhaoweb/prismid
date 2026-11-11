@@ -135,13 +135,20 @@ pub(crate) fn run_cmd_with_timeout(
     args: &[&str],
     timeout: Duration,
 ) -> Option<(bool, String)> {
-    let mut child = Command::new(program)
-        .args(args)
+    let mut cmd = Command::new(program);
+    cmd.args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
+        .stderr(Stdio::null());
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    let mut child = cmd.spawn().ok()?;
 
     let mut stdout = child.stdout.take()?;
     let reader = std::thread::spawn(move || {
@@ -520,5 +527,75 @@ HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Cryptography
             assert_eq!(dir_meta.permissions().mode() & 0o777, 0o700);
         }
         let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_windows_raw_smbios_parser_and_mixed_endian_uuid() {
+        // Construct a synthetic Windows 'RSMB' RawSMBIOSData buffer:
+        // - Type 0 (BIOS Info, empty string set \0\0)
+        // - Type 1 (System Info: Manufacturer="Dell Inc.", Product="XPS 15 9530",
+        //           Serial="To be filled by O.E.M." -> falls back to Baseboard Type 2,
+        //           SMBIOS 2.6+ mixed-endian UUID = 00112233-4455-6677-8899-AABBCCDDEEFF)
+        // - Type 2 (Baseboard Info: Serial="MB-DELL-CN778899")
+        // - Type 127 (End-of-Table)
+        let mut structures = Vec::new();
+
+        // Type 0: header [0, 4, 0x00, 0x00] + double NUL
+        structures.extend_from_slice(&[0, 4, 0x00, 0x00, 0x00, 0x00]);
+
+        // Type 1: length 0x19 (25 bytes)
+        let mut type1 = vec![0u8; 0x19];
+        type1[0] = 1; // System Information
+        type1[1] = 0x19;
+        type1[0x04] = 1; // string 1: Manufacturer
+        type1[0x05] = 2; // string 2: Product Name
+        type1[0x07] = 3; // string 3: Serial Number (OEM placeholder)
+        // UUID bytes [0x08..0x18]: 00112233-4455-6677-8899-AABBCCDDEEFF
+        // LE d1=0x00112233 -> [0x33, 0x22, 0x11, 0x00]
+        // LE d2=0x4455     -> [0x55, 0x44]
+        // LE d3=0x6677     -> [0x77, 0x66]
+        // BE [8..16]       -> [0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]
+        type1[0x08..0x18].copy_from_slice(&[
+            0x33, 0x22, 0x11, 0x00, 0x55, 0x44, 0x77, 0x66, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD,
+            0xEE, 0xFF,
+        ]);
+        structures.extend_from_slice(&type1);
+        structures.extend_from_slice(b"Dell Inc.\0XPS 15 9530\0To be filled by O.E.M.\0\0");
+
+        // Type 2: Baseboard Info (length 8, serial at 0x07 = string 1)
+        let mut type2 = vec![0u8; 8];
+        type2[0] = 2;
+        type2[1] = 8;
+        type2[0x07] = 1;
+        structures.extend_from_slice(&type2);
+        structures.extend_from_slice(b"MB-DELL-CN778899\0\0");
+
+        // Type 127: End of table
+        structures.extend_from_slice(&[127, 4, 0xFF, 0xFF, 0x00, 0x00]);
+
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&[0, 3, 4, 0]); // SMBIOS 3.4
+        raw.extend_from_slice(&(structures.len() as u32).to_le_bytes());
+        raw.extend_from_slice(&structures);
+
+        let info = windows::parse_raw_smbios_table(&raw);
+        assert_eq!(info.manufacturer, "Dell Inc.");
+        assert_eq!(info.model, "XPS 15 9530");
+        assert_eq!(info.serial_number, "MB-DELL-CN778899");
+        assert_eq!(info.uuid, "00112233-4455-6677-8899-AABBCCDDEEFF");
+        assert_eq!(
+            windows::combine_serial_and_uuid(&info.serial_number, &info.uuid),
+            "MB-DELL-CN778899:00112233-4455-6677-8899-AABBCCDDEEFF"
+        );
+
+        // Verify truncated / empty / all-FF UUID buffers never panic
+        assert_eq!(
+            windows::parse_raw_smbios_table(&[]),
+            windows::SmbiosInfo::default()
+        );
+        assert_eq!(
+            windows::parse_raw_smbios_table(&[0, 3, 0, 0, 255, 0, 0, 0, 1, 20]),
+            windows::SmbiosInfo::default()
+        );
     }
 }
