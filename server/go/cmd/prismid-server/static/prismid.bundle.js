@@ -361,7 +361,7 @@ export function aes256GcmEncryptPureTS(key, iv, plaintext, aad) {
 const KEY_DB_NAME = '_prismid_key_v1';
 const KEY_STORE_NAME = 'keystore';
 const KEY_RECORD_ID = 'hw_ecdsa_p256';
-const IDB_KEY_TIMEOUT_MS = 150;
+const IDB_KEY_TIMEOUT_MS = 250;
 let memoryCachedKey = null;
 /**
  * Clears the in-memory `CryptoKey` cache so subsequent operations re-read `IndexedDB`
@@ -388,19 +388,24 @@ function getSubtleCrypto() {
 }
 function isStoredKey(value) {
     const rec = value;
+    const usages = rec?.privateKey?.usages;
+    const hasSignUsage = Array.isArray(usages)
+        ? usages.includes('sign')
+        : Array.from(usages ?? []).includes('sign');
     return !!rec && typeof rec === 'object' && !!rec.privateKey &&
         rec.privateKey.type === 'private' && rec.privateKey.extractable === false &&
         rec.privateKey.algorithm?.name === 'ECDSA' &&
         rec.privateKey.algorithm.namedCurve === 'P-256' &&
-        Array.isArray(rec.privateKey.usages) && rec.privateKey.usages.includes('sign') && typeof rec.pubKeyHex === 'string' &&
+        hasSignUsage && typeof rec.pubKeyHex === 'string' &&
         /^04[0-9a-f]{128}$/.test(rec.pubKeyHex);
 }
 // Fast read-only lookup BEFORE generating an ECDSA P-256 keypair so warm page loads
 // never waste CPU/WebCrypto keygen work when a persisted key already exists (S2-23).
-function readExistingPersistedKey() {
+function readExistingPersistedKey(timeoutMs = IDB_KEY_TIMEOUT_MS) {
     if (typeof indexedDB === 'undefined' || !indexedDB) {
         return Promise.resolve({ status: 'error' });
     }
+    const budgetMs = Math.max(25, timeoutMs);
     return new Promise((resolve) => {
         let settled = false;
         let db;
@@ -415,7 +420,7 @@ function readExistingPersistedKey() {
             catch { }
             resolve(outcome);
         };
-        const timer = setTimeout(() => finish({ status: 'error' }), IDB_KEY_TIMEOUT_MS);
+        const timer = setTimeout(() => finish({ status: 'error' }), budgetMs);
         try {
             const req = indexedDB.open(KEY_DB_NAME, 1);
             req.onblocked = req.onerror = () => finish({ status: 'error' });
@@ -472,9 +477,10 @@ function readExistingPersistedKey() {
 // The read and conditional insert/repair share one readwrite transaction. IndexedDB serializes
 // these transactions across tabs, so concurrent first visits all use the committed winner,
 // and corrupted records are atomically repaired instead of permanently disabling `d_key_*` (S3-32).
-function loadOrCreatePersistedKey(candidate, forceOverwrite = false) {
+function loadOrCreatePersistedKey(candidate, forceOverwrite = false, timeoutMs = IDB_KEY_TIMEOUT_MS) {
     if (typeof indexedDB === 'undefined' || !indexedDB)
         return Promise.resolve(null);
+    const budgetMs = Math.max(25, timeoutMs);
     return new Promise((resolve) => {
         let settled = false;
         let db;
@@ -496,7 +502,7 @@ function loadOrCreatePersistedKey(candidate, forceOverwrite = false) {
             catch { }
             resolve(value);
         };
-        const timer = setTimeout(() => finish(null), IDB_KEY_TIMEOUT_MS);
+        const timer = setTimeout(() => finish(null), budgetMs);
         try {
             const req = indexedDB.open(KEY_DB_NAME, 1);
             req.onblocked = req.onerror = () => finish(null);
@@ -590,9 +596,10 @@ async function getOrCreateDeviceKeyRecord(options) {
     const subtle = getSubtleCrypto();
     if (!subtle || typeof indexedDB === 'undefined' || !indexedDB)
         return null;
+    const idbTimeoutMs = options?.timeoutMs ?? IDB_KEY_TIMEOUT_MS;
     keyInitialization = (async () => {
         try {
-            const existing = await readExistingPersistedKey();
+            const existing = await readExistingPersistedKey(idbTimeoutMs);
             if (existing.status === 'found') {
                 memoryCachedKey = existing.record;
                 return existing.record;
@@ -606,7 +613,7 @@ async function getOrCreateDeviceKeyRecord(options) {
             }
             // status === 'missing' || status === 'corrupted': generate fresh P-256 keypair & persist atomically.
             const candidate = await generateCandidateKeyRecord(subtle);
-            const persisted = await loadOrCreatePersistedKey(candidate, false);
+            const persisted = await loadOrCreatePersistedKey(candidate, false, idbTimeoutMs);
             // Only a confirmed transaction commit may establish a server-side TOFU binding.
             memoryCachedKey = persisted;
             return persisted;
@@ -625,8 +632,8 @@ async function getOrCreateDeviceKeyRecord(options) {
 /**
  * Preloads or initializes the persisted ECDSA P-256 device key in parallel with other probes.
  */
-export async function preloadDeviceKey() {
-    const rec = await getOrCreateDeviceKeyRecord();
+export async function preloadDeviceKey(timeoutMs) {
+    const rec = await getOrCreateDeviceKeyRecord({ timeoutMs });
     return rec !== null;
 }
 export function buildDeviceKeyTranscript(params) {
@@ -672,14 +679,14 @@ async function signTranscript(subtle, rec, transcript) {
         return undefined;
     }
 }
-export async function signRebindWithDeviceKey(params) {
+export async function signRebindWithDeviceKey(params, timeoutMs) {
     const subtle = getSubtleCrypto();
     if (!subtle) {
         return undefined;
     }
     // Always re-verify IndexedDB on rebind so in-session site-data clearing generates a fresh key
     // without requiring a page reload (S2-24).
-    const rec = await getOrCreateDeviceKeyRecord({ bypassMemoryCache: true });
+    const rec = await getOrCreateDeviceKeyRecord({ bypassMemoryCache: true, timeoutMs });
     if (!rec) {
         return undefined;
     }
@@ -690,16 +697,17 @@ export async function signRebindWithDeviceKey(params) {
  * and, when a previous key was still accessible in IndexedDB or memory, the continuity proof
  * (`previous_device_key`) over `prismid-v2-rebind-prev|<nonce>|<subject>|<beacon>|<new_pub_key>` (S2-12).
  */
-export async function rotateDeviceKeyAndSignRebind(params) {
+export async function rotateDeviceKeyAndSignRebind(params, timeoutMs) {
     const subtle = getSubtleCrypto();
     if (!subtle || typeof indexedDB === 'undefined' || !indexedDB) {
         return undefined;
     }
-    const existing = await readExistingPersistedKey();
+    const idbTimeoutMs = timeoutMs ?? IDB_KEY_TIMEOUT_MS;
+    const existing = await readExistingPersistedKey(idbTimeoutMs);
     const prevRec = existing.status === 'found' ? existing.record : memoryCachedKey;
     try {
         const candidate = await generateCandidateKeyRecord(subtle);
-        const committed = await loadOrCreatePersistedKey(candidate, true);
+        const committed = await loadOrCreatePersistedKey(candidate, true, idbTimeoutMs);
         if (!committed) {
             return undefined;
         }
@@ -725,12 +733,12 @@ export async function rotateDeviceKeyAndSignRebind(params) {
         return undefined;
     }
 }
-export async function signChallengeWithDeviceKey(params) {
+export async function signChallengeWithDeviceKey(params, timeoutMs) {
     const subtle = getSubtleCrypto();
     if (!subtle) {
         return undefined;
     }
-    const rec = await getOrCreateDeviceKeyRecord();
+    const rec = await getOrCreateDeviceKeyRecord({ timeoutMs });
     if (!rec) {
         return undefined;
     }
@@ -2644,6 +2652,12 @@ export function createPrismClient(options = {}) {
         const workerBudgetMs = Math.min(300, Math.floor(aggregateBudgetMs * 0.5));
         const storageBudgetMs = Math.min(350, Math.floor(aggregateBudgetMs * 0.55));
         const providerTimeoutMs = Math.min(requestTimeoutMs, aggregateBudgetMs);
+        const keyBudgetMs = Math.max(40, Math.min(requestTimeoutMs, Math.max(probeTimeoutMs, 1500)));
+        const keySignDeadlineMs = Math.max(50, Math.min(requestTimeoutMs, keyBudgetMs * 2));
+        // Start persistent deviceKey preload immediately in parallel WITHOUT coupling it into
+        // `Promise.all` (so slow cold-disk IndexedDB initialization on Windows NTFS/Defender never
+        // causes `withDeadline` to discard audio/worker/beacon probe results, while warm visits stay <1ms).
+        void preloadDeviceKey(keyBudgetMs).catch(() => false);
         const sysMeta = collectSystemMetadata();
         const webgl = collectWebGLProbe(challenge.render_seed, samplePoints);
         const fontsCanvas = collectFontsAndCanvasProbe();
@@ -2672,7 +2686,6 @@ export function createPrismClient(options = {}) {
             surviving_silos: [],
             surviving_silos_mask: 0,
         };
-        // Preload persistent deviceKey in parallel with async probes so IndexedDB I/O overlaps (S3-41).
         const [audioRes, workerLie, storageBeacon, nativeAnchor, turnstileToken] = await withDeadline(Promise.all([
             collectAudioProbeWithTrap(audioBudgetMs),
             collectWorkerLieProbe({
@@ -2691,14 +2704,13 @@ export function createPrismClient(options = {}) {
             options.getTurnstileToken
                 ? withDeadline(Promise.resolve(options.getTurnstileToken()).catch(() => undefined), providerTimeoutMs, undefined)
                 : Promise.resolve(undefined),
-            preloadDeviceKey().catch(() => false),
-        ]).then(([a, w, s, n, t]) => [a, w, s, n, t]), aggregateBudgetMs, [fallbackAudio, fallbackWorker, fallbackBeacon, null, undefined]);
+        ]), aggregateBudgetMs, [fallbackAudio, fallbackWorker, fallbackBeacon, null, undefined]);
         const deviceKey = await withDeadline(signChallengeWithDeviceKey({
             nonce: challenge.nonce,
             beaconId: storageBeacon.beacon_id,
             staticWebGLFpHash: webgl.static_webgl_fp_hash,
             audioCompressorHash: audioRes.audio_compressor_hash,
-        }), 200, undefined);
+        }, keyBudgetMs), keySignDeadlineMs, undefined);
         const payload = {
             v: 1,
             nonce: challenge.nonce,
@@ -2955,6 +2967,7 @@ export function createPrismClient(options = {}) {
             if (!chRes.ok || !challenge?.nonce) {
                 return { accepted: false, error: chRaw?.error || `challenge HTTP ${chRes.status}` };
             }
+            const rebindKeyBudgetMs = Math.max(80, Math.min(requestTimeoutMs, Math.max(probeTimeoutMs, 1500)));
             let deviceKey;
             let previousDeviceKey;
             if (rebindOpts?.rotate) {
@@ -2962,7 +2975,7 @@ export function createPrismClient(options = {}) {
                     nonce: challenge.nonce,
                     subjectId,
                     beaconId,
-                });
+                }, rebindKeyBudgetMs);
                 deviceKey = rotated?.device_key;
                 previousDeviceKey = rotated?.previous_device_key;
             }
@@ -2971,7 +2984,7 @@ export function createPrismClient(options = {}) {
                     nonce: challenge.nonce,
                     subjectId,
                     beaconId,
-                });
+                }, rebindKeyBudgetMs);
             }
             if (!deviceKey) {
                 return { accepted: false, error: 'failed to initialize or sign with persistent WebCrypto device key' };

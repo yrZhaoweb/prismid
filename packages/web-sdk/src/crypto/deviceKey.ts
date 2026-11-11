@@ -27,7 +27,7 @@ interface StoredDeviceKeyRecord {
 const KEY_DB_NAME = '_prismid_key_v1'
 const KEY_STORE_NAME = 'keystore'
 const KEY_RECORD_ID = 'hw_ecdsa_p256'
-const IDB_KEY_TIMEOUT_MS = 150
+const IDB_KEY_TIMEOUT_MS = 250
 
 let memoryCachedKey: StoredDeviceKeyRecord | null = null
 
@@ -61,11 +61,15 @@ function getSubtleCrypto(): SubtleCrypto | null {
 
 function isStoredKey(value: unknown): value is StoredDeviceKeyRecord {
   const rec = value as StoredDeviceKeyRecord | undefined
+  const usages = rec?.privateKey?.usages
+  const hasSignUsage = Array.isArray(usages)
+    ? usages.includes('sign')
+    : Array.from<string>(usages ?? []).includes('sign')
   return !!rec && typeof rec === 'object' && !!rec.privateKey &&
     rec.privateKey.type === 'private' && rec.privateKey.extractable === false &&
     rec.privateKey.algorithm?.name === 'ECDSA' &&
     (rec.privateKey.algorithm as EcKeyAlgorithm).namedCurve === 'P-256' &&
-    Array.isArray(rec.privateKey.usages) && rec.privateKey.usages.includes('sign') && typeof rec.pubKeyHex === 'string' &&
+    hasSignUsage && typeof rec.pubKeyHex === 'string' &&
     /^04[0-9a-f]{128}$/.test(rec.pubKeyHex)
 }
 
@@ -77,10 +81,11 @@ type ReadKeyOutcome =
 
 // Fast read-only lookup BEFORE generating an ECDSA P-256 keypair so warm page loads
 // never waste CPU/WebCrypto keygen work when a persisted key already exists (S2-23).
-function readExistingPersistedKey(): Promise<ReadKeyOutcome> {
+function readExistingPersistedKey(timeoutMs: number = IDB_KEY_TIMEOUT_MS): Promise<ReadKeyOutcome> {
   if (typeof indexedDB === 'undefined' || !indexedDB) {
     return Promise.resolve({ status: 'error' })
   }
+  const budgetMs = Math.max(25, timeoutMs)
   return new Promise((resolve) => {
     let settled = false
     let db: IDBDatabase | undefined
@@ -91,7 +96,7 @@ function readExistingPersistedKey(): Promise<ReadKeyOutcome> {
       try { db?.close() } catch {}
       resolve(outcome)
     }
-    const timer = setTimeout(() => finish({ status: 'error' }), IDB_KEY_TIMEOUT_MS)
+    const timer = setTimeout(() => finish({ status: 'error' }), budgetMs)
     try {
       const req = indexedDB.open(KEY_DB_NAME, 1)
       req.onblocked = req.onerror = () => finish({ status: 'error' })
@@ -140,9 +145,11 @@ function readExistingPersistedKey(): Promise<ReadKeyOutcome> {
 // and corrupted records are atomically repaired instead of permanently disabling `d_key_*` (S3-32).
 function loadOrCreatePersistedKey(
   candidate: StoredDeviceKeyRecord,
-  forceOverwrite = false
+  forceOverwrite = false,
+  timeoutMs: number = IDB_KEY_TIMEOUT_MS
 ): Promise<StoredDeviceKeyRecord | null> {
   if (typeof indexedDB === 'undefined' || !indexedDB) return Promise.resolve(null)
+  const budgetMs = Math.max(25, timeoutMs)
   return new Promise((resolve) => {
     let settled = false
     let db: IDBDatabase | undefined
@@ -157,7 +164,7 @@ function loadOrCreatePersistedKey(
       try { db?.close() } catch {}
       resolve(value)
     }
-    const timer = setTimeout(() => finish(null), IDB_KEY_TIMEOUT_MS)
+    const timer = setTimeout(() => finish(null), budgetMs)
     try {
       const req = indexedDB.open(KEY_DB_NAME, 1)
       req.onblocked = req.onerror = () => finish(null)
@@ -229,14 +236,18 @@ async function generateCandidateKeyRecord(subtle: SubtleCrypto): Promise<StoredD
 
 let keyInitialization: Promise<StoredDeviceKeyRecord | null> | null = null
 
-async function getOrCreateDeviceKeyRecord(options?: { bypassMemoryCache?: boolean }): Promise<StoredDeviceKeyRecord | null> {
+async function getOrCreateDeviceKeyRecord(options?: {
+  bypassMemoryCache?: boolean
+  timeoutMs?: number
+}): Promise<StoredDeviceKeyRecord | null> {
   if (!options?.bypassMemoryCache && memoryCachedKey) return memoryCachedKey
   if (keyInitialization) return keyInitialization
   const subtle = getSubtleCrypto()
   if (!subtle || typeof indexedDB === 'undefined' || !indexedDB) return null
+  const idbTimeoutMs = options?.timeoutMs ?? IDB_KEY_TIMEOUT_MS
   keyInitialization = (async () => {
     try {
-      const existing = await readExistingPersistedKey()
+      const existing = await readExistingPersistedKey(idbTimeoutMs)
       if (existing.status === 'found') {
         memoryCachedKey = existing.record
         return existing.record
@@ -250,7 +261,7 @@ async function getOrCreateDeviceKeyRecord(options?: { bypassMemoryCache?: boolea
       }
       // status === 'missing' || status === 'corrupted': generate fresh P-256 keypair & persist atomically.
       const candidate = await generateCandidateKeyRecord(subtle)
-      const persisted = await loadOrCreatePersistedKey(candidate, false)
+      const persisted = await loadOrCreatePersistedKey(candidate, false, idbTimeoutMs)
       // Only a confirmed transaction commit may establish a server-side TOFU binding.
       memoryCachedKey = persisted
       return persisted
@@ -264,8 +275,8 @@ async function getOrCreateDeviceKeyRecord(options?: { bypassMemoryCache?: boolea
 /**
  * Preloads or initializes the persisted ECDSA P-256 device key in parallel with other probes.
  */
-export async function preloadDeviceKey(): Promise<boolean> {
-  const rec = await getOrCreateDeviceKeyRecord()
+export async function preloadDeviceKey(timeoutMs?: number): Promise<boolean> {
+  const rec = await getOrCreateDeviceKeyRecord({ timeoutMs })
   return rec !== null
 }
 
@@ -336,18 +347,21 @@ async function signTranscript(
   }
 }
 
-export async function signRebindWithDeviceKey(params: {
-  nonce: string
-  subjectId: string
-  beaconId: string
-}): Promise<DeviceKeyProof | undefined> {
+export async function signRebindWithDeviceKey(
+  params: {
+    nonce: string
+    subjectId: string
+    beaconId: string
+  },
+  timeoutMs?: number
+): Promise<DeviceKeyProof | undefined> {
   const subtle = getSubtleCrypto()
   if (!subtle) {
     return undefined
   }
   // Always re-verify IndexedDB on rebind so in-session site-data clearing generates a fresh key
   // without requiring a page reload (S2-24).
-  const rec = await getOrCreateDeviceKeyRecord({ bypassMemoryCache: true })
+  const rec = await getOrCreateDeviceKeyRecord({ bypassMemoryCache: true, timeoutMs })
   if (!rec) {
     return undefined
   }
@@ -359,22 +373,26 @@ export async function signRebindWithDeviceKey(params: {
  * and, when a previous key was still accessible in IndexedDB or memory, the continuity proof
  * (`previous_device_key`) over `prismid-v2-rebind-prev|<nonce>|<subject>|<beacon>|<new_pub_key>` (S2-12).
  */
-export async function rotateDeviceKeyAndSignRebind(params: {
-  nonce: string
-  subjectId: string
-  beaconId: string
-}): Promise<{ device_key: DeviceKeyProof; previous_device_key?: DeviceKeyProof } | undefined> {
+export async function rotateDeviceKeyAndSignRebind(
+  params: {
+    nonce: string
+    subjectId: string
+    beaconId: string
+  },
+  timeoutMs?: number
+): Promise<{ device_key: DeviceKeyProof; previous_device_key?: DeviceKeyProof } | undefined> {
   const subtle = getSubtleCrypto()
   if (!subtle || typeof indexedDB === 'undefined' || !indexedDB) {
     return undefined
   }
-  const existing = await readExistingPersistedKey()
+  const idbTimeoutMs = timeoutMs ?? IDB_KEY_TIMEOUT_MS
+  const existing = await readExistingPersistedKey(idbTimeoutMs)
   const prevRec =
     existing.status === 'found' ? existing.record : memoryCachedKey
 
   try {
     const candidate = await generateCandidateKeyRecord(subtle)
-    const committed = await loadOrCreatePersistedKey(candidate, true)
+    const committed = await loadOrCreatePersistedKey(candidate, true, idbTimeoutMs)
     if (!committed) {
       return undefined
     }
@@ -404,17 +422,20 @@ export async function rotateDeviceKeyAndSignRebind(params: {
   }
 }
 
-export async function signChallengeWithDeviceKey(params: {
-  nonce: string
-  beaconId: string
-  staticWebGLFpHash: string
-  audioCompressorHash: string
-}): Promise<DeviceKeyProof | undefined> {
+export async function signChallengeWithDeviceKey(
+  params: {
+    nonce: string
+    beaconId: string
+    staticWebGLFpHash: string
+    audioCompressorHash: string
+  },
+  timeoutMs?: number
+): Promise<DeviceKeyProof | undefined> {
   const subtle = getSubtleCrypto()
   if (!subtle) {
     return undefined
   }
-  const rec = await getOrCreateDeviceKeyRecord()
+  const rec = await getOrCreateDeviceKeyRecord({ timeoutMs })
   if (!rec) {
     return undefined
   }

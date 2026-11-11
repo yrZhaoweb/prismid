@@ -1696,7 +1696,11 @@ describe('PrismID Web SDK (prismid-js) Unit & Cross-Language Suite', () => {
               const { createPrismClient, sealPayload } = await new Function(
                 'return import("/prismid.bundle.js")'
               )()
-              const client = createPrismClient({ baseUrl: '' })
+              const client = createPrismClient({
+                baseUrl: '',
+                probeTimeoutMs: 2500,
+                requestTimeoutMs: 10000,
+              })
               const clientIp =
                 engineName === 'chromium'
                   ? '198.18.201.11'
@@ -1746,7 +1750,10 @@ describe('PrismID Web SDK (prismid-js) Unit & Cross-Language Suite', () => {
               out.verifyResult.spoof_trap_triggered,
               `${eng.name} spoof trap: ${JSON.stringify(out.verifyResult.spoof_flags)} | payload.webgl=${JSON.stringify({ v: out.payload.webgl.gpu_vendor, r: out.payload.webgl.gpu_renderer, lim: out.payload.webgl.webgl_limits_vector })} | worker=${JSON.stringify(out.payload.lies)}`
             ).toBe(false)
-            expect(out.verifyResult.device_key_bound, `${eng.name} device key bound`).toBe(true)
+            expect(
+              out.verifyResult.device_key_bound,
+              `${eng.name} device key bound (payload.device_key=${Boolean(out.payload.device_key)}, privacy_signals=${JSON.stringify(out.verifyResult.privacy_signals)})`
+            ).toBe(true)
             if (!out.verifyResult.is_virtual_gpu) {
               expect(out.verifyResult.risk_status, `${eng.name} risk status`).toBe('green')
             }

@@ -549,6 +549,13 @@ export function createPrismClient(options: PrismClientOptions = {}): PrismClient
     const workerBudgetMs = Math.min(300, Math.floor(aggregateBudgetMs * 0.5))
     const storageBudgetMs = Math.min(350, Math.floor(aggregateBudgetMs * 0.55))
     const providerTimeoutMs = Math.min(requestTimeoutMs, aggregateBudgetMs)
+    const keyBudgetMs = Math.max(40, Math.min(requestTimeoutMs, Math.max(probeTimeoutMs, 1500)))
+    const keySignDeadlineMs = Math.max(50, Math.min(requestTimeoutMs, keyBudgetMs * 2))
+
+    // Start persistent deviceKey preload immediately in parallel WITHOUT coupling it into
+    // `Promise.all` (so slow cold-disk IndexedDB initialization on Windows NTFS/Defender never
+    // causes `withDeadline` to discard audio/worker/beacon probe results, while warm visits stay <1ms).
+    void preloadDeviceKey(keyBudgetMs).catch(() => false)
 
     const sysMeta = collectSystemMetadata()
     const webgl = collectWebGLProbe(challenge.render_seed, samplePoints)
@@ -580,7 +587,6 @@ export function createPrismClient(options: PrismClientOptions = {}): PrismClient
       surviving_silos_mask: 0,
     }
 
-    // Preload persistent deviceKey in parallel with async probes so IndexedDB I/O overlaps (S3-41).
     const [audioRes, workerLie, storageBeacon, nativeAnchor, turnstileToken] = await withDeadline(
       Promise.all([
         collectAudioProbeWithTrap(audioBudgetMs),
@@ -611,20 +617,22 @@ export function createPrismClient(options: PrismClientOptions = {}): PrismClient
               undefined
             )
           : Promise.resolve(undefined),
-        preloadDeviceKey().catch(() => false),
-      ]).then(([a, w, s, n, t]) => [a, w, s, n, t] as const),
+      ]),
       aggregateBudgetMs,
       [fallbackAudio, fallbackWorker, fallbackBeacon, null, undefined] as const
     )
 
     const deviceKey = await withDeadline(
-      signChallengeWithDeviceKey({
-        nonce: challenge.nonce,
-        beaconId: storageBeacon.beacon_id,
-        staticWebGLFpHash: webgl.static_webgl_fp_hash,
-        audioCompressorHash: audioRes.audio_compressor_hash,
-      }),
-      200,
+      signChallengeWithDeviceKey(
+        {
+          nonce: challenge.nonce,
+          beaconId: storageBeacon.beacon_id,
+          staticWebGLFpHash: webgl.static_webgl_fp_hash,
+          audioCompressorHash: audioRes.audio_compressor_hash,
+        },
+        keyBudgetMs
+      ),
+      keySignDeadlineMs,
       undefined
     )
 
@@ -927,22 +935,29 @@ export function createPrismClient(options: PrismClientOptions = {}): PrismClient
         return { accepted: false, error: chRaw?.error || `challenge HTTP ${chRes.status}` }
       }
 
+      const rebindKeyBudgetMs = Math.max(80, Math.min(requestTimeoutMs, Math.max(probeTimeoutMs, 1500)))
       let deviceKey: DeviceKeyProof | undefined
       let previousDeviceKey: DeviceKeyProof | undefined
       if (rebindOpts?.rotate) {
-        const rotated = await rotateDeviceKeyAndSignRebind({
-          nonce: challenge.nonce,
-          subjectId,
-          beaconId,
-        })
+        const rotated = await rotateDeviceKeyAndSignRebind(
+          {
+            nonce: challenge.nonce,
+            subjectId,
+            beaconId,
+          },
+          rebindKeyBudgetMs
+        )
         deviceKey = rotated?.device_key
         previousDeviceKey = rotated?.previous_device_key
       } else {
-        deviceKey = await signRebindWithDeviceKey({
-          nonce: challenge.nonce,
-          subjectId,
-          beaconId,
-        })
+        deviceKey = await signRebindWithDeviceKey(
+          {
+            nonce: challenge.nonce,
+            subjectId,
+            beaconId,
+          },
+          rebindKeyBudgetMs
+        )
       }
       if (!deviceKey) {
         return { accepted: false, error: 'failed to initialize or sign with persistent WebCrypto device key' }
