@@ -243,6 +243,58 @@ describe('PrismID Web SDK (prismid-js) Unit & Cross-Language Suite', () => {
     expect(attempts).toBe(2)
   })
 
+  it('decouples external provider deadlines so slow nativeAnchorProvider/Turnstile never clobbers storage beacon', async () => {
+    let observedTenantHeader = ''
+    const client = createPrismClient({
+      baseUrl: 'http://provider-decouple.invalid',
+      tenantId: 'tenant_acme',
+      probeTimeoutMs: 120,
+      providerTimeoutMs: 400,
+      requestTimeoutMs: 2000,
+      nativeAnchorProvider: async () => {
+        // Intentionally exceeds probeTimeoutMs (120ms) while staying within providerTimeoutMs (400ms)
+        await new Promise((r) => setTimeout(r, 180))
+        return {
+          platform: 'windows',
+          hw_uuid: '00112233-4455-6677-8899-AABBCCDDEEFF',
+          serial_number: 'SN-WIN32-FFI',
+          keychain_anchor: '0123456789abcdef0123456789abcdef',
+          cpu_brand: 'AMD Ryzen 9',
+          cpu_cores: 16,
+          memory_bytes: 34359738368,
+          is_vm: false,
+        }
+      },
+      getTurnstileToken: async () => {
+        await new Promise((r) => setTimeout(r, 170))
+        return 'cf_turnstile_ok_token'
+      },
+      fetchImpl: async (_input, init) => {
+        const hdrs = (init?.headers || {}) as Record<string, string>
+        if (hdrs['X-PrismID-Tenant-ID']) {
+          observedTenantHeader = hdrs['X-PrismID-Tenant-ID']
+        }
+        return new Response(JSON.stringify({ accepted: true, risk_status: 'green' }), { status: 200 })
+      },
+    })
+
+    const { request, payload } = await client.collectAndSeal({
+      nonce: 'a'.repeat(64),
+      render_seed: [2.1, 3.2, 4.3, 5.4],
+      sample_points: DEFAULT_SAMPLE_POINTS,
+      issued_at: Date.now(),
+      expires_at: Date.now() + 60000,
+    })
+
+    // Storage beacon MUST NOT be discarded even though nativeAnchorProvider took > probeTimeoutMs!
+    expect(payload.beacon_id).toMatch(/^[0-9a-f]{32}$/)
+    expect(payload.native_anchor?.hw_uuid).toBe('00112233-4455-6677-8899-AABBCCDDEEFF')
+    expect(request.ts).toBe('cf_turnstile_ok_token')
+
+    await client.identify({ force: true })
+    expect(observedTenantHeader).toBe('tenant_acme')
+  })
+
   describe('6. Live Cross-Language E2E Integration (prismid-js -> prismid-go standalone server)', () => {
     let serverProc: ChildProcess | null = null
     let serverBinPath = ''

@@ -195,4 +195,79 @@ describe('persistent device-key lifecycle', () => {
     expect(afterReset?.pub_key).toMatch(/^04[0-9a-f]{128}$/)
     expect(afterReset?.pub_key).not.toBe(recovered?.pub_key)
   })
+
+  it('two-phase prepareDeviceKeyRotation binds new_pub_key in transcript and never overwrites IDB before commit()', async () => {
+    const mem = createInMemoryIDB()
+    vi.stubGlobal('indexedDB', mem.idb)
+
+    const {
+      signChallengeWithDeviceKey,
+      prepareDeviceKeyRotation,
+      buildPreviousKeyRotationTranscript,
+    } = await import('../src/crypto/deviceKey.js')
+
+    const initial = await signChallengeWithDeviceKey(params)
+    expect(initial?.pub_key).toMatch(/^04[0-9a-f]{128}$/)
+
+    // Prepare rotation WITHOUT calling commit() (simulating HTTP 500/429 on /rebind-key):
+    const prepared = await prepareDeviceKeyRotation({
+      nonce: 'rot-two-phase-1',
+      subjectId: 'alice',
+      beaconId: params.beaconId,
+    })
+    expect(prepared).toBeDefined()
+    expect(prepared!.device_key.pub_key).not.toBe(initial!.pub_key)
+    expect(prepared!.previous_device_key?.pub_key).toBe(initial!.pub_key)
+
+    // Verify IndexedDB & subsequent identify signing STILL use the original key before commit()!
+    expect((mem.getStored() as any)?.pubKeyHex).toBe(initial!.pub_key)
+    const stillOld = await signChallengeWithDeviceKey({ ...params, nonce: 'after-aborted-rot' })
+    expect(stillOld?.pub_key).toBe(initial!.pub_key)
+
+    // Verify continuity signature is cryptographically bound to `new_pub_key` (5 segments):
+    const boundTranscript = buildPreviousKeyRotationTranscript({
+      nonce: 'rot-two-phase-1',
+      subjectId: 'alice',
+      beaconId: params.beaconId,
+      newPubKey: prepared!.device_key.pub_key,
+    })
+    expect(boundTranscript.split('|')).toHaveLength(5)
+    const pubBytes = Buffer.from(initial!.pub_key, 'hex')
+    const sigBytes = Buffer.from(prepared!.previous_device_key!.signature, 'hex')
+    const importedPrevPub = await webcrypto.subtle.importKey(
+      'raw',
+      pubBytes,
+      { name: 'ECDSA', namedCurve: 'P-256' },
+      false,
+      ['verify']
+    )
+    const validBound = await webcrypto.subtle.verify(
+      { name: 'ECDSA', hash: 'SHA-256' },
+      importedPrevPub,
+      sigBytes,
+      new TextEncoder().encode(boundTranscript)
+    )
+    expect(validBound).toBe(true)
+
+    // Swapping `newPubKey` (MitM attack) invalidates the continuity signature!
+    const tamperedTranscript = buildPreviousKeyRotationTranscript({
+      nonce: 'rot-two-phase-1',
+      subjectId: 'alice',
+      beaconId: params.beaconId,
+      newPubKey: '04' + 'f'.repeat(128),
+    })
+    const validTampered = await webcrypto.subtle.verify(
+      { name: 'ECDSA', hash: 'SHA-256' },
+      importedPrevPub,
+      sigBytes,
+      new TextEncoder().encode(tamperedTranscript)
+    )
+    expect(validTampered).toBe(false)
+
+    // Now invoke commit() (simulating HTTP 200 OK from /rebind-key) -> IDB updates atomically!
+    expect(await prepared!.commit()).toBe(true)
+    expect((mem.getStored() as any)?.pubKeyHex).toBe(prepared!.device_key.pub_key)
+    const afterCommit = await signChallengeWithDeviceKey({ ...params, nonce: 'after-commit-rot' })
+    expect(afterCommit?.pub_key).toBe(prepared!.device_key.pub_key)
+  })
 })

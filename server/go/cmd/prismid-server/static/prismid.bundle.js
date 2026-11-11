@@ -654,12 +654,16 @@ export function buildRebindKeyTranscript(params) {
     ].join('|');
 }
 export function buildPreviousKeyRotationTranscript(params) {
-    return [
+    const parts = [
         'prismid-v2-rebind-prev',
         params.nonce.trim(),
         params.subjectId.trim(),
         params.beaconId.trim().toLowerCase(),
-    ].join('|');
+    ];
+    if (params.newPubKey && params.newPubKey.trim()) {
+        parts.push(params.newPubKey.trim().toLowerCase());
+    }
+    return parts.join('|');
 }
 async function signTranscript(subtle, rec, transcript) {
     try {
@@ -693,45 +697,71 @@ export async function signRebindWithDeviceKey(params, timeoutMs) {
     return signTranscript(subtle, rec, buildRebindKeyTranscript(params));
 }
 /**
- * Rotates the persisted ECDSA P-256 keypair in-place and signs both the new key PoP (`device_key`)
- * and, when a previous key was still accessible in IndexedDB or memory, the continuity proof
- * (`previous_device_key`) over `prismid-v2-rebind-prev|<nonce>|<subject>|<beacon>|<new_pub_key>` (S2-12).
+ * Two-phase key rotation: generates a fresh non-extractable ECDSA P-256 candidate keypair in memory
+ * and signs both `device_key` PoP and the `<new_pub_key>`-bound `previous_device_key` continuity
+ * proof WITHOUT overwriting IndexedDB until `commit()` is invoked after server confirmation.
  */
-export async function rotateDeviceKeyAndSignRebind(params, timeoutMs) {
+export async function prepareDeviceKeyRotation(params, timeoutMs) {
     const subtle = getSubtleCrypto();
     if (!subtle || typeof indexedDB === 'undefined' || !indexedDB) {
         return undefined;
     }
     const idbTimeoutMs = timeoutMs ?? IDB_KEY_TIMEOUT_MS;
     const existing = await readExistingPersistedKey(idbTimeoutMs);
+    if (existing.status === 'error') {
+        return undefined;
+    }
     const prevRec = existing.status === 'found' ? existing.record : memoryCachedKey;
     try {
         const candidate = await generateCandidateKeyRecord(subtle);
-        const committed = await loadOrCreatePersistedKey(candidate, true, idbTimeoutMs);
-        if (!committed) {
-            return undefined;
-        }
-        memoryCachedKey = committed;
-        const newProof = await signTranscript(subtle, committed, buildRebindKeyTranscript(params));
+        const newProof = await signTranscript(subtle, candidate, buildRebindKeyTranscript(params));
         if (!newProof) {
             return undefined;
         }
         let prevProof;
-        if (prevRec && prevRec.pubKeyHex !== committed.pubKeyHex) {
+        if (prevRec && prevRec.pubKeyHex !== candidate.pubKeyHex) {
             prevProof = await signTranscript(subtle, prevRec, buildPreviousKeyRotationTranscript({
                 nonce: params.nonce,
                 subjectId: params.subjectId,
                 beaconId: params.beaconId,
+                newPubKey: candidate.pubKeyHex,
             }));
         }
         return {
             device_key: newProof,
             ...(prevProof ? { previous_device_key: prevProof } : {}),
+            commit: async (commitTimeoutMs) => {
+                const committed = await loadOrCreatePersistedKey(candidate, true, commitTimeoutMs ?? idbTimeoutMs);
+                if (!committed || committed.pubKeyHex !== candidate.pubKeyHex) {
+                    return false;
+                }
+                memoryCachedKey = committed;
+                return true;
+            },
         };
     }
     catch {
         return undefined;
     }
+}
+/**
+ * Rotates the persisted ECDSA P-256 keypair in-place and signs both the new key PoP (`device_key`)
+ * and, when a previous key was still accessible in IndexedDB or memory, the continuity proof
+ * (`previous_device_key`) over `prismid-v2-rebind-prev|<nonce>|<subject>|<beacon>|<new_pub_key>` (S2-12).
+ */
+export async function rotateDeviceKeyAndSignRebind(params, timeoutMs) {
+    const prepared = await prepareDeviceKeyRotation(params, timeoutMs);
+    if (!prepared) {
+        return undefined;
+    }
+    const ok = await prepared.commit(timeoutMs);
+    if (!ok) {
+        return undefined;
+    }
+    return {
+        device_key: prepared.device_key,
+        ...(prepared.previous_device_key ? { previous_device_key: prepared.previous_device_key } : {}),
+    };
 }
 export async function signChallengeWithDeviceKey(params, timeoutMs) {
     const subtle = getSubtleCrypto();
@@ -2640,18 +2670,24 @@ export function createPrismClient(options = {}) {
         if (token) {
             headers['Authorization'] = token.startsWith('Bearer ') ? token : `Bearer ${token}`;
         }
+        const configuredTenant = options.tenantId?.trim();
+        if (configuredTenant) {
+            headers['X-PrismID-Tenant-ID'] = configuredTenant;
+        }
         return headers;
     }
     async function collectAndSeal(challenge) {
         const samplePoints = Array.isArray(challenge.sample_points) && challenge.sample_points.length > 0
             ? challenge.sample_points
             : DEFAULT_SAMPLE_POINTS;
-        // Enforce bounded aggregate probe budget across synchronous & asynchronous probes (S3-41).
+        // Enforce bounded per-probe budgets while keeping external providers (`nativeAnchorProvider`,
+        // `getTurnstileToken`) decoupled from browser probes so a slow Turnstile challenge or cold
+        // desktop IPC bridge NEVER discards completed `beacon_id` / `audio` / `worker` results.
         const aggregateBudgetMs = Math.max(120, Math.min(probeTimeoutMs, requestTimeoutMs));
         const audioBudgetMs = Math.min(400, Math.floor(aggregateBudgetMs * 0.65));
         const workerBudgetMs = Math.min(300, Math.floor(aggregateBudgetMs * 0.5));
         const storageBudgetMs = Math.min(350, Math.floor(aggregateBudgetMs * 0.55));
-        const providerTimeoutMs = Math.min(requestTimeoutMs, aggregateBudgetMs);
+        const externalProviderTimeoutMs = Math.max(120, Math.min(requestTimeoutMs, options.providerTimeoutMs ?? Math.max(probeTimeoutMs, 2500)));
         const keyBudgetMs = Math.max(40, Math.min(requestTimeoutMs, Math.max(probeTimeoutMs, 1500)));
         const keySignDeadlineMs = Math.max(50, Math.min(requestTimeoutMs, keyBudgetMs * 2));
         // Start persistent deviceKey preload immediately in parallel WITHOUT coupling it into
@@ -2686,9 +2722,9 @@ export function createPrismClient(options = {}) {
             surviving_silos: [],
             surviving_silos_mask: 0,
         };
-        const [audioRes, workerLie, storageBeacon, nativeAnchor, turnstileToken] = await withDeadline(Promise.all([
-            collectAudioProbeWithTrap(audioBudgetMs),
-            collectWorkerLieProbe({
+        const [audioRes, workerLie, storageBeacon, nativeAnchor, turnstileToken] = await Promise.all([
+            withDeadline(collectAudioProbeWithTrap(audioBudgetMs).catch(() => fallbackAudio), aggregateBudgetMs, fallbackAudio),
+            withDeadline(collectWorkerLieProbe({
                 gpuRenderer: webgl.gpu_renderer,
                 staticWebGLFpHash: webgl.static_webgl_fp_hash,
                 webglAvailable: webgl.webgl_available,
@@ -2696,15 +2732,15 @@ export function createPrismClient(options = {}) {
                 platform: sysMeta.platform,
                 userAgent: sysMeta.userAgent,
                 timezone: sysMeta.timezone,
-            }, workerBudgetMs),
-            collectAndHealStorageBeacon(storageBudgetMs),
+            }, workerBudgetMs).catch(() => fallbackWorker), aggregateBudgetMs, fallbackWorker),
+            withDeadline(collectAndHealStorageBeacon(storageBudgetMs).catch(() => fallbackBeacon), aggregateBudgetMs, fallbackBeacon),
             options.nativeAnchorProvider
-                ? withDeadline(Promise.resolve(options.nativeAnchorProvider()).catch(() => null), providerTimeoutMs, null)
+                ? withDeadline(Promise.resolve(options.nativeAnchorProvider()).catch(() => null), externalProviderTimeoutMs, null)
                 : Promise.resolve(null),
             options.getTurnstileToken
-                ? withDeadline(Promise.resolve(options.getTurnstileToken()).catch(() => undefined), providerTimeoutMs, undefined)
+                ? withDeadline(Promise.resolve(options.getTurnstileToken()).catch(() => undefined), externalProviderTimeoutMs, undefined)
                 : Promise.resolve(undefined),
-        ]), aggregateBudgetMs, [fallbackAudio, fallbackWorker, fallbackBeacon, null, undefined]);
+        ]);
         const deviceKey = await withDeadline(signChallengeWithDeviceKey({
             nonce: challenge.nonce,
             beaconId: storageBeacon.beacon_id,
@@ -2970,14 +3006,15 @@ export function createPrismClient(options = {}) {
             const rebindKeyBudgetMs = Math.max(80, Math.min(requestTimeoutMs, Math.max(probeTimeoutMs, 1500)));
             let deviceKey;
             let previousDeviceKey;
+            let preparedRotation;
             if (rebindOpts?.rotate) {
-                const rotated = await rotateDeviceKeyAndSignRebind({
+                preparedRotation = await prepareDeviceKeyRotation({
                     nonce: challenge.nonce,
                     subjectId,
                     beaconId,
                 }, rebindKeyBudgetMs);
-                deviceKey = rotated?.device_key;
-                previousDeviceKey = rotated?.previous_device_key;
+                deviceKey = preparedRotation?.device_key;
+                previousDeviceKey = preparedRotation?.previous_device_key;
             }
             else {
                 deviceKey = await signRebindWithDeviceKey({
@@ -3012,10 +3049,20 @@ export function createPrismClient(options = {}) {
             if (!rbRes.data) {
                 return { accepted: false, error: `rebind-key HTTP ${rbRes.status}` };
             }
+            const accepted = rbRes.ok && rbRes.data.accepted !== false;
+            if (accepted && preparedRotation) {
+                const committed = await preparedRotation.commit(rebindKeyBudgetMs);
+                if (!committed) {
+                    return {
+                        accepted: false,
+                        error: 'server accepted key rotation, but IndexedDB commit failed',
+                    };
+                }
+            }
             resetSessionCache();
             return {
                 ...rbRes.data,
-                accepted: rbRes.ok && rbRes.data.accepted !== false,
+                accepted,
             };
         }
         catch (err) {

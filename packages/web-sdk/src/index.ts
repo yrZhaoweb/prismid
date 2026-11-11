@@ -26,11 +26,13 @@ import {
   buildPreviousKeyRotationTranscript,
   buildRebindKeyTranscript,
   preloadDeviceKey,
+  prepareDeviceKeyRotation,
   resetDeviceKeyCache,
   rotateDeviceKeyAndSignRebind,
   signChallengeWithDeviceKey,
   signRebindWithDeviceKey,
   type DeviceKeyProof,
+  type PreparedKeyRotation,
 } from './crypto/deviceKey.js'
 import { collectAudioProbe, collectAudioProbeWithTrap, type AudioProbeResult } from './probes/audio.js'
 import { collectFontsAndCanvasProbe, resetFontsProbeCache } from './probes/fontsCanvas.js'
@@ -65,6 +67,7 @@ export {
   DEFAULT_SAMPLE_POINTS,
   deriveAEADKeyBytes,
   preloadDeviceKey,
+  prepareDeviceKeyRotation,
   resetDeviceKeyCache,
   resetFontsProbeCache,
   rotateDeviceKeyAndSignRebind,
@@ -77,6 +80,7 @@ export {
   toBase64RawURL,
   type AudioProbeResult,
   type DeviceKeyProof,
+  type PreparedKeyRotation,
   type StorageBeaconResult,
 }
 
@@ -247,6 +251,8 @@ export interface ProbePayload {
 export interface PrismClientOptions {
   /** Base API URL (default: `""` for same-origin requests). */
   baseUrl?: string
+  /** Optional multi-tenant isolation identifier sent as `X-PrismID-Tenant-ID`. */
+  tenantId?: string
   /** Returns the current user's bearer access token (if authenticated). Invoked at most once per request cycle. */
   getAccessToken?: () => string | null | undefined | Promise<string | null | undefined>
   /** Optional explicit subject ID resolver when bearer tokens are opaque session cookies/handles. */
@@ -274,6 +280,8 @@ export interface PrismClientOptions {
   requestTimeoutMs?: number
   /** Aggregate client-side probe collection budget in milliseconds (default: 800ms, S3-41). */
   probeTimeoutMs?: number
+  /** Independent deadline in milliseconds for external providers (`nativeAnchorProvider` / `getTurnstileToken`; default: `min(requestTimeoutMs, max(probeTimeoutMs, 2500))`). */
+  providerTimeoutMs?: number
   /** Optional error observer invoked whenever `identify()` encounters an HTTP, timeout, or network failure (S3-40). */
   onError?: (error: PrismClientError) => void
 }
@@ -531,6 +539,10 @@ export function createPrismClient(options: PrismClientOptions = {}): PrismClient
     if (token) {
       headers['Authorization'] = token.startsWith('Bearer ') ? token : `Bearer ${token}`
     }
+    const configuredTenant = options.tenantId?.trim()
+    if (configuredTenant) {
+      headers['X-PrismID-Tenant-ID'] = configuredTenant
+    }
     return headers
   }
 
@@ -543,12 +555,17 @@ export function createPrismClient(options: PrismClientOptions = {}): PrismClient
         ? challenge.sample_points
         : DEFAULT_SAMPLE_POINTS
 
-    // Enforce bounded aggregate probe budget across synchronous & asynchronous probes (S3-41).
+    // Enforce bounded per-probe budgets while keeping external providers (`nativeAnchorProvider`,
+    // `getTurnstileToken`) decoupled from browser probes so a slow Turnstile challenge or cold
+    // desktop IPC bridge NEVER discards completed `beacon_id` / `audio` / `worker` results.
     const aggregateBudgetMs = Math.max(120, Math.min(probeTimeoutMs, requestTimeoutMs))
     const audioBudgetMs = Math.min(400, Math.floor(aggregateBudgetMs * 0.65))
     const workerBudgetMs = Math.min(300, Math.floor(aggregateBudgetMs * 0.5))
     const storageBudgetMs = Math.min(350, Math.floor(aggregateBudgetMs * 0.55))
-    const providerTimeoutMs = Math.min(requestTimeoutMs, aggregateBudgetMs)
+    const externalProviderTimeoutMs = Math.max(
+      120,
+      Math.min(requestTimeoutMs, options.providerTimeoutMs ?? Math.max(probeTimeoutMs, 2500))
+    )
     const keyBudgetMs = Math.max(40, Math.min(requestTimeoutMs, Math.max(probeTimeoutMs, 1500)))
     const keySignDeadlineMs = Math.max(50, Math.min(requestTimeoutMs, keyBudgetMs * 2))
 
@@ -587,9 +604,13 @@ export function createPrismClient(options: PrismClientOptions = {}): PrismClient
       surviving_silos_mask: 0,
     }
 
-    const [audioRes, workerLie, storageBeacon, nativeAnchor, turnstileToken] = await withDeadline(
-      Promise.all([
-        collectAudioProbeWithTrap(audioBudgetMs),
+    const [audioRes, workerLie, storageBeacon, nativeAnchor, turnstileToken] = await Promise.all([
+      withDeadline(
+        collectAudioProbeWithTrap(audioBudgetMs).catch(() => fallbackAudio),
+        aggregateBudgetMs,
+        fallbackAudio
+      ),
+      withDeadline(
         collectWorkerLieProbe(
           {
             gpuRenderer: webgl.gpu_renderer,
@@ -601,26 +622,30 @@ export function createPrismClient(options: PrismClientOptions = {}): PrismClient
             timezone: sysMeta.timezone,
           },
           workerBudgetMs
-        ),
-        collectAndHealStorageBeacon(storageBudgetMs),
-        options.nativeAnchorProvider
-          ? withDeadline(
-              Promise.resolve(options.nativeAnchorProvider()).catch(() => null),
-              providerTimeoutMs,
-              null
-            )
-          : Promise.resolve(null),
-        options.getTurnstileToken
-          ? withDeadline(
-              Promise.resolve(options.getTurnstileToken()).catch(() => undefined),
-              providerTimeoutMs,
-              undefined
-            )
-          : Promise.resolve(undefined),
-      ]),
-      aggregateBudgetMs,
-      [fallbackAudio, fallbackWorker, fallbackBeacon, null, undefined] as const
-    )
+        ).catch(() => fallbackWorker),
+        aggregateBudgetMs,
+        fallbackWorker
+      ),
+      withDeadline(
+        collectAndHealStorageBeacon(storageBudgetMs).catch(() => fallbackBeacon),
+        aggregateBudgetMs,
+        fallbackBeacon
+      ),
+      options.nativeAnchorProvider
+        ? withDeadline(
+            Promise.resolve(options.nativeAnchorProvider()).catch(() => null),
+            externalProviderTimeoutMs,
+            null
+          )
+        : Promise.resolve(null),
+      options.getTurnstileToken
+        ? withDeadline(
+            Promise.resolve(options.getTurnstileToken()).catch(() => undefined),
+            externalProviderTimeoutMs,
+            undefined
+          )
+        : Promise.resolve(undefined),
+    ])
 
     const deviceKey = await withDeadline(
       signChallengeWithDeviceKey(
@@ -938,8 +963,9 @@ export function createPrismClient(options: PrismClientOptions = {}): PrismClient
       const rebindKeyBudgetMs = Math.max(80, Math.min(requestTimeoutMs, Math.max(probeTimeoutMs, 1500)))
       let deviceKey: DeviceKeyProof | undefined
       let previousDeviceKey: DeviceKeyProof | undefined
+      let preparedRotation: PreparedKeyRotation | undefined
       if (rebindOpts?.rotate) {
-        const rotated = await rotateDeviceKeyAndSignRebind(
+        preparedRotation = await prepareDeviceKeyRotation(
           {
             nonce: challenge.nonce,
             subjectId,
@@ -947,8 +973,8 @@ export function createPrismClient(options: PrismClientOptions = {}): PrismClient
           },
           rebindKeyBudgetMs
         )
-        deviceKey = rotated?.device_key
-        previousDeviceKey = rotated?.previous_device_key
+        deviceKey = preparedRotation?.device_key
+        previousDeviceKey = preparedRotation?.previous_device_key
       } else {
         deviceKey = await signRebindWithDeviceKey(
           {
@@ -990,10 +1016,20 @@ export function createPrismClient(options: PrismClientOptions = {}): PrismClient
       if (!rbRes.data) {
         return { accepted: false, error: `rebind-key HTTP ${rbRes.status}` }
       }
+      const accepted = rbRes.ok && rbRes.data.accepted !== false
+      if (accepted && preparedRotation) {
+        const committed = await preparedRotation.commit(rebindKeyBudgetMs)
+        if (!committed) {
+          return {
+            accepted: false,
+            error: 'server accepted key rotation, but IndexedDB commit failed',
+          }
+        }
+      }
       resetSessionCache()
       return {
         ...rbRes.data,
-        accepted: rbRes.ok && rbRes.data.accepted !== false,
+        accepted,
       }
     } catch (err) {
       return {

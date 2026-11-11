@@ -312,13 +312,18 @@ export function buildPreviousKeyRotationTranscript(params: {
   nonce: string
   subjectId: string
   beaconId: string
+  newPubKey?: string
 }): string {
-  return [
+  const parts = [
     'prismid-v2-rebind-prev',
     params.nonce.trim(),
     params.subjectId.trim(),
     params.beaconId.trim().toLowerCase(),
-  ].join('|')
+  ]
+  if (params.newPubKey && params.newPubKey.trim()) {
+    parts.push(params.newPubKey.trim().toLowerCase())
+  }
+  return parts.join('|')
 }
 
 async function signTranscript(
@@ -368,6 +373,81 @@ export async function signRebindWithDeviceKey(
   return signTranscript(subtle, rec, buildRebindKeyTranscript(params))
 }
 
+export interface PreparedKeyRotation {
+  device_key: DeviceKeyProof
+  previous_device_key?: DeviceKeyProof
+  /**
+   * Commits the newly generated candidate keypair to IndexedDB and updates the in-memory cache.
+   * Call ONLY after the server acknowledges `/api/v1/risk/rebind-key` with HTTP 200 so transient
+   * 5xx/429/network failures never overwrite the previously bound non-extractable key.
+   */
+  commit: (timeoutMs?: number) => Promise<boolean>
+}
+
+/**
+ * Two-phase key rotation: generates a fresh non-extractable ECDSA P-256 candidate keypair in memory
+ * and signs both `device_key` PoP and the `<new_pub_key>`-bound `previous_device_key` continuity
+ * proof WITHOUT overwriting IndexedDB until `commit()` is invoked after server confirmation.
+ */
+export async function prepareDeviceKeyRotation(
+  params: {
+    nonce: string
+    subjectId: string
+    beaconId: string
+  },
+  timeoutMs?: number
+): Promise<PreparedKeyRotation | undefined> {
+  const subtle = getSubtleCrypto()
+  if (!subtle || typeof indexedDB === 'undefined' || !indexedDB) {
+    return undefined
+  }
+  const idbTimeoutMs = timeoutMs ?? IDB_KEY_TIMEOUT_MS
+  const existing = await readExistingPersistedKey(idbTimeoutMs)
+  if (existing.status === 'error') {
+    return undefined
+  }
+  const prevRec = existing.status === 'found' ? existing.record : memoryCachedKey
+
+  try {
+    const candidate = await generateCandidateKeyRecord(subtle)
+    const newProof = await signTranscript(subtle, candidate, buildRebindKeyTranscript(params))
+    if (!newProof) {
+      return undefined
+    }
+    let prevProof: DeviceKeyProof | undefined
+    if (prevRec && prevRec.pubKeyHex !== candidate.pubKeyHex) {
+      prevProof = await signTranscript(
+        subtle,
+        prevRec,
+        buildPreviousKeyRotationTranscript({
+          nonce: params.nonce,
+          subjectId: params.subjectId,
+          beaconId: params.beaconId,
+          newPubKey: candidate.pubKeyHex,
+        })
+      )
+    }
+    return {
+      device_key: newProof,
+      ...(prevProof ? { previous_device_key: prevProof } : {}),
+      commit: async (commitTimeoutMs?: number) => {
+        const committed = await loadOrCreatePersistedKey(
+          candidate,
+          true,
+          commitTimeoutMs ?? idbTimeoutMs
+        )
+        if (!committed || committed.pubKeyHex !== candidate.pubKeyHex) {
+          return false
+        }
+        memoryCachedKey = committed
+        return true
+      },
+    }
+  } catch {
+    return undefined
+  }
+}
+
 /**
  * Rotates the persisted ECDSA P-256 keypair in-place and signs both the new key PoP (`device_key`)
  * and, when a previous key was still accessible in IndexedDB or memory, the continuity proof
@@ -381,44 +461,17 @@ export async function rotateDeviceKeyAndSignRebind(
   },
   timeoutMs?: number
 ): Promise<{ device_key: DeviceKeyProof; previous_device_key?: DeviceKeyProof } | undefined> {
-  const subtle = getSubtleCrypto()
-  if (!subtle || typeof indexedDB === 'undefined' || !indexedDB) {
+  const prepared = await prepareDeviceKeyRotation(params, timeoutMs)
+  if (!prepared) {
     return undefined
   }
-  const idbTimeoutMs = timeoutMs ?? IDB_KEY_TIMEOUT_MS
-  const existing = await readExistingPersistedKey(idbTimeoutMs)
-  const prevRec =
-    existing.status === 'found' ? existing.record : memoryCachedKey
-
-  try {
-    const candidate = await generateCandidateKeyRecord(subtle)
-    const committed = await loadOrCreatePersistedKey(candidate, true, idbTimeoutMs)
-    if (!committed) {
-      return undefined
-    }
-    memoryCachedKey = committed
-    const newProof = await signTranscript(subtle, committed, buildRebindKeyTranscript(params))
-    if (!newProof) {
-      return undefined
-    }
-    let prevProof: DeviceKeyProof | undefined
-    if (prevRec && prevRec.pubKeyHex !== committed.pubKeyHex) {
-      prevProof = await signTranscript(
-        subtle,
-        prevRec,
-        buildPreviousKeyRotationTranscript({
-          nonce: params.nonce,
-          subjectId: params.subjectId,
-          beaconId: params.beaconId,
-        })
-      )
-    }
-    return {
-      device_key: newProof,
-      ...(prevProof ? { previous_device_key: prevProof } : {}),
-    }
-  } catch {
+  const ok = await prepared.commit(timeoutMs)
+  if (!ok) {
     return undefined
+  }
+  return {
+    device_key: prepared.device_key,
+    ...(prepared.previous_device_key ? { previous_device_key: prepared.previous_device_key } : {}),
   }
 }
 
