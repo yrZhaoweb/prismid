@@ -1,6 +1,8 @@
 //! macOS native hardware anchor implementation using direct `IOKit` + `sysctlbyname` FFI
-//! (completing in **< 0.5ms** with zero subprocess spawns), with `ioreg` / `sysctl` subprocess
-//! fallback and bounded Keychain + owner-only `0600` file-anchor persistence.
+//! (completing in **< 0.5ms** with zero subprocess spawns on the happy path), plus non-interactive
+//! `Security.framework` FFI (`kSecUseAuthenticationUISkip` / `kSecUseAuthenticationUIFail`) and
+//! owner-only `0600` file-anchor persistence (never spawning `/usr/bin/security`, so no macOS
+//! keychain modal authorization prompts are ever triggered).
 
 use crate::{
     detect_vm_vendor_from_text, load_or_create_file_anchor, read_existing_file_anchor,
@@ -11,7 +13,6 @@ use std::time::Duration;
 const KEYCHAIN_SERVICE: &str = "io.prismid.device.anchor";
 const KEYCHAIN_ACCOUNT: &str = "default";
 const CMD_TIMEOUT: Duration = Duration::from_millis(400);
-const KEYCHAIN_TIMEOUT: Duration = Duration::from_millis(120);
 
 pub fn collect() -> NativeHardwareAnchor {
     #[cfg(target_os = "macos")]
@@ -131,43 +132,24 @@ fn read_or_create_macos_keychain_anchor(hw_uuid_hint: &str) -> String {
         return load_or_create_file_anchor(seed);
     }
 
-    // 2. Bounded Keychain lookup (hard 120ms timeout; killed immediately if locked or prompting).
-    if let Some((true, stdout)) = run_cmd_with_timeout(
-        "/usr/bin/security",
-        &[
-            "find-generic-password",
-            "-s",
-            KEYCHAIN_SERVICE,
-            "-a",
-            KEYCHAIN_ACCOUNT,
-            "-w",
-        ],
-        KEYCHAIN_TIMEOUT,
-    ) {
-        let secret = stdout.trim().to_string();
-        if secret.len() >= 32 && secret.chars().all(|c| c.is_ascii_hexdigit()) {
-            let normalized = secret.to_ascii_lowercase();
+    // 2. Non-interactive Security.framework FFI lookup (never spawns `/usr/bin/security` and sets
+    // `kSecUseAuthenticationUISkip`, so locked keychains / mismatched ACLs fail silently).
+    #[cfg(target_os = "macos")]
+    if let Some(secret) = macos_ffi::keychain_find_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT) {
+        let trimmed = secret.trim();
+        if trimmed.len() >= 32 && trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
+            let normalized = trimmed.to_ascii_lowercase();
             write_file_anchor_restricted(seed, &normalized);
             return normalized;
         }
     }
 
-    // 3. Fallback: generate and persist 0600 file anchor, then mirror to Keychain best-effort.
+    // 3. Fallback: generate and persist 0600 file anchor, then mirror to Keychain non-interactively.
     let anchor = load_or_create_file_anchor(seed);
-    let _ = run_cmd_with_timeout(
-        "/usr/bin/security",
-        &[
-            "add-generic-password",
-            "-U",
-            "-s",
-            KEYCHAIN_SERVICE,
-            "-a",
-            KEYCHAIN_ACCOUNT,
-            "-w",
-            &anchor,
-        ],
-        Duration::from_millis(80),
-    );
+    #[cfg(target_os = "macos")]
+    {
+        let _ = macos_ffi::keychain_save_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT, &anchor);
+    }
 
     anchor
 }
@@ -206,6 +188,9 @@ mod macos_ffi {
 
     #[link(name = "CoreFoundation", kind = "framework")]
     extern "C" {
+        static kCFBooleanTrue: CFTypeRef;
+        static kCFTypeDictionaryKeyCallBacks: u8;
+        static kCFTypeDictionaryValueCallBacks: u8;
         fn CFStringCreateWithBytes(
             alloc: CFAllocatorRef,
             bytes: *const u8,
@@ -219,12 +204,229 @@ mod macos_ffi {
             buffer_size: isize,
             encoding: u32,
         ) -> u8;
+        fn CFDataCreate(alloc: CFAllocatorRef, bytes: *const u8, length: isize) -> CFDataRef;
+        fn CFDictionaryCreate(
+            allocator: CFAllocatorRef,
+            keys: *const CFTypeRef,
+            values: *const CFTypeRef,
+            num_values: isize,
+            key_callbacks: *const u8,
+            value_callbacks: *const u8,
+        ) -> CFDictionaryRef;
         fn CFGetTypeID(cf: CFTypeRef) -> usize;
         fn CFStringGetTypeID() -> usize;
         fn CFDataGetTypeID() -> usize;
         fn CFDataGetBytePtr(the_data: CFDataRef) -> *const u8;
         fn CFDataGetLength(the_data: CFDataRef) -> isize;
         fn CFRelease(cf: CFTypeRef);
+    }
+
+    #[link(name = "Security", kind = "framework")]
+    extern "C" {
+        static kSecClass: CFTypeRef;
+        static kSecClassGenericPassword: CFTypeRef;
+        static kSecAttrService: CFTypeRef;
+        static kSecAttrAccount: CFTypeRef;
+        static kSecAttrAccessible: CFTypeRef;
+        static kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly: CFTypeRef;
+        static kSecUseAuthenticationUI: CFTypeRef;
+        static kSecUseAuthenticationUISkip: CFTypeRef;
+        static kSecUseAuthenticationUIFail: CFTypeRef;
+        static kSecReturnData: CFTypeRef;
+        static kSecValueData: CFTypeRef;
+        static kSecMatchLimit: CFTypeRef;
+        static kSecMatchLimitOne: CFTypeRef;
+        fn SecItemCopyMatching(query: CFDictionaryRef, result: *mut CFTypeRef) -> i32;
+        fn SecItemAdd(attributes: CFDictionaryRef, result: *mut CFTypeRef) -> i32;
+        fn SecItemUpdate(query: CFDictionaryRef, attributes_to_update: CFDictionaryRef) -> i32;
+        #[cfg(test)]
+        fn SecItemDelete(query: CFDictionaryRef) -> i32;
+    }
+
+    const ERR_SEC_SUCCESS: i32 = 0;
+    #[cfg(test)]
+    const ERR_SEC_ITEM_NOT_FOUND: i32 = -25300;
+    const ERR_SEC_DUPLICATE_ITEM: i32 = -25299;
+
+    struct OwnedCF(CFTypeRef);
+
+    impl OwnedCF {
+        fn wrap(raw: CFTypeRef) -> Option<Self> {
+            if raw.is_null() {
+                None
+            } else {
+                Some(Self(raw))
+            }
+        }
+
+        fn as_ptr(&self) -> CFTypeRef {
+            self.0
+        }
+    }
+
+    impl Drop for OwnedCF {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe { CFRelease(self.0) };
+            }
+        }
+    }
+
+    fn cf_string(s: &str) -> Option<OwnedCF> {
+        OwnedCF::wrap(unsafe {
+            CFStringCreateWithBytes(
+                core::ptr::null(),
+                s.as_ptr(),
+                s.len() as isize,
+                K_CF_STRING_ENCODING_UTF8,
+                0,
+            )
+        })
+    }
+
+    fn cf_data(bytes: &[u8]) -> Option<OwnedCF> {
+        OwnedCF::wrap(unsafe { CFDataCreate(core::ptr::null(), bytes.as_ptr(), bytes.len() as isize) })
+    }
+
+    fn cf_dict(pairs: &[(CFTypeRef, CFTypeRef)]) -> Option<OwnedCF> {
+        let mut keys: Vec<CFTypeRef> = Vec::with_capacity(pairs.len());
+        let mut values: Vec<CFTypeRef> = Vec::with_capacity(pairs.len());
+        for &(k, v) in pairs {
+            if k.is_null() || v.is_null() {
+                return None;
+            }
+            keys.push(k);
+            values.push(v);
+        }
+        OwnedCF::wrap(unsafe {
+            CFDictionaryCreate(
+                core::ptr::null(),
+                keys.as_ptr(),
+                values.as_ptr(),
+                pairs.len() as isize,
+                &kCFTypeDictionaryKeyCallBacks,
+                &kCFTypeDictionaryValueCallBacks,
+            )
+        })
+    }
+
+    pub(super) fn keychain_find_password(service: &str, account: &str) -> Option<String> {
+        let cf_service = cf_string(service)?;
+        let cf_account = cf_string(account)?;
+        let query = unsafe {
+            cf_dict(&[
+                (kSecClass, kSecClassGenericPassword),
+                (kSecAttrService, cf_service.as_ptr()),
+                (kSecAttrAccount, cf_account.as_ptr()),
+                (kSecReturnData, kCFBooleanTrue),
+                (kSecMatchLimit, kSecMatchLimitOne),
+                // Never display a SecurityAgent modal prompt if Keychain is locked or ACL differs.
+                (kSecUseAuthenticationUI, kSecUseAuthenticationUISkip),
+            ])
+        }?;
+
+        let mut raw_result: CFTypeRef = core::ptr::null();
+        let status = unsafe { SecItemCopyMatching(query.as_ptr(), &mut raw_result) };
+        let result = OwnedCF::wrap(raw_result)?;
+        if status != ERR_SEC_SUCCESS {
+            return None;
+        }
+        if unsafe { CFGetTypeID(result.as_ptr()) } != unsafe { CFDataGetTypeID() } {
+            return None;
+        }
+        let len = unsafe { CFDataGetLength(result.as_ptr()) };
+        let ptr = unsafe { CFDataGetBytePtr(result.as_ptr()) };
+        if ptr.is_null() || len <= 0 || len > 4096 {
+            return None;
+        }
+        let bytes = unsafe { core::slice::from_raw_parts(ptr, len as usize) };
+        let s = String::from_utf8(bytes.to_vec()).ok()?;
+        let trimmed = s.trim().to_string();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        }
+    }
+
+    pub(super) fn keychain_save_password(service: &str, account: &str, value: &str) -> bool {
+        let Some(cf_service) = cf_string(service) else {
+            return false;
+        };
+        let Some(cf_account) = cf_string(account) else {
+            return false;
+        };
+        let Some(cf_secret) = cf_data(value.as_bytes()) else {
+            return false;
+        };
+
+        let Some(add_attrs) = (unsafe {
+            cf_dict(&[
+                (kSecClass, kSecClassGenericPassword),
+                (kSecAttrService, cf_service.as_ptr()),
+                (kSecAttrAccount, cf_account.as_ptr()),
+                (kSecValueData, cf_secret.as_ptr()),
+                (
+                    kSecAttrAccessible,
+                    kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
+                ),
+                (kSecUseAuthenticationUI, kSecUseAuthenticationUIFail),
+            ])
+        }) else {
+            return false;
+        };
+
+        let add_status = unsafe { SecItemAdd(add_attrs.as_ptr(), core::ptr::null_mut()) };
+        if add_status == ERR_SEC_SUCCESS {
+            return true;
+        }
+        if add_status != ERR_SEC_DUPLICATE_ITEM {
+            return false;
+        }
+
+        let Some(query) = (unsafe {
+            cf_dict(&[
+                (kSecClass, kSecClassGenericPassword),
+                (kSecAttrService, cf_service.as_ptr()),
+                (kSecAttrAccount, cf_account.as_ptr()),
+                (kSecUseAuthenticationUI, kSecUseAuthenticationUIFail),
+            ])
+        }) else {
+            return false;
+        };
+        let Some(update_attrs) = (unsafe {
+            cf_dict(&[
+                (kSecValueData, cf_secret.as_ptr()),
+                (
+                    kSecAttrAccessible,
+                    kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
+                ),
+            ])
+        }) else {
+            return false;
+        };
+        unsafe { SecItemUpdate(query.as_ptr(), update_attrs.as_ptr()) == ERR_SEC_SUCCESS }
+    }
+
+    #[cfg(test)]
+    pub(super) fn keychain_delete_password(service: &str, account: &str) -> i32 {
+        let Some(cf_service) = cf_string(service) else {
+            return ERR_SEC_ITEM_NOT_FOUND;
+        };
+        let Some(cf_account) = cf_string(account) else {
+            return ERR_SEC_ITEM_NOT_FOUND;
+        };
+        let Some(query) = (unsafe {
+            cf_dict(&[
+                (kSecClass, kSecClassGenericPassword),
+                (kSecAttrService, cf_service.as_ptr()),
+                (kSecAttrAccount, cf_account.as_ptr()),
+                (kSecUseAuthenticationUI, kSecUseAuthenticationUIFail),
+            ])
+        }) else {
+            return ERR_SEC_ITEM_NOT_FOUND;
+        };
+        unsafe { SecItemDelete(query.as_ptr()) }
     }
 
     extern "C" {
@@ -414,5 +616,41 @@ mod macos_ffi {
             is_vm,
             vm_vendor,
         })
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::macos_ffi::{
+        keychain_delete_password, keychain_find_password, keychain_save_password,
+    };
+
+    #[test]
+    fn test_macos_keychain_ffi_silent_roundtrip_or_graceful_fallback() {
+        let test_service = "io.prismid.device.anchor.unit-test";
+        let test_account = format!("unit-test-{}", std::process::id());
+        let _ = keychain_delete_password(test_service, &test_account);
+
+        assert_eq!(keychain_find_password(test_service, &test_account), None);
+
+        let initial_secret = "0123456789abcdef0123456789abcdef";
+        if keychain_save_password(test_service, &test_account, initial_secret) {
+            assert_eq!(
+                keychain_find_password(test_service, &test_account).as_deref(),
+                Some(initial_secret)
+            );
+            let updated_secret = "fedcba9876543210fedcba9876543210";
+            assert!(keychain_save_password(
+                test_service,
+                &test_account,
+                updated_secret
+            ));
+            assert_eq!(
+                keychain_find_password(test_service, &test_account).as_deref(),
+                Some(updated_secret)
+            );
+        }
+
+        let _ = keychain_delete_password(test_service, &test_account);
     }
 }

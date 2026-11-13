@@ -93,7 +93,7 @@ function readExistingPersistedKey(timeoutMs: number = IDB_KEY_TIMEOUT_MS): Promi
       if (settled) return
       settled = true
       clearTimeout(timer)
-      try { db?.close() } catch {}
+      try { db?.close() } catch { /* ignore */ }
       resolve(outcome)
     }
     const timer = setTimeout(() => finish({ status: 'error' }), budgetMs)
@@ -159,9 +159,9 @@ function loadOrCreatePersistedKey(
       settled = true
       clearTimeout(timer)
       if (!value) {
-        try { tx?.abort() } catch {}
+        try { tx?.abort() } catch { /* ignore */ }
       }
-      try { db?.close() } catch {}
+      try { db?.close() } catch { /* ignore */ }
       resolve(value)
     }
     const timer = setTimeout(() => finish(null), budgetMs)

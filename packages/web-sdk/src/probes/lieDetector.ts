@@ -37,6 +37,40 @@ function sampleMathConstants(): number[] {
   ]
 }
 
+function stripStackFrameLocation(frame: string): string {
+  const withoutParenUrl = frame.replace(
+    /\s*\((?:https?:|file:|blob:|webpack-internal:|\/)[^)]*\)\s*$/i,
+    ''
+  )
+  const atIdx = withoutParenUrl.indexOf('@')
+  if (atIdx >= 0 && /^(?:https?:|file:|blob:|\/)/i.test(withoutParenUrl.slice(atIdx + 1))) {
+    return withoutParenUrl.slice(0, atIdx)
+  }
+  return withoutParenUrl.replace(/\s+(?:https?:|file:|blob:)[^\s]+$/i, '')
+}
+
+/**
+ * Checks whether `Object.setPrototypeOf(fn, Object.create(fn))` threw directly inside a Proxy
+ * `setPrototypeOf` trap rather than inside a caller's own wrapper (such as Vue reactivity proxies).
+ */
+export function isTopFrameProxySetPrototypeTrap(stack: string): boolean {
+  if (!stack || !stack.includes('Proxy.')) {
+    return false
+  }
+  const frames = stack
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0 && !/^(TypeError|Error)\b/.test(line))
+  if (frames.length === 0) {
+    return false
+  }
+  const detectorIdx = frames.findIndex((frame) => frame.includes('checkNativeFunction'))
+  const candidateFrames = detectorIdx >= 0 ? frames.slice(0, detectorIdx) : frames.slice(0, 2)
+  return candidateFrames.some((frame) =>
+    /\bProxy\.(?:setPrototypeOf|<anonymous>)\b/.test(stripStackFrameLocation(frame))
+  )
+}
+
 export function collectLieDetectorProbe(): LieDetectorResult {
   // 1. FDLIBM Math floating-point boundary fingerprint + active tamper check (S3-29)
   const mValues = sampleMathConstants()
@@ -77,8 +111,6 @@ export function collectLieDetectorProbe(): LieDetectorResult {
       mathEngineSignature = 'spidermonkey'
     } else if (errStack.includes('@')) {
       mathEngineSignature = 'jsc'
-    } else if ('captureStackTrace' in Error) {
-      mathEngineSignature = 'v8'
     }
   } catch {
     mathEngineSignature = 'unknown'
@@ -130,7 +162,7 @@ export function collectLieDetectorProbe(): LieDetectorResult {
           prototypeLies.push(`${label}:es6_proxy_detected`)
         } catch (err) {
           const stack = (err as Error)?.stack || ''
-          if (stack.includes('Proxy.')) {
+          if (isTopFrameProxySetPrototypeTrap(stack)) {
             prototypeLies.push(`${label}:proxy_setPrototypeOf_trap`)
           }
         } finally {
@@ -196,13 +228,6 @@ export function collectLieDetectorProbe(): LieDetectorResult {
         'getParameter'
       )
     }
-    if (typeof HTMLMediaElement !== 'undefined') {
-      checkNativeFunction(
-        HTMLMediaElement.prototype.canPlayType,
-        'HTMLMediaElement.canPlayType',
-        'canPlayType'
-      )
-    }
     if (typeof Document !== 'undefined' && typeof document !== 'undefined') {
       checkNativeFunction(
         Document.prototype.createElement,
@@ -211,14 +236,6 @@ export function collectLieDetectorProbe(): LieDetectorResult {
       )
       if (Object.prototype.hasOwnProperty.call(document, 'createElement')) {
         prototypeLies.push('document.createElement:instance_property_override')
-      }
-    }
-    if (typeof window !== 'undefined') {
-      for (const dimProp of ['outerWidth', 'outerHeight', 'innerWidth', 'innerHeight'] as const) {
-        const wDesc = Object.getOwnPropertyDescriptor(window, dimProp)
-        if (wDesc && ('value' in wDesc || typeof wDesc.get !== 'function')) {
-          prototypeLies.push(`window.${dimProp}:replaceable_data_override`)
-        }
       }
     }
     if (typeof OfflineAudioContext !== 'undefined') {
@@ -302,12 +319,6 @@ export function collectLieDetectorProbe(): LieDetectorResult {
         if (Object.prototype.hasOwnProperty.call(screen, prop)) {
           prototypeLies.push(`screen.${prop}:instance_property_override`)
         }
-      }
-      if (
-        (screen.width > 0 && screen.availWidth > screen.width) ||
-        (screen.height > 0 && screen.availHeight > screen.height)
-      ) {
-        prototypeLies.push('screen:avail_exceeds_total_dimensions')
       }
     }
   } catch {

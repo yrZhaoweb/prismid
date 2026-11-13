@@ -3,9 +3,10 @@
 //! Windows, and Linux.
 //!
 //! Results are cached in a process-wide [`std::sync::OnceLock`] so that the initial collection
-//! completes in ~12ms (on macOS via `ioreg` + `sysctl`, avoiding slow `diskutil` calls, with
-//! bounded subprocess timeouts and owner-only `0600` file-anchor fallback when OS Keychain is
-//! unavailable or locked) and all subsequent invocations execute in **0ms**.
+//! completes in ~12ms (on macOS via direct `IOKit` + `sysctlbyname` + non-interactive
+//! `Security.framework` FFI without spawning `/usr/bin/security`, with owner-only `0600`
+//! file-anchor fallback when OS Keychain is unavailable or locked) and all subsequent invocations
+//! execute in **0ms**.
 
 use std::io::Read;
 use std::process::{Command, Stdio};
