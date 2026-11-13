@@ -1,12 +1,12 @@
-# PrismID Full-Stack Integration Guide (`INTEGRATION_GUIDE.md` — `v1.2.0`)
+# PrismID Full-Stack Integration Guide (`INTEGRATION_GUIDE.md` — `v1.2.1`)
 
-This guide shows how to integrate **PrismID v1.2.0** into a Web application (`prismid-js`), a Tauri 2 Desktop application (`prismid-native`), and a Go backend (`prismid-go`) in single-node or multi-instance deployments.
+This guide shows how to integrate **PrismID v1.2.1** into a Web application (`prismid-js`), a Tauri 2 Desktop application (`prismid-native`), and a Go backend (`prismid-go`) in single-node or multi-instance deployments.
 
 ---
 
 ## 1. Browser Web Application Integration (`prismid-js`)
 
-Install `prismid-js` (`>= 1.2.0`):
+Install `prismid-js` (`>= 1.2.1`):
 
 ```bash
 npm install prismid-js
@@ -63,11 +63,11 @@ await prismClient.rebindKey({ rotate: true })
 
 ### 2.1 Rust Side (`src-tauri/Cargo.toml` & `src-tauri/src/lib.rs`)
 
-Add `prismid-native` (`1.2.0`) to `src-tauri/Cargo.toml`:
+Add `prismid-native` (`1.2.1`) to `src-tauri/Cargo.toml`:
 
 ```toml
 [dependencies]
-prismid-native = { git = "https://github.com/yrZhaoweb/prismid", version = "1.2.0" }
+prismid-native = { git = "https://github.com/yrZhaoweb/prismid", version = "1.2.1" }
 ```
 
 Expose a Tauri command in `src-tauri/src/lib.rs` (note: set `PRISMID_DISABLE_KEYCHAIN=1` if running inside a headless CI daemon where macOS Login Keychain should be skipped in favor of the `0600` file anchor):

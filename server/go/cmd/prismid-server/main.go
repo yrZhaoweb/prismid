@@ -32,7 +32,7 @@ import (
 var embeddedPrismBundleJS []byte
 
 const (
-	serverVersion         = "1.2.0"
+	serverVersion         = "1.2.1"
 	maxRequestBodyBytes   = 64 << 10 // 64 KiB
 	DefaultBearerTokenTTL = 24 * time.Hour
 	DefaultStepUpTokenTTL = 5 * time.Minute

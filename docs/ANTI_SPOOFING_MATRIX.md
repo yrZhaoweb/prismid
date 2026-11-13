@@ -1,4 +1,4 @@
-# PrismID Anti-Spoofing & Adversarial Matrix (`ANTI_SPOOFING_MATRIX.md` — `v1.2.0`)
+# PrismID Anti-Spoofing & Adversarial Matrix (`ANTI_SPOOFING_MATRIX.md` — `v1.2.1`)
 
 This document catalogs the adversarial vectors, explicit client-telemetry limits, and false-positive prevention invariants verified in `prismid-go` (`engine_test.go`, `v110_deepseek_review_test.go`, `fuzz_test.go`, and `internal/bench/benchmark_accuracy.go`) and `prismid-js` (`test/prismid.test.ts` across Chromium, Firefox, and WebKit).
 

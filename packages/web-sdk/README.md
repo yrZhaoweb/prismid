@@ -1,4 +1,4 @@
-# prismid-js (`v1.2.0`)
+# prismid-js (`v1.2.1`)
 
 Zero-dependency browser & Tauri WebView client SDK for **PrismID**: orthogonal hardware risk signals, dynamic stratified WebGL fragment-shader spot-pixel verification, non-extractable WebCrypto `ECDSA P-256` device keys (`d_key_*`) with two-phase MitM-safe key rotation, 5-silo self-healing storage beacons (`d_bcn_*`), cross-thread `Blob` Worker + `OffscreenCanvas` consistency checks, multi-tenant namespace headers (`X-PrismID-Tenant-ID`), and `AES-256-GCM` AEAD payload sealing.
 

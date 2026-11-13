@@ -1,4 +1,4 @@
-# PrismID (`prismid` v1.2.0)
+# PrismID (`prismid` v1.2.1)
 
 > **Open-source orthogonal hardware signal collection, non-extractable WebCrypto ECDSA P-256 device key binding, raw-measurement consistency checks, and multi-slice risk correlation SDK for Web (`prismid-js`), Tauri / Rust Desktop (`prismid-native`), and Go (`prismid-go`).**
 >
@@ -13,7 +13,7 @@ Traditional open-source fingerprinting libraries hash ~20 browser attributes on 
 2. **Residential Proxy Evasion**: Mixing IP addresses into the device hash allows attackers to rotate `/24` proxy subnets to obtain a fresh ID on every request.
 3. **Shared-Model False Positives**: Treating model-level hardware hashes (such as WebGL/Audio hashes shared by stock MacBook Pro M3 laptops) as unique device IDs falsely merges innocent users in offices or across cities.
 
-**PrismID v1.2.0** addresses these challenges with a clear separation between **Per-Device Hard Identity Anchors** and **Shared-Model Environment Velocity Signals**:
+**PrismID v1.2.1** addresses these challenges with a clear separation between **Per-Device Hard Identity Anchors** and **Shared-Model Environment Velocity Signals**:
 
 1. **Per-Device Hard Identity Slices (`d_key_*`, `d_nat_*`, `d_kch_*`, `d_bcn_*`)**:
    - `d_key_*` (**Non-Extractable WebCrypto ECDSA P-256 Key Binding + Dual-Path TOFU Rebind & Key Retirement**): Reads existing `IndexedDB` `_prismid_key_v1` key material before generating a new `ECDSA P-256` keypair (`extractable: false`) and signs every challenge transcript (`prismid-v2-sig|<nonce>|<beacon_id>|<static_webgl_fp_hash>|<audio_compressor_hash>`). The Go server verifies the P-256 signature (`device_key_bound: true`, Web `confidence = 0.95` — proves possession of a bound keypair rather than hardware silicon attestation) and enforces **Trust-On-First-Use (TOFU)** binding between `d_bcn_*` and `d_key_*`. Rebinding via `Verifier.RebindDeviceKeyWithProof` / `POST /api/v1/risk/rebind-key` supports two cryptographic paths and **retires the superseded `d_key_old` edge** from `RiskGraph` on rotation:

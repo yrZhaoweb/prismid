@@ -1,4 +1,4 @@
-// PrismID Web SDK (prismid-js v1.2.0) Standalone ES Module Bundle
+// PrismID Web SDK (prismid-js v1.2.1) Standalone ES Module Bundle
 
 // --- crypto/aead.js ---
 /**
@@ -417,7 +417,7 @@ function readExistingPersistedKey(timeoutMs = IDB_KEY_TIMEOUT_MS) {
             try {
                 db?.close();
             }
-            catch { }
+            catch { /* ignore */ }
             resolve(outcome);
         };
         const timer = setTimeout(() => finish({ status: 'error' }), budgetMs);
@@ -494,12 +494,12 @@ function loadOrCreatePersistedKey(candidate, forceOverwrite = false, timeoutMs =
                 try {
                     tx?.abort();
                 }
-                catch { }
+                catch { /* ignore */ }
             }
             try {
                 db?.close();
             }
-            catch { }
+            catch { /* ignore */ }
             resolve(value);
         };
         const timer = setTimeout(() => finish(null), budgetMs);
@@ -2184,6 +2184,33 @@ function sampleMathConstants() {
         Math.tan(-1e300),
     ];
 }
+function stripStackFrameLocation(frame) {
+    const withoutParenUrl = frame.replace(/\s*\((?:https?:|file:|blob:|webpack-internal:|\/)[^)]*\)\s*$/i, '');
+    const atIdx = withoutParenUrl.indexOf('@');
+    if (atIdx >= 0 && /^(?:https?:|file:|blob:|\/)/i.test(withoutParenUrl.slice(atIdx + 1))) {
+        return withoutParenUrl.slice(0, atIdx);
+    }
+    return withoutParenUrl.replace(/\s+(?:https?:|file:|blob:)[^\s]+$/i, '');
+}
+/**
+ * Checks whether `Object.setPrototypeOf(fn, Object.create(fn))` threw directly inside a Proxy
+ * `setPrototypeOf` trap rather than inside a caller's own wrapper (such as Vue reactivity proxies).
+ */
+export function isTopFrameProxySetPrototypeTrap(stack) {
+    if (!stack || !stack.includes('Proxy.')) {
+        return false;
+    }
+    const frames = stack
+        .split('\n')
+        .map((line) => line.trim())
+        .filter((line) => line.length > 0 && !/^(TypeError|Error)\b/.test(line));
+    if (frames.length === 0) {
+        return false;
+    }
+    const detectorIdx = frames.findIndex((frame) => frame.includes('checkNativeFunction'));
+    const candidateFrames = detectorIdx >= 0 ? frames.slice(0, detectorIdx) : frames.slice(0, 2);
+    return candidateFrames.some((frame) => /\bProxy\.(?:setPrototypeOf|<anonymous>)\b/.test(stripStackFrameLocation(frame)));
+}
 export function collectLieDetectorProbe() {
     // 1. FDLIBM Math floating-point boundary fingerprint + active tamper check (S3-29)
     const mValues = sampleMathConstants();
@@ -2220,9 +2247,6 @@ export function collectLieDetectorProbe() {
         }
         else if (errStack.includes('@')) {
             mathEngineSignature = 'jsc';
-        }
-        else if ('captureStackTrace' in Error) {
-            mathEngineSignature = 'v8';
         }
     }
     catch {
@@ -2274,7 +2298,7 @@ export function collectLieDetectorProbe() {
                 }
                 catch (err) {
                     const stack = err?.stack || '';
-                    if (stack.includes('Proxy.')) {
+                    if (isTopFrameProxySetPrototypeTrap(stack)) {
                         prototypeLies.push(`${label}:proxy_setPrototypeOf_trap`);
                     }
                 }
@@ -2318,21 +2342,10 @@ export function collectLieDetectorProbe() {
         if (typeof WebGL2RenderingContext !== 'undefined') {
             checkNativeFunction(WebGL2RenderingContext.prototype.getParameter, 'WebGL2RenderingContext.getParameter', 'getParameter');
         }
-        if (typeof HTMLMediaElement !== 'undefined') {
-            checkNativeFunction(HTMLMediaElement.prototype.canPlayType, 'HTMLMediaElement.canPlayType', 'canPlayType');
-        }
         if (typeof Document !== 'undefined' && typeof document !== 'undefined') {
             checkNativeFunction(Document.prototype.createElement, 'Document.createElement', 'createElement');
             if (Object.prototype.hasOwnProperty.call(document, 'createElement')) {
                 prototypeLies.push('document.createElement:instance_property_override');
-            }
-        }
-        if (typeof window !== 'undefined') {
-            for (const dimProp of ['outerWidth', 'outerHeight', 'innerWidth', 'innerHeight']) {
-                const wDesc = Object.getOwnPropertyDescriptor(window, dimProp);
-                if (wDesc && ('value' in wDesc || typeof wDesc.get !== 'function')) {
-                    prototypeLies.push(`window.${dimProp}:replaceable_data_override`);
-                }
             }
         }
         if (typeof OfflineAudioContext !== 'undefined') {
@@ -2408,10 +2421,6 @@ export function collectLieDetectorProbe() {
                     prototypeLies.push(`screen.${prop}:instance_property_override`);
                 }
             }
-            if ((screen.width > 0 && screen.availWidth > screen.width) ||
-                (screen.height > 0 && screen.availHeight > screen.height)) {
-                prototypeLies.push('screen:avail_exceeds_total_dimensions');
-            }
         }
     }
     catch {
@@ -2463,6 +2472,20 @@ export function collectLieDetectorProbe() {
 }
 
 // --- index.js ---
+export const PRISM_PROBE_VERSION = 2;
+export const MAX_PRISM_WIRE_BYTES = 65_536;
+export function utf8ByteLength(text) {
+    if (typeof TextEncoder !== 'undefined') {
+        return new TextEncoder().encode(text).byteLength;
+    }
+    if (typeof Buffer !== 'undefined') {
+        return Buffer.byteLength(text, 'utf8');
+    }
+    return text.length * 3;
+}
+export function measureJsonWireBytes(payload) {
+    return utf8ByteLength(JSON.stringify(payload));
+}
 function inferSubjectIdFromToken(token) {
     if (!token)
         return '';
@@ -2474,7 +2497,7 @@ function inferSubjectIdFromToken(token) {
     if (prismMatch && prismMatch[1]) {
         return prismMatch[1];
     }
-    // 2. Standard 3-segment JWT (`header.payload.signature`) with `sub` claim
+    // 2. Standard 3-segment JWT (`header.payload.signature`) with `sub` or `user_id` claim
     const parts = raw.split('.');
     if (parts.length === 3 && parts[0].startsWith('eyJ')) {
         try {
@@ -2484,13 +2507,18 @@ function inferSubjectIdFromToken(token) {
                 ? atob(padded)
                 : Buffer.from(padded, 'base64').toString('utf8');
             const parsed = JSON.parse(jsonStr);
-            if (typeof parsed.sub === 'string' && parsed.sub.trim()) {
-                return parsed.sub.trim();
+            const rawSub = parsed.sub ?? parsed.user_id;
+            if (typeof rawSub === 'string' && rawSub.trim()) {
+                return rawSub.trim();
+            }
+            if (typeof rawSub === 'number' && Number.isFinite(rawSub) && rawSub > 0) {
+                return String(rawSub);
             }
         }
         catch {
             // fall through
         }
+        return '';
     }
     return raw;
 }
@@ -2600,6 +2628,8 @@ export function createPrismClient(options = {}) {
     let lastIdentifiedAt = 0;
     let lastError = null;
     let inFlightPromise = null;
+    let inFlightToken = null;
+    let clientSessionEpoch = 0;
     function recordError(err) {
         lastError = err;
         try {
@@ -2620,12 +2650,89 @@ export function createPrismClient(options = {}) {
                 clearTimeout(timer);
         });
     }
+    function createAbortError(message = 'PrismID operation aborted') {
+        const err = new Error(message);
+        err.name = 'AbortError';
+        err.isAborted = true;
+        return err;
+    }
+    function throwIfAborted(signal) {
+        if (signal?.aborted) {
+            throw createAbortError();
+        }
+    }
+    function raceWithAbort(promise, signal) {
+        if (!signal)
+            return promise;
+        if (signal.aborted) {
+            return Promise.reject(createAbortError());
+        }
+        let onAbort;
+        const abortPromise = new Promise((_, reject) => {
+            onAbort = () => reject(createAbortError());
+            signal.addEventListener('abort', onAbort, { once: true });
+        });
+        return Promise.race([promise, abortPromise]).finally(() => {
+            if (onAbort)
+                signal.removeEventListener('abort', onAbort);
+        });
+    }
+    function parseRetryAfterMs(headers) {
+        if (!headers || typeof headers.get !== 'function')
+            return undefined;
+        const raw = headers.get('retry-after') ?? headers.get('Retry-After');
+        if (!raw)
+            return undefined;
+        const trimmed = raw.trim();
+        if (!trimmed)
+            return undefined;
+        if (/^\d+$/.test(trimmed)) {
+            const secs = Number(trimmed);
+            return Number.isFinite(secs) && secs >= 0 ? secs * 1000 : undefined;
+        }
+        const parsedAt = Date.parse(trimmed);
+        if (Number.isFinite(parsedAt)) {
+            return Math.max(0, parsedAt - Date.now());
+        }
+        return undefined;
+    }
+    function extractWireError(raw) {
+        if (!raw || typeof raw !== 'object')
+            return {};
+        const rec = raw;
+        const nested = rec.data && typeof rec.data === 'object' ? rec.data : undefined;
+        const reasonStr = typeof rec.reason === 'string' && rec.reason.trim()
+            ? rec.reason.trim()
+            : nested && typeof nested.reason === 'string' && nested.reason.trim()
+                ? nested.reason.trim()
+                : undefined;
+        const codeStr = typeof rec.code === 'string' && rec.code.trim()
+            ? rec.code.trim()
+            : nested && typeof nested.code === 'string' && nested.code.trim()
+                ? nested.code.trim()
+                : undefined;
+        const messageStr = typeof rec.message === 'string' && rec.message.trim()
+            ? rec.message.trim()
+            : typeof rec.error === 'string' && rec.error.trim()
+                ? rec.error.trim()
+                : nested && typeof nested.message === 'string' && nested.message.trim()
+                    ? nested.message.trim()
+                    : nested && typeof nested.error === 'string' && nested.error.trim()
+                        ? nested.error.trim()
+                        : undefined;
+        return {
+            code: reasonStr ?? codeStr,
+            message: messageStr,
+        };
+    }
     // Covers both HTTP response headers AND full response body reading within a single deadline!
-    async function fetchJsonWithDeadline(url, init) {
+    async function fetchJsonWithDeadline(url, init, externalSignal) {
         if (!fetchFn)
             throw new Error('fetch unavailable');
+        throwIfAborted(externalSignal);
         const controller = typeof AbortController !== 'undefined' ? new AbortController() : undefined;
         let timer;
+        let onExternalAbort;
         const timeoutPromise = new Promise((_, reject) => {
             timer = setTimeout(() => {
                 if (controller)
@@ -2635,32 +2742,57 @@ export function createPrismClient(options = {}) {
                 reject(err);
             }, requestTimeoutMs);
         });
+        const externalAbortPromise = externalSignal
+            ? new Promise((_, reject) => {
+                onExternalAbort = () => {
+                    if (controller)
+                        controller.abort();
+                    reject(createAbortError());
+                };
+                if (externalSignal.aborted) {
+                    onExternalAbort();
+                }
+                else {
+                    externalSignal.addEventListener('abort', onExternalAbort, { once: true });
+                }
+            })
+            : undefined;
         try {
             const work = (async () => {
                 const res = await fetchFn(url, controller ? { ...init, signal: controller.signal } : init);
+                throwIfAborted(externalSignal);
+                const retryAfterMs = parseRetryAfterMs(res.headers);
                 const text = await res.text();
+                throwIfAborted(externalSignal);
                 if (!text) {
-                    return { ok: res.ok, status: res.status, data: null };
+                    return { ok: res.ok, status: res.status, retryAfterMs, data: null };
                 }
                 try {
-                    return { ok: res.ok, status: res.status, data: JSON.parse(text) };
+                    return { ok: res.ok, status: res.status, retryAfterMs, data: JSON.parse(text) };
                 }
                 catch {
-                    return { ok: res.ok, status: res.status, data: null };
+                    return { ok: res.ok, status: res.status, retryAfterMs, data: null };
                 }
             })();
-            return await Promise.race([work, timeoutPromise]);
+            return await (externalAbortPromise
+                ? Promise.race([work, timeoutPromise, externalAbortPromise])
+                : Promise.race([work, timeoutPromise]));
         }
         finally {
             if (timer !== undefined)
                 clearTimeout(timer);
+            if (externalSignal && onExternalAbort) {
+                externalSignal.removeEventListener('abort', onExternalAbort);
+            }
         }
     }
     // Resolves access token AT MOST ONCE per client operation (S3-39).
-    async function resolveAccessToken() {
+    async function resolveAccessToken(signal) {
+        throwIfAborted(signal);
         if (!options.getAccessToken)
             return null;
-        const tok = await withDeadline(Promise.resolve(options.getAccessToken()).catch(() => null), Math.min(requestTimeoutMs, 1500), null);
+        const tok = await raceWithAbort(withDeadline(Promise.resolve(options.getAccessToken()).catch(() => null), Math.min(requestTimeoutMs, 1500), null), signal);
+        throwIfAborted(signal);
         return tok ? String(tok) : null;
     }
     function buildAuthHeadersFromToken(token) {
@@ -2676,7 +2808,8 @@ export function createPrismClient(options = {}) {
         }
         return headers;
     }
-    async function collectAndSeal(challenge) {
+    async function collectAndSeal(challenge, callOpts) {
+        throwIfAborted(callOpts?.signal);
         const samplePoints = Array.isArray(challenge.sample_points) && challenge.sample_points.length > 0
             ? challenge.sample_points
             : DEFAULT_SAMPLE_POINTS;
@@ -2722,7 +2855,7 @@ export function createPrismClient(options = {}) {
             surviving_silos: [],
             surviving_silos_mask: 0,
         };
-        const [audioRes, workerLie, storageBeacon, nativeAnchor, turnstileToken] = await Promise.all([
+        const [audioRes, workerLie, storageBeacon, nativeAnchor, turnstileToken] = await raceWithAbort(Promise.all([
             withDeadline(collectAudioProbeWithTrap(audioBudgetMs).catch(() => fallbackAudio), aggregateBudgetMs, fallbackAudio),
             withDeadline(collectWorkerLieProbe({
                 gpuRenderer: webgl.gpu_renderer,
@@ -2740,15 +2873,17 @@ export function createPrismClient(options = {}) {
             options.getTurnstileToken
                 ? withDeadline(Promise.resolve(options.getTurnstileToken()).catch(() => undefined), externalProviderTimeoutMs, undefined)
                 : Promise.resolve(undefined),
-        ]);
-        const deviceKey = await withDeadline(signChallengeWithDeviceKey({
+        ]), callOpts?.signal);
+        throwIfAborted(callOpts?.signal);
+        const deviceKey = await raceWithAbort(withDeadline(signChallengeWithDeviceKey({
             nonce: challenge.nonce,
             beaconId: storageBeacon.beacon_id,
             staticWebGLFpHash: webgl.static_webgl_fp_hash,
             audioCompressorHash: audioRes.audio_compressor_hash,
-        }, keyBudgetMs), keySignDeadlineMs, undefined);
+        }, keyBudgetMs), keySignDeadlineMs, undefined), callOpts?.signal);
+        throwIfAborted(callOpts?.signal);
         const payload = {
-            v: 1,
+            v: PRISM_PROBE_VERSION,
             nonce: challenge.nonce,
             collected_at: Date.now(),
             beacon_id: storageBeacon.beacon_id,
@@ -2804,7 +2939,8 @@ export function createPrismClient(options = {}) {
             },
             ...(nativeAnchor ? { native_anchor: nativeAnchor } : {}),
         };
-        const sealedBlob = await sealPayload(challenge.nonce, JSON.stringify(payload));
+        const sealedBlob = await raceWithAbort(sealPayload(challenge.nonce, JSON.stringify(payload)), callOpts?.signal);
+        throwIfAborted(callOpts?.signal);
         const request = {
             c: challenge.nonce,
             p: sealedBlob,
@@ -2813,14 +2949,37 @@ export function createPrismClient(options = {}) {
         return { request, payload };
     }
     async function identifyDetailed(callOpts) {
+        const signal = callOpts?.signal;
+        if (signal?.aborted) {
+            return {
+                result: null,
+                error: { kind: 'aborted', code: 'ABORTED', message: 'PrismID operation aborted' },
+            };
+        }
         if (!fetchFn) {
             return {
                 result: null,
                 error: recordError({ kind: 'network', message: 'fetch implementation unavailable' }),
             };
         }
-        // Resolve access token ONCE and reuse for cooldown check + HTTP Authorization header (S3-39).
-        const token = await resolveAccessToken();
+        let token = null;
+        try {
+            // Resolve access token ONCE and reuse for cooldown check + HTTP Authorization header (S3-39).
+            token = await resolveAccessToken(signal);
+        }
+        catch (caught) {
+            if (caught?.isAborted) {
+                return {
+                    result: null,
+                    error: {
+                        kind: 'aborted',
+                        code: 'ABORTED',
+                        message: caught instanceof Error ? caught.message : 'PrismID operation aborted',
+                    },
+                };
+            }
+            throw caught;
+        }
         const now = Date.now();
         if (!callOpts?.force &&
             lastIdentifiedAt > 0 &&
@@ -2828,11 +2987,16 @@ export function createPrismClient(options = {}) {
             now - lastIdentifiedAt < cooldownMs) {
             return { result: null, error: null };
         }
-        if (inFlightPromise) {
+        if (!signal && inFlightPromise && inFlightToken === token) {
             return inFlightPromise;
         }
-        inFlightPromise = (async () => {
+        const reqEpoch = clientSessionEpoch;
+        if (!signal) {
+            inFlightToken = token;
+        }
+        const currentFlight = (async () => {
             try {
+                throwIfAborted(signal);
                 lastError = null;
                 const headers = buildAuthHeadersFromToken(token);
                 if (!callOpts?.force) {
@@ -2840,12 +3004,14 @@ export function createPrismClient(options = {}) {
                         const scRes = await fetchJsonWithDeadline(`${baseUrl}/api/v1/risk/should-collect`, {
                             method: 'GET',
                             headers,
-                        });
+                        }, signal);
                         if (scRes.ok && scRes.data) {
                             const shouldCollect = scRes.data.should_collect ?? scRes.data.data?.should_collect ?? true;
                             if (shouldCollect === false) {
-                                lastIdentifiedToken = token;
-                                lastIdentifiedAt = Date.now();
+                                if (reqEpoch === clientSessionEpoch && !signal?.aborted) {
+                                    lastIdentifiedToken = token;
+                                    lastIdentifiedAt = Date.now();
+                                }
                                 // Never synthesize `{ accepted: true }` when collection was skipped (S3-53).
                                 return {
                                     result: {
@@ -2859,7 +3025,10 @@ export function createPrismClient(options = {}) {
                             }
                         }
                     }
-                    catch {
+                    catch (caught) {
+                        if (caught?.isAborted) {
+                            throw caught;
+                        }
                         // Proceed to challenge if should-collect endpoint is unreachable or unused
                     }
                 }
@@ -2867,13 +3036,15 @@ export function createPrismClient(options = {}) {
                     method: 'POST',
                     headers,
                     body: '{}',
-                });
+                }, signal);
                 if (!chRes.ok || !chRes.data) {
+                    const chErr = extractWireError(chRes.data);
                     const err = recordError({
                         kind: chRes.ok ? 'malformed_response' : 'http',
                         status: chRes.status,
-                        code: chRes.data?.code,
-                        message: chRes.data?.error || `challenge HTTP ${chRes.status}`,
+                        ...(chErr.code ? { code: chErr.code } : {}),
+                        ...(chRes.retryAfterMs !== undefined ? { retryAfterMs: chRes.retryAfterMs } : {}),
+                        message: chErr.message || `challenge HTTP ${chRes.status}`,
                     });
                     return { result: null, error: err };
                 }
@@ -2887,33 +3058,43 @@ export function createPrismClient(options = {}) {
                     });
                     return { result: null, error: err };
                 }
-                const { request } = await collectAndSeal(challenge);
+                const { request } = await collectAndSeal(challenge, { signal });
+                const bodyJson = JSON.stringify(request);
+                if (utf8ByteLength(bodyJson) > MAX_PRISM_WIRE_BYTES) {
+                    const err = recordError({
+                        kind: 'http',
+                        status: 413,
+                        code: 'PAYLOAD_TOO_LARGE',
+                        message: `identify request exceeds ${MAX_PRISM_WIRE_BYTES}-byte wire limit`,
+                    });
+                    return { result: null, error: err };
+                }
                 const idRes = await fetchJsonWithDeadline(`${baseUrl}/api/v1/risk/identify`, {
                     method: 'POST',
                     headers,
-                    body: JSON.stringify(request),
-                });
+                    body: bodyJson,
+                }, signal);
                 const idRaw = idRes.data;
                 if (!idRaw || typeof idRaw !== 'object') {
                     const err = recordError({
                         kind: idRes.ok ? 'malformed_response' : 'http',
                         status: idRes.status,
+                        ...(idRes.retryAfterMs !== undefined ? { retryAfterMs: idRes.retryAfterMs } : {}),
                         message: `identify HTTP ${idRes.status} without valid JSON body`,
                     });
                     return { result: null, error: err };
                 }
-                const candidate = typeof idRaw.accepted === 'boolean'
-                    ? idRaw
-                    : idRaw.data && typeof idRaw.data.accepted === 'boolean'
-                        ? idRaw.data
-                        : undefined;
+                const idWireErr = extractWireError(idRaw);
+                const rawCandidate = idRaw.data && typeof idRaw.data === 'object' ? idRaw.data : idRaw;
+                const candidate = typeof rawCandidate.accepted === 'boolean' ? rawCandidate : undefined;
                 // Strict schema check: never synthesize `{ accepted: true }` from an empty `{}` response!
                 if (!candidate || typeof candidate.accepted !== 'boolean') {
                     const err = recordError({
                         kind: idRes.ok ? 'malformed_response' : 'http',
                         status: idRes.status,
-                        code: idRaw.code,
-                        message: idRaw.error || idRaw.message || `identify HTTP ${idRes.status}`,
+                        ...(idWireErr.code ? { code: idWireErr.code } : {}),
+                        ...(idRes.retryAfterMs !== undefined ? { retryAfterMs: idRes.retryAfterMs } : {}),
+                        message: idWireErr.message || `identify HTTP ${idRes.status}`,
                     });
                     return { result: null, error: err };
                 }
@@ -2921,8 +3102,9 @@ export function createPrismClient(options = {}) {
                     const err = recordError({
                         kind: 'http',
                         status: idRes.status,
-                        code: candidate.code,
-                        message: candidate.message || `identify HTTP ${idRes.status}`,
+                        ...(idWireErr.code ? { code: idWireErr.code } : {}),
+                        ...(idRes.retryAfterMs !== undefined ? { retryAfterMs: idRes.retryAfterMs } : {}),
+                        message: idWireErr.message || `identify HTTP ${idRes.status}`,
                     });
                     return { result: null, error: err };
                 }
@@ -2930,25 +3112,45 @@ export function createPrismClient(options = {}) {
                     const err = recordError({
                         kind: 'http',
                         status: idRes.status,
-                        code: candidate.code,
-                        message: candidate.message || idRaw.error || `identify HTTP ${idRes.status}`,
+                        ...(idWireErr.code ? { code: idWireErr.code } : {}),
+                        ...(idRes.retryAfterMs !== undefined ? { retryAfterMs: idRes.retryAfterMs } : {}),
+                        message: idWireErr.message || `identify HTTP ${idRes.status}`,
                     });
+                    const normalizedCandidate = {
+                        ...candidate,
+                        accepted: false,
+                        ...(idWireErr.code ? { code: idWireErr.code } : {}),
+                    };
                     // Preserve structured `accepted: false` rejection payloads (e.g. HTTP 409/403) when non-429/401,
-                    // while return null on 401/429 gateway rejections without domain error code if no `code` was set.
+                    // while returning null on 401/429 gateway rejections without domain error code if no string code was set.
                     if (idRes.status === 401 || idRes.status === 429) {
-                        if (!candidate.code) {
+                        if (!idWireErr.code) {
                             return { result: null, error: err };
                         }
                     }
-                    return { result: candidate, error: err };
+                    return { result: normalizedCandidate, error: err };
                 }
-                if (candidate.accepted && !candidate.risk_pending && !candidate.device_key_recovery_required) {
+                if (reqEpoch === clientSessionEpoch &&
+                    !signal?.aborted &&
+                    candidate.accepted &&
+                    !candidate.risk_pending &&
+                    !candidate.device_key_recovery_required) {
                     lastIdentifiedToken = token;
                     lastIdentifiedAt = Date.now();
                 }
                 return { result: candidate, error: null };
             }
             catch (caught) {
+                if (caught?.isAborted) {
+                    return {
+                        result: null,
+                        error: {
+                            kind: 'aborted',
+                            code: 'ABORTED',
+                            message: caught instanceof Error ? caught.message : 'PrismID operation aborted',
+                        },
+                    };
+                }
                 const isTimeout = Boolean(caught?.isTimeout);
                 const err = recordError({
                     kind: isTimeout ? 'timeout' : 'network',
@@ -2956,11 +3158,16 @@ export function createPrismClient(options = {}) {
                 });
                 return { result: null, error: err };
             }
-            finally {
+        })().finally(() => {
+            if (!signal && inFlightPromise === currentFlight) {
                 inFlightPromise = null;
+                inFlightToken = null;
             }
-        })();
-        return inFlightPromise;
+        });
+        if (!signal) {
+            inFlightPromise = currentFlight;
+        }
+        return currentFlight;
     }
     async function identify(callOpts) {
         const { result } = await identifyDetailed(callOpts);
@@ -2970,18 +3177,23 @@ export function createPrismClient(options = {}) {
         return lastError;
     }
     async function rebindKey(rebindOpts) {
+        const signal = rebindOpts?.signal;
+        if (signal?.aborted) {
+            return { accepted: false, code: 'ABORTED', error: 'PrismID operation aborted' };
+        }
         if (!fetchFn) {
             return { accepted: false, error: 'fetch unavailable' };
         }
         try {
-            const token = await resolveAccessToken();
+            const token = await resolveAccessToken(signal);
             const headers = buildAuthHeadersFromToken(token);
             let subjectId = (rebindOpts?.subjectId || '').trim();
             if (!subjectId && options.getSubjectId) {
-                const resolvedSub = await withDeadline(Promise.resolve(options.getSubjectId()).catch(() => null), 1500, null);
+                const resolvedSub = await raceWithAbort(withDeadline(Promise.resolve(options.getSubjectId()).catch(() => null), 1500, null), signal);
                 if (resolvedSub)
                     subjectId = String(resolvedSub).trim();
             }
+            throwIfAborted(signal);
             if (!subjectId) {
                 subjectId = inferSubjectIdFromToken(token);
             }
@@ -2989,7 +3201,8 @@ export function createPrismClient(options = {}) {
                 return { accepted: false, error: 'subjectId is required to sign rebind proof' };
             }
             const beaconId = rebindOpts?.beaconId?.trim().toLowerCase() ||
-                (await collectAndHealStorageBeacon(Math.min(350, probeTimeoutMs))).beacon_id;
+                (await raceWithAbort(collectAndHealStorageBeacon(Math.min(350, probeTimeoutMs)), signal)).beacon_id;
+            throwIfAborted(signal);
             if (!beaconId) {
                 return { accepted: false, error: 'storage beacon unavailable' };
             }
@@ -2997,40 +3210,64 @@ export function createPrismClient(options = {}) {
                 method: 'POST',
                 headers,
                 body: '{}',
-            });
+            }, signal);
             const chRaw = chRes.data;
             const challenge = chRaw?.nonce ? chRaw : chRaw?.data;
             if (!chRes.ok || !challenge?.nonce) {
-                return { accepted: false, error: chRaw?.error || `challenge HTTP ${chRes.status}` };
+                const chErr = extractWireError(chRaw);
+                return {
+                    accepted: false,
+                    http_status: chRes.status,
+                    ...(chErr.code ? { code: chErr.code } : {}),
+                    ...(chRes.retryAfterMs !== undefined ? { retry_after_ms: chRes.retryAfterMs } : {}),
+                    error: chErr.message || `challenge HTTP ${chRes.status}`,
+                };
             }
             const rebindKeyBudgetMs = Math.max(80, Math.min(requestTimeoutMs, Math.max(probeTimeoutMs, 1500)));
             let deviceKey;
             let previousDeviceKey;
             let preparedRotation;
             if (rebindOpts?.rotate) {
-                preparedRotation = await prepareDeviceKeyRotation({
+                preparedRotation = await raceWithAbort(prepareDeviceKeyRotation({
                     nonce: challenge.nonce,
                     subjectId,
                     beaconId,
-                }, rebindKeyBudgetMs);
+                }, rebindKeyBudgetMs), signal);
                 deviceKey = preparedRotation?.device_key;
                 previousDeviceKey = preparedRotation?.previous_device_key;
             }
             else {
-                deviceKey = await signRebindWithDeviceKey({
+                deviceKey = await raceWithAbort(signRebindWithDeviceKey({
                     nonce: challenge.nonce,
                     subjectId,
                     beaconId,
-                }, rebindKeyBudgetMs);
+                }, rebindKeyBudgetMs), signal);
             }
+            throwIfAborted(signal);
             if (!deviceKey) {
                 return { accepted: false, error: 'failed to initialize or sign with persistent WebCrypto device key' };
             }
             let stepUpToken = rebindOpts?.stepUpToken?.trim() || '';
             if (!stepUpToken && !previousDeviceKey && options.getStepUpToken) {
-                const fetchedStepUp = await withDeadline(Promise.resolve(options.getStepUpToken('rebind_key', { subjectId, beaconId })).catch(() => null), requestTimeoutMs, null);
+                const fetchedStepUp = await raceWithAbort(withDeadline(Promise.resolve(options.getStepUpToken('rebind_key', { subjectId, beaconId })).catch(() => null), requestTimeoutMs, null), signal);
                 if (fetchedStepUp)
                     stepUpToken = String(fetchedStepUp).trim();
+            }
+            throwIfAborted(signal);
+            const rebindBody = JSON.stringify({
+                challenge_nonce: challenge.nonce,
+                beacon_id: beaconId,
+                step_up_token: stepUpToken || undefined,
+                device_key: deviceKey,
+                ...(previousDeviceKey ? { previous_device_key: previousDeviceKey } : {}),
+            });
+            if (utf8ByteLength(rebindBody) > MAX_PRISM_WIRE_BYTES) {
+                return {
+                    accepted: false,
+                    http_status: 413,
+                    code: 'PAYLOAD_TOO_LARGE',
+                    error: `rebind-key request exceeds ${MAX_PRISM_WIRE_BYTES}-byte wire limit`,
+                };
             }
             const rbRes = await fetchJsonWithDeadline(`${baseUrl}/api/v1/risk/rebind-key`, {
                 method: 'POST',
@@ -3038,34 +3275,57 @@ export function createPrismClient(options = {}) {
                     ...headers,
                     ...(stepUpToken ? { 'X-PrismID-StepUp-Token': stepUpToken } : {}),
                 },
-                body: JSON.stringify({
-                    challenge_nonce: challenge.nonce,
-                    beacon_id: beaconId,
-                    step_up_token: stepUpToken || undefined,
-                    device_key: deviceKey,
-                    ...(previousDeviceKey ? { previous_device_key: previousDeviceKey } : {}),
-                }),
-            });
-            if (!rbRes.data) {
-                return { accepted: false, error: `rebind-key HTTP ${rbRes.status}` };
+                body: rebindBody,
+            }, signal);
+            if (!rbRes.data || typeof rbRes.data !== 'object') {
+                return {
+                    accepted: false,
+                    http_status: rbRes.status,
+                    ...(rbRes.status === 409 ? { code: 'HTTP_409_CONFLICT' } : {}),
+                    ...(rbRes.retryAfterMs !== undefined ? { retry_after_ms: rbRes.retryAfterMs } : {}),
+                    error: `rebind-key HTTP ${rbRes.status}`,
+                };
             }
-            const accepted = rbRes.ok && rbRes.data.accepted !== false;
+            const rbPayload = rbRes.data.data && typeof rbRes.data.data === 'object'
+                ? rbRes.data.data
+                : rbRes.data;
+            const wireErr = extractWireError(rbRes.data);
+            const accepted = rbRes.ok && rbPayload.accepted !== false && rbPayload.rebound !== false;
+            throwIfAborted(signal);
             if (accepted && preparedRotation) {
                 const committed = await preparedRotation.commit(rebindKeyBudgetMs);
                 if (!committed) {
                     return {
                         accepted: false,
+                        http_status: rbRes.status,
                         error: 'server accepted key rotation, but IndexedDB commit failed',
                     };
                 }
             }
+            throwIfAborted(signal);
             resetSessionCache();
+            const { code: _ignoredRawCode, ...rbRest } = rbPayload;
+            const resolvedCode = wireErr.code ??
+                (!accepted && rbRes.status === 409 ? 'HTTP_409_CONFLICT' : undefined);
             return {
-                ...rbRes.data,
+                ...rbRest,
                 accepted,
+                http_status: rbRes.status,
+                ...(rbRes.retryAfterMs !== undefined ? { retry_after_ms: rbRes.retryAfterMs } : {}),
+                ...(resolvedCode ? { code: resolvedCode } : {}),
+                ...(accepted
+                    ? {}
+                    : { error: wireErr.message || `rebind-key HTTP ${rbRes.status}` }),
             };
         }
         catch (err) {
+            if (err?.isAborted) {
+                return {
+                    accepted: false,
+                    code: 'ABORTED',
+                    error: err instanceof Error ? err.message : 'PrismID operation aborted',
+                };
+            }
             return {
                 accepted: false,
                 error: err instanceof Error ? err.message : 'rebindKey request failed',
@@ -3138,8 +3398,11 @@ export function createPrismClient(options = {}) {
         }
     }
     function resetSessionCache(resetOpts) {
+        clientSessionEpoch += 1;
         lastIdentifiedToken = null;
         lastIdentifiedAt = 0;
+        inFlightPromise = null;
+        inFlightToken = null;
         if (resetOpts?.includeDeviceKey) {
             resetDeviceKeyCache();
         }
