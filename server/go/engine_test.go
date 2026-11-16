@@ -393,6 +393,60 @@ func TestVector7_NativeUUIDSplitHoneypotTriggered(t *testing.T) {
 	}
 }
 
+func TestVector7_MacOSWebKitClampedCPUCoresDoesNotTriggerSplitTrap(t *testing.T) {
+	ctx := context.Background()
+	v := NewVerifier(Config{HMACSecret: []byte("test-secret-key-32-bytes-long-000")}, nil)
+
+	chMac, _ := v.IssueChallenge(ctx, "198.51.100.71")
+	pMac := buildValidPayload(chMac)
+	pMac.System.Platform = "MacIntel"
+	pMac.System.CPUCores = 8
+	pMac.Lies.WorkerPlatform = "MacIntel"
+	pMac.Lies.WorkerCPUCores = 8
+	pMac.NativeAnchor = &NativeHardwareAnchor{
+		Platform:       "macos",
+		HWUUID:         "FD7FC36D-MAC-CLAMP-0001-000000000001",
+		SerialNumber:   "SERMAC1",
+		KeychainAnchor: "kcmac1",
+		CPUCores:       12,
+	}
+	resMac, err := v.VerifyAndDerive(ctx, IdentifyRequest{
+		ChallengeNonce: chMac.Nonce,
+		SealedPayload:  sealProbePayload(t, chMac.Nonce, pMac),
+	}, "198.51.100.71")
+	if err != nil {
+		t.Fatalf("macOS clamped check failed: %v", err)
+	}
+	if resMac.SpoofTrapTriggered {
+		t.Fatalf("expected macOS WebKit clamped cpu_cores (8 vs 12) not to trigger spoof trap, got flags %v", resMac.SpoofFlags)
+	}
+
+	// Non-macOS mismatch must still trigger native_uuid_split_trap.
+	chWin, _ := v.IssueChallenge(ctx, "198.51.100.72")
+	pWin := buildValidPayload(chWin)
+	pWin.System.Platform = "Win32"
+	pWin.System.CPUCores = 8
+	pWin.Lies.WorkerPlatform = "Win32"
+	pWin.Lies.WorkerCPUCores = 8
+	pWin.NativeAnchor = &NativeHardwareAnchor{
+		Platform:       "windows",
+		HWUUID:         "WIN-UUID-0001-000000000001",
+		SerialNumber:   "SERWIN1",
+		KeychainAnchor: "kcwin1",
+		CPUCores:       12,
+	}
+	resWin, err := v.VerifyAndDerive(ctx, IdentifyRequest{
+		ChallengeNonce: chWin.Nonce,
+		SealedPayload:  sealProbePayload(t, chWin.Nonce, pWin),
+	}, "198.51.100.72")
+	if err != nil {
+		t.Fatalf("Windows mismatch check failed: %v", err)
+	}
+	if !resWin.SpoofTrapTriggered {
+		t.Fatalf("expected Windows cpu_cores mismatch to still trigger spoof trap")
+	}
+}
+
 // Vector 8: Headless browser SwiftShader / llvmpipe / VMware virtual GPU is automatically demoted
 // to Confidence = 0.30 (< 0.60 authoritative threshold).
 func TestVector8_VirtualGPUSwiftShaderDemotedTo030(t *testing.T) {

@@ -881,7 +881,14 @@ func (v *Verifier) VerifyAndDeriveWithTransport(ctx context.Context, req Identif
 			}
 		}
 		if payload.NativeAnchor.CPUCores > 0 && payload.System.CPUCores > 0 && payload.NativeAnchor.CPUCores != effectiveCPUCores {
-			splitDetected = true
+			// macOS WebKit / WKWebView clamps navigator.hardwareConcurrency to 8 (or 4) for fingerprinting privacy,
+			// while sysctl hw.ncpu reports true logical cores (e.g., 10/12/14/16 on Apple Silicon).
+			macOSWebKitClamped := osFamily == "macos" &&
+				(effectiveCPUCores == 4 || effectiveCPUCores == 8) &&
+				payload.NativeAnchor.CPUCores >= effectiveCPUCores
+			if !macOSWebKitClamped {
+				splitDetected = true
+			}
 		}
 		if splitDetected {
 			spoofFlags = appendUniqueFlag(spoofFlags, "native_uuid_split_trap")
